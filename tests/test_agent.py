@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 import agent
 import guardrails
@@ -246,51 +246,10 @@ def test_dispatch_settings_rejects_non_route_b_category():
         pass
 
 
-def test_save_note_writes_isolated_file(isolated_notes_file):
-    fake_model = FakeToolCallingModel(
-        responses=[
-            AIMessage(
-                content="",
-                tool_calls=[{"name": "save_note", "args": {"note": "test note"}, "id": "call_1"}],
-            ),
-            AIMessage(content="Saved it for you."),
-        ]
-    )
-    built = agent.build_agent(fake_model)
-
-    result = agent.run_agent(built, [{"role": "user", "content": "remember: test note"}])
-
-    assert result[-1].content == "Saved it for you."
-    lines = isolated_notes_file.read_text().strip().splitlines()
-    assert len(lines) == 1
-    entry = json.loads(lines[0])
-    assert entry["note"] == "test note"
-    assert "ts" in entry
-
-
-def _search_news_call(chat_id=1, embedder=None, guard_model=None, query="AI coding"):
-    """Drives agent.search_news through the real tool-calling loop (not a
-    direct function call) so these tests exercise the same runtime.context
-    plumbing bot.py relies on -- chat_id always required, guard_model/
-    embedder default to None (matching bot.py's own embedder=None fallback
-    contract) unless a test needs one."""
-    fake_model = FakeToolCallingModel(
-        responses=[
-            AIMessage(
-                content="",
-                tool_calls=[{"name": "search_news", "args": {"query": query}, "id": "call_1"}],
-            ),
-            AIMessage(content="Here's what I found."),
-        ]
-    )
-    built = agent.build_agent(fake_model)
-    result = agent.run_agent(
-        built, [{"role": "user", "content": "what's trending?"}],
-        context={"chat_id": chat_id, "guard_model": guard_model, "embedder": embedder},
-    )
-    tool_messages = [m for m in result if isinstance(m, ToolMessage)]
-    assert len(tool_messages) == 1
-    return tool_messages[0].content
+# agent.search_news is a plain function now (chat_id, query, history,
+# model, guard_model, embedder), not a LangChain tool an agent loop
+# decides whether/how often to call -- see that function's own module
+# note (2026-09-05) for why. These tests call it directly.
 
 
 def _cached_article(link, title, categories=None, embedding=None, published="2026-09-01"):
@@ -301,10 +260,26 @@ def _cached_article(link, title, categories=None, embedding=None, published="202
     }
 
 
-def test_search_news_returns_cached_articles_ranked_by_relevance(monkeypatch, isolated_subscribers_db):
+class _RecordingModel(FakeToolCallingModel):
+    """Captures the exact messages passed to invoke() -- the candidate
+    listing agent.search_news builds -- same RecordingModel-subclasses-
+    FakeToolCallingModel convention tests/test_news_push.py's own
+    write_push_digest tests already use. `captured` is a declared
+    pydantic field (like FakeToolCallingModel's own `responses`/`i`),
+    not a plain instance attribute -- BaseChatModel is a pydantic model
+    and rejects undeclared attributes."""
+    captured: list = []
+
+    def invoke(self, messages, *args, **kwargs):
+        self.captured = messages
+        return super().invoke(messages, *args, **kwargs)
+
+
+def test_search_news_sends_only_relevant_candidates_to_the_model(monkeypatch, isolated_subscribers_db):
     """No live source fetch any more -- search_news reads whatever
     news_ingest.py already cached, the same corpus news_push.py's digest
-    pipeline reads (news_cache.read_all)."""
+    pipeline reads (news_cache.read_all), and only passes the
+    embedding-relevant subset to the model -- never the whole cache."""
     embedder = FakeEmbedder()
     on_topic = _cached_article(
         "https://example.com/coding", "New AI coding assistant launches",
@@ -315,19 +290,27 @@ def test_search_news_returns_cached_articles_ranked_by_relevance(monkeypatch, is
         embedding=news_embed.embed_one(embedder, "Storm hits coastal region"),
     )
     monkeypatch.setattr(news_cache, "read_all", lambda: [on_topic, off_topic])
+    # A pool this small (2) is smaller than the real SEARCH_RELEVANCE_KEEP_MIN
+    # default (20), which would otherwise clamp to "keep everything" and
+    # never actually exercise the relevance gate -- lower it so this test
+    # can distinguish "excluded" from "pool too small to filter at all".
+    monkeypatch.setattr(agent, "SEARCH_RELEVANCE_KEEP_MIN", 1)
+    model = _RecordingModel(responses=[AIMessage(content="<b>Report</b>")])
 
-    output = _search_news_call(embedder=embedder, query="AI coding assistant")
+    result = agent.search_news(1, "AI coding assistant", [], model, None, embedder)
 
-    assert "New AI coding assistant launches" in output
-    assert "https://example.com/coding" in output
+    listing = model.captured[1]["content"]
+    assert "New AI coding assistant launches" in listing
+    assert "Storm hits coastal region" not in listing
+    assert result == "<b>Report</b>"
 
 
-def test_search_news_truncates_to_max_results_newest_first(monkeypatch, isolated_subscribers_db):
+def test_search_news_sends_only_the_newest_max_results_candidates(monkeypatch, isolated_subscribers_db):
     """SEARCH_MAX_RESULTS=5 (the user's own explicit call, after rejecting
-    a proposed 20) must actually cap the output, and relevance-gated
-    survivors must come back newest-first -- recency governs order,
-    relevance only gates inclusion, same principle as news_push.py's own
-    digest cut."""
+    a proposed 20) must actually cap what reaches the model, and
+    survivors must be newest-first -- recency governs order, relevance
+    only gates inclusion, same principle as news_push.py's own digest
+    cut."""
     embedder = FakeEmbedder()
     base = datetime(2026, 9, 1, tzinfo=timezone.utc)
     articles = [
@@ -340,19 +323,23 @@ def test_search_news_truncates_to_max_results_newest_first(monkeypatch, isolated
     for i, a in enumerate(articles):
         a["published_dt"] = base + timedelta(hours=i)  # index 6 is newest
     monkeypatch.setattr(news_cache, "read_all", lambda: articles)
+    model = _RecordingModel(responses=[AIMessage(content="<b>Report</b>")])
 
-    output = _search_news_call(embedder=embedder, query="AI coding")
+    agent.search_news(1, "AI coding", [], model, None, embedder)
 
+    listing = model.captured[1]["content"]
     expected_newest_first = [f"https://example.com/{i}" for i in (6, 5, 4, 3, 2)]
-    positions = [output.index(link) for link in expected_newest_first]
+    positions = [listing.index(link) for link in expected_newest_first]
     assert positions == sorted(positions)  # each appears, in this exact order
-    assert "https://example.com/1" not in output  # 6th/7th-newest, truncated
-    assert "https://example.com/0" not in output
+    assert "https://example.com/1" not in listing  # 6th/7th-newest, truncated
+    assert "https://example.com/0" not in listing
 
 
 def test_search_news_excludes_already_shown_links(monkeypatch, isolated_subscribers_db):
     """Shares subscriber_ops' pushed_links dedup memory with news_push.py --
-    an article a push digest already delivered must not resurface here."""
+    an article a push digest already delivered must not resurface here.
+    An empty candidate pool short-circuits before the model is ever
+    called -- see search_news's own "no is no" design."""
     embedder = FakeEmbedder()
     link = "https://example.com/coding"
     article = _cached_article(
@@ -361,19 +348,24 @@ def test_search_news_excludes_already_shown_links(monkeypatch, isolated_subscrib
     )
     monkeypatch.setattr(news_cache, "read_all", lambda: [article])
     subscriber_ops.mark_links_shown(1, [link], datetime.now(timezone.utc))
+    model = MagicMock()
 
-    output = _search_news_call(embedder=embedder, query="AI coding assistant")
+    result = agent.search_news(1, "AI coding assistant", [], model, None, embedder)
 
-    assert "No cached articles found" in output
-    assert link not in output
+    assert result == agent._no_results_message("AI coding assistant")
+    model.invoke.assert_not_called()
 
 
-def test_search_news_marks_returned_links_shown_without_advancing_last_push_at(monkeypatch, isolated_subscribers_db):
+def test_search_news_marks_only_actually_cited_links_shown_without_advancing_last_push_at(
+    monkeypatch, isolated_subscribers_db
+):
     """The other half of the shared-dedup contract: a search result must
     itself become "already shown" (so a later push doesn't re-send it),
     but must NOT touch last_push_at -- a manual search must never delay
     this subscriber's own scheduled push. See subscriber_ops.mark_links_shown
-    and advance_last_push_at's docstrings for the 2026-09-04 split."""
+    and advance_last_push_at's docstrings for the 2026-09-04 split. Only
+    what the model actually cites counts as shown -- same convention as
+    telegram_html.links_actually_sent, shared with news_push.py."""
     embedder = FakeEmbedder()
     link = "https://example.com/coding"
     article = _cached_article(
@@ -382,8 +374,11 @@ def test_search_news_marks_returned_links_shown_without_advancing_last_push_at(m
     )
     monkeypatch.setattr(news_cache, "read_all", lambda: [article])
     assert subscriber_ops.get_last_push_at(1) is None
+    model = FakeToolCallingModel(
+        responses=[AIMessage(content=f'<a href="{link}">New AI coding assistant launches</a>')]
+    )
 
-    _search_news_call(embedder=embedder, query="AI coding assistant")
+    agent.search_news(1, "AI coding assistant", [], model, None, embedder)
 
     assert link in subscriber_ops.get_pushed_links(1)
     assert subscriber_ops.get_last_push_at(1) is None
@@ -392,16 +387,19 @@ def test_search_news_marks_returned_links_shown_without_advancing_last_push_at(m
 def test_search_news_enforces_daily_quota(monkeypatch, isolated_subscribers_db):
     monkeypatch.setattr(agent, "SEARCH_DAILY_LIMIT", 1)
     monkeypatch.setattr(news_cache, "read_all", lambda: [])
+    model = MagicMock()
 
-    first = _search_news_call(query="AI")
-    second = _search_news_call(query="AI")
+    first = agent.search_news(1, "AI", [], model, None, None)
+    second = agent.search_news(1, "AI", [], model, None, None)
 
-    assert "No cached articles found" in first  # cap not yet reached, just an empty cache
+    assert first == agent._no_results_message("AI")  # cap not yet reached, just an empty cache
     assert "today's searches" in second
+    model.invoke.assert_not_called()
 
 
 def test_search_news_generates_and_caches_a_query_definition_when_uncached(monkeypatch, isolated_subscribers_db):
     monkeypatch.setattr(news_cache, "read_all", lambda: [])
+    monkeypatch.setattr(agent, "_rewrite_search_query", lambda query, history, guard_model: query)
     expand_calls = []
 
     def fake_expand(model, interest):
@@ -410,33 +408,78 @@ def test_search_news_generates_and_caches_a_query_definition_when_uncached(monke
 
     monkeypatch.setattr(news_classify, "expand_interest_for_retrieval", fake_expand)
 
-    output = _search_news_call(guard_model="fake-guard-model", query="AI coding")
+    result = agent.search_news(1, "AI coding", [], MagicMock(), "fake-guard-model", None)
 
     assert expand_calls == ["AI coding"]
     assert interest_cache_ops.get_interest_query_expansion("AI coding") == "a generated definition"
-    assert "a generated definition" in output
+    assert result == agent._no_results_message("AI coding")
 
 
 def test_search_news_reuses_a_cached_query_definition(monkeypatch, isolated_subscribers_db):
     interest_cache_ops.set_interest_query_expansion("AI coding", "already cached definition")
     monkeypatch.setattr(news_cache, "read_all", lambda: [])
+    monkeypatch.setattr(agent, "_rewrite_search_query", lambda query, history, guard_model: query)
 
     def fail_if_called(model, interest):
         raise AssertionError("should not regenerate a cached definition")
 
     monkeypatch.setattr(news_classify, "expand_interest_for_retrieval", fail_if_called)
 
-    output = _search_news_call(guard_model="fake-guard-model", query="AI coding")
+    result = agent.search_news(1, "AI coding", [], MagicMock(), "fake-guard-model", None)
 
-    assert "already cached definition" in output
+    assert result == agent._no_results_message("AI coding")
 
 
 def test_search_news_no_results_message(monkeypatch, isolated_subscribers_db):
     monkeypatch.setattr(news_cache, "read_all", lambda: [])
 
-    output = _search_news_call(query="AI coding")
+    result = agent.search_news(1, "AI coding", [], MagicMock(), None, None)
 
-    assert "No cached articles found" in output
+    assert result == 'No related news found for "AI coding".'
+
+
+# --- query-rewrite: resolving a context-dependent follow-up ----------------
+
+
+def test_search_news_rewrites_a_follow_up_using_conversation_history(monkeypatch, isolated_subscribers_db):
+    """"what about Nvidia?" only makes sense with the conversation above
+    it -- the rewrite step must resolve it into a standalone topic before
+    anything downstream (definition generation, embedding, the
+    no-results message) ever sees the raw follow-up phrasing."""
+    monkeypatch.setattr(news_cache, "read_all", lambda: [])
+    guard_model = FakeToolCallingModel(responses=[AIMessage(content="Nvidia")])
+    history = [HumanMessage(content="What's new in AI chips?"), AIMessage(content="...")]
+
+    result = agent.search_news(1, "what about Nvidia?", history, MagicMock(), guard_model, None)
+
+    assert result == 'No related news found for "Nvidia".'
+
+
+def test_search_news_skips_rewrite_when_guard_model_is_none(monkeypatch, isolated_subscribers_db):
+    monkeypatch.setattr(news_cache, "read_all", lambda: [])
+
+    result = agent.search_news(1, "what about Nvidia?", [], MagicMock(), None, None)
+
+    assert result == 'No related news found for "what about Nvidia?".'
+
+
+def test_search_news_rewrite_failure_falls_back_to_the_raw_query(monkeypatch, isolated_subscribers_db):
+    """Degrades to the unresolved raw query rather than crashing -- an
+    unresolved follow-up is a worse search, not a broken one; same
+    fail-open shape as the rest of this pipeline."""
+    monkeypatch.setattr(news_cache, "read_all", lambda: [])
+    # Isolated from definition generation, which isn't what this test is
+    # about -- guard_model's generic MagicMock().invoke() would otherwise
+    # also stand in for expand_interest_for_retrieval's own internal
+    # with_structured_output(...).invoke() call, returning an
+    # un-storable MagicMock instead of a real string.
+    monkeypatch.setattr(news_classify, "expand_interest_for_retrieval", lambda model, interest: None)
+    guard_model = MagicMock()
+    guard_model.invoke.side_effect = RuntimeError("simulated model failure")
+
+    result = agent.search_news(1, "what about Nvidia?", [], MagicMock(), guard_model, None)
+
+    assert result == 'No related news found for "what about Nvidia?".'
 
 
 def test_run_agent_no_tool_call_direct_answer():

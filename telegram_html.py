@@ -102,3 +102,29 @@ def _check_escaping(segment: str) -> str | None:
     if ">" in segment:
         return "unescaped > outside a recognized tag -- use &gt;"
     return None
+
+
+# Distinct from _HREF_RE above (which validates one already-extracted <a>
+# attribute string) -- this one finds every href value in free-form text.
+_HREF_VALUE_RE = re.compile(r"""href=["']([^"']+)["']""", re.IGNORECASE)
+
+
+def links_actually_sent(digest: str, candidates: list[dict]) -> list[str]:
+    """Which candidate articles genuinely appear in a model-written
+    digest/report. Shared by news_push.write_push_digest and
+    agent.search_news -- moved here (a zero-dependency leaf module) from
+    news_push.py 2026-09-05 specifically so agent.py could reuse it
+    without a circular import (news_push.py already imports agent.py).
+
+    The digest is free-form prose the model writes from a candidate
+    list, and both callers' prompts explicitly tell it to omit candidates
+    that aren't relevant -- so "what was offered" and "what the reader
+    actually saw" are different sets. Only the latter should count as
+    seen: marking an omitted candidate as sent would retire an article
+    nobody ever read.
+
+    Recovered by matching the digest's own <a href> targets against the
+    candidate links, since both callers' report-structure prompts require
+    every cited item to carry its source link and forbid inventing URLs."""
+    hrefs = {h.strip() for h in _HREF_VALUE_RE.findall(digest or "")}
+    return [a["link"] for a in candidates if a.get("link") in hrefs]

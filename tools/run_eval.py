@@ -235,8 +235,8 @@ def judge_reply(judge_model, category: str, question: str, reply: str) -> EvalVe
 # --- Runner ------------------------------------------------------------
 
 
-async def run_case(agent_obj, guard_model, case: dict) -> dict:
-    result = await bot.process_message(_EVAL_CHAT_ID, case["text"], agent_obj, guard_model)
+async def run_case(model, guard_model, case: dict) -> dict:
+    result = await bot.process_message(_EVAL_CHAT_ID, case["text"], model, guard_model)
     checks = run_deterministic_checks(result["reply"], case["category"])
     verdict = judge_reply(guard_model, case["category"], case["text"], result["reply"])
     return {
@@ -296,9 +296,7 @@ def main():
 
     cases = [c for c in EVAL_CASES if args.category is None or c["category"] == args.category]
 
-    agent_obj = agent.build_agent(model)
-
-    results = [asyncio.run(run_case(agent_obj, guard_model, case)) for case in cases]
+    results = [asyncio.run(run_case(model, guard_model, case)) for case in cases]
     print_report(results)
 
 
