@@ -25,22 +25,22 @@ Run:
     python agent.py
 """
 
-import json
 from datetime import datetime, timezone
-from langchain_core.tools import tool
 from langchain.agents import create_agent
 from langchain.agents.middleware import dynamic_prompt
-from langchain.tools import ToolRuntime
 from langchain_openai import ChatOpenAI
 from app_settings import get_settings
 import telemetry
+from telemetry import EventLogger, get_event_logger
+from telemetry_providers import Level
 import news_cache
 import news_classify
 import news_embed
 import interest_cache_ops
 import subscriber_ops
+import telegram_html
 
-NOTES_FILE = "notes.jsonl"
+_events: EventLogger = get_event_logger("argus.agent")
 
 # search_news's own relevance-keep clamp -- see news_embed.filter_by_relevance's
 # docstring for why each caller passes its own values rather than sharing
@@ -150,12 +150,16 @@ LAYER1_IDENTITY = (
 )
 
 # --- Layer 2: situational instructions -----------------------------------
-# The only category that still reaches the agent loop at all -- news_query.
-# set_interest/remove_interest/start_push/stop_push/set_language are
-# dispatched directly by agent.dispatch_settings (below) once the router
-# has already extracted their arguments, per
-# docs/plans/context-management-plan.md's settings-dispatch refactor, so
-# there's no per-category selection left to do here.
+# news_query used to be the only category that reached the agent loop --
+# it no longer does either, as of 2026-09-05 (see search_news's own note
+# below): its retrieval turned out to be fully boundable to a fixed
+# pipeline, the same way set_interest/remove_interest/start_push/
+# stop_push/set_language already were. Those are dispatched directly by
+# agent.dispatch_settings (below) once the router has already extracted
+# their arguments, per docs/plans/context-management-plan.md's
+# settings-dispatch refactor. LAYER1_IDENTITY/_compose_prompt/
+# build_agent/run_agent below are kept working but currently unused by
+# any live route -- see TOOLS's own comment for why.
 
 # Shared with news_push.py's digest-writing prompt (see that module) so the
 # two places that ever write a trend report can't drift apart the way
@@ -176,6 +180,30 @@ HTML_FORMATTING_RULES = (
     "as a substitute for an actual label."
 )
 
+def _report_structure_body(source_label: str) -> str:
+    """The shared "subtitle / sentences / link line" section format both
+    TREND_REPORT_STRUCTURE and search_news's _SEARCH_REPORT_BASE_PROMPT
+    build a report from -- factored out so a formatting tweak (spacing,
+    the link-line style, etc.) can't silently drift between the two the
+    way HTML_FORMATTING_RULES already exists to prevent for the tag
+    rules themselves. `source_label` is the one wording difference
+    between the two callers -- "the source material below" (the news_query
+    agent's own search results) vs. "the candidate list below" (search_news's
+    pre-filtered pool)."""
+    return (
+        "<b>[Short subtitle naming one theme or story]</b>\n"
+        "[1-3 tight sentences — don't pad. If multiple sources are covering "
+        "the same underlying story or trend, synthesize them into one summary "
+        "instead of listing each source's article separately.]\n"
+        "🔗 <a href=\"URL1\">Source name 1</a> · <a href=\"URL2\">Source name 2</a>\n\n"
+        "<b>[Next subtitle]</b>\n"
+        "[...]\n\n"
+        "Use a blank line between sections, one <b>subtitle</b> per distinct "
+        f"theme or story, and only include sources actually provided in "
+        f"{source_label} — never invent a URL."
+    )
+
+
 TREND_REPORT_STRUCTURE = (
     "Structure the report like this:\n"
     "📰 <b>[Topic] Trend Report</b>\n\n"
@@ -189,16 +217,8 @@ TREND_REPORT_STRUCTURE = (
     "this note in the middle or at the end: a reader who only sees the "
     "first section must already know there's no direct coverage before "
     "reading anything about the substituted topic.\n\n"
-    "<b>[Short subtitle naming one theme or story]</b>\n"
-    "[1-3 tight sentences — don't pad. If multiple sources are covering "
-    "the same underlying story or trend, synthesize them into one summary "
-    "instead of listing each source's article separately.]\n"
-    "🔗 <a href=\"URL1\">Source name 1</a> · <a href=\"URL2\">Source name 2</a>\n\n"
-    "<b>[Next subtitle]</b>\n"
-    "[...]\n\n"
-    "Use a blank line between sections, one <b>subtitle</b> per distinct "
-    "theme or story, and only include sources actually provided in the "
-    "source material below — never invent a URL.\n\n"
+    + _report_structure_body("the source material below")
+    + "\n\n"
     "Your reply must consist ONLY of the final report above — no preamble "
     "or narration about your process (never write things like \"Let me "
     "compile these into a report\", \"I'll prioritize the recent ones\", "
@@ -206,6 +226,14 @@ TREND_REPORT_STRUCTURE = (
     "line."
 )
 
+# Dormant as of 2026-09-05, along with build_agent/run_agent/TOOLS/
+# compose_prompt below -- news_query no longer reaches the agent loop
+# these feed (bot.py calls search_news directly now, see that function's
+# own note), and TOOLS is empty, so this text's "Use the search_news
+# tool" instruction has nothing left to refer to. Left as-is rather than
+# rewritten for a hypothetical future tool -- whoever wires one back into
+# TOOLS should rewrite this for what that tool actually is, not inherit
+# search_news's own wording by accident.
 _NEWS_QUERY_INSTRUCTIONS = (
     "This turn: the user wants tech/AI news or trends. Use the search_news "
     "tool to gather recent items, spot recurring themes across sources, "
@@ -256,28 +284,134 @@ def compose_prompt(request):
 
 
 # --- Tools -------------------------------------------------------------
+#
+# Empty for now -- the two tools that used to live here (save_note, an
+# always-dead path never actually reachable through the real router's
+# classifier prompt; search_news, moved below to its own deterministic
+# function, 2026-09-05) are both gone. build_agent/run_agent and this
+# list are kept, not deleted, for whenever a future feature genuinely
+# needs a model that decides its own number of steps -- see that
+# function's own docstring for why nothing currently does.
+
+TOOLS = []
 
 
-@tool
-def save_note(note: str) -> str:
-    """Save a short note to persistent local storage for later recall."""
-    entry = {"note": note, "ts": datetime.now().isoformat()}
-    with open(NOTES_FILE, "a") as f:
-        f.write(json.dumps(entry) + "\n")
-    return f"Saved note: {note}"
+# --- search_news: one deterministic lookup, not an agent loop ------------
+#
+# Redesigned 2026-09-05 after a live INT test showed the tool-calling
+# version (search_news as a @tool the agent decided whether/how often to
+# call) searching the SAME question 5-7 times -- each one a full
+# news_cache.read_all() (measured ~15s against INT's real 2036-article
+# cache) plus its own model round trip, because TREND_REPORT_STRUCTURE's
+# gap-note instruction ("if nothing covers this, name related coverage
+# instead") gave the model a reason to keep searching for material to pad
+# a gap-note with, and nothing capped how many times it could try. Fixed
+# by making retrieval a fixed, bounded pipeline instead of something an
+# agent loop decides to repeat: at most one query-rewrite call, one
+# vector retrieval (code, no model), and one report-writing call -- ever,
+# per search. "No genuinely relevant news" is now a real, final answer
+# (see _SEARCH_REPORT_BASE_PROMPT below), not a reason to try again.
+
+_QUERY_REWRITE_PROMPT = (
+    "Rewrite the user's latest message below into a single, self-contained "
+    "search topic for a tech/AI news search -- output ONLY the topic, "
+    "nothing else (no quotes, no explanation, no preamble). If the message "
+    "already stands on its own without needing anything from the "
+    "conversation above, return it as-is, lightly cleaned up (e.g. strip "
+    "filler words like \"tell me about\"). If it depends on earlier "
+    "context to make sense (e.g. \"what about Nvidia?\", \"and more on "
+    "that\"), resolve it into a standalone topic using that context "
+    "(e.g. \"Nvidia\")."
+)
 
 
-@tool
-def search_news(query: str, runtime: ToolRuntime) -> str:
-    """Search the already-ingested news cache for a query (e.g. a company,
-    model name, or topic like "AI regulation") and return the most
-    relevant recent articles. This is a one-off lookup, not a
-    subscription -- it does not add or change any of the user's interests.
-    """
-    chat_id = runtime.context["chat_id"]
-    guard_model = runtime.context.get("guard_model")
-    embedder = runtime.context.get("embedder")
+def _rewrite_search_query(query: str, history: list, guard_model) -> str:
+    """Resolves context-dependent phrasing ("what about Nvidia?") into a
+    standalone search topic, using the conversation history -- without
+    this, a follow-up question would be embedded and searched literally,
+    with nothing for the vector search to match against.
 
+    guard_model is the cheap/fast model already used for definition
+    generation and guardrail classification, not the main report-writing
+    model -- this is one bounded call, not a step in a reasoning loop:
+    unlike the old tool-calling design, nothing here can decide to call
+    itself again.
+
+    Degrades to the raw `query` (no rewrite) when guard_model is None or
+    the call fails -- an unresolved follow-up is a worse search, not a
+    broken one; same fail-open shape as the rest of this pipeline."""
+    if guard_model is None:
+        return query
+    messages = (
+        [{"role": "system", "content": _QUERY_REWRITE_PROMPT}]
+        + history
+        + [{"role": "user", "content": query}]
+    )
+    try:
+        response = guard_model.invoke(messages)
+        rewritten = (response.content or "").strip()
+    except Exception as exc:
+        _events.log("search_query_rewrite_failed",
+                     {"message": f"could not rewrite search query {query!r}", "query": query},
+                     level=Level.WARN, exc=exc)
+        return query
+    return rewritten or query
+
+
+def _no_results_message(topic: str) -> str:
+    return f'No related news found for "{topic}".'
+
+
+# Deliberately NOT built from TREND_REPORT_STRUCTURE (agent.py's old
+# tool-loop prompt, still used by news_push._PUSH_DIGEST_PROMPT) --
+# TREND_REPORT_STRUCTURE's gap-note instruction ("if nothing covers this
+# directly, name related coverage instead") is exactly what gave the old
+# design a reason to keep searching, and per this session's own explicit
+# direction ("no is no"), search_news must not pad a report with
+# tangential background when nothing is genuinely relevant -- it must say
+# so and stop. news_push.py's own prompt/behavior is untouched by this;
+# push has its own, different "write nothing" convention for the same
+# situation, appropriate for a scheduled digest, not an interactive
+# question that deserves a visible answer either way.
+_SEARCH_REPORT_BASE_PROMPT = (
+    "You are a technology industry analyst answering one subscriber's "
+    "on-demand search on a Telegram bot, covering AI and the broader tech "
+    "industry. Below is a list of candidate articles retrieved by semantic "
+    "similarity to the search topic -- that retrieval is approximate, not "
+    "a guarantee: some candidates may not actually be relevant. Use your "
+    "own judgment: write a short report covering ONLY the candidates that "
+    "are genuinely, specifically relevant to the search topic, silently "
+    "omitting any that aren't. Do not pad the report with tangentially "
+    "related background just because nothing directly relevant was "
+    "found.\n\n"
+    + HTML_FORMATTING_RULES
+    + "\n\n"
+    "If a genuine report can be written, structure it like this:\n"
+    "📰 <b>[Topic] Search Results</b>\n\n"
+    + _report_structure_body("the candidate list below")
+    + "\n\n"
+    "Your reply must consist ONLY of the final report (or the exact "
+    "no-results line an instruction below may specify) — no preamble or "
+    "narration about your process."
+)
+
+
+def search_news(chat_id: int, query: str, history: list, model, guard_model, embedder=None) -> str:
+    """Search the already-ingested news cache for `query` and return the
+    most relevant recent articles as a finished, ready-to-send report --
+    a one-off lookup, not a subscription; it does not add or change any
+    of the user's interests. Not a LangChain tool any more (see this
+    module's own note above) -- a plain function bot.py's news_query
+    route calls directly, exactly once per user question, guaranteed.
+
+    `history` is this chat's prior conversation turns (whatever shape
+    bot.py's chat_histories already holds), used only by the
+    query-rewrite step to resolve a context-dependent follow-up -- this
+    function itself has no memory of its own and makes no other use of
+    it. `guard_model`/`embedder` are optional (default None) and this
+    function degrades gracefully without either -- a caller that hasn't
+    built one yet (or a test) can omit them, same convention as the
+    rest of this pipeline."""
     today = datetime.now(timezone.utc).date().isoformat()
     if not subscriber_ops.try_consume_search_query(chat_id, today, daily_cap=SEARCH_DAILY_LIMIT):
         return (
@@ -285,18 +419,20 @@ def search_news(query: str, runtime: ToolRuntime) -> str:
             "The count resets at midnight UTC -- your push digest still keeps arriving on schedule."
         )
 
+    topic = _rewrite_search_query(query, history, guard_model)
+
     # Same cache-check-then-generate pattern as _add_one_interest: a
     # generated definition is a measurably better embedding query than
     # the bare string (see news_classify.expand_interest_for_retrieval),
-    # and it's cached under the query text itself so a repeated search
-    # (or an interest added later with the same wording) reuses it rather
-    # than paying for generation twice.
-    definition = interest_cache_ops.get_interest_query_expansion(query)
+    # and it's cached under the (rewritten) topic itself so a repeated
+    # search -- or an interest added later with the same wording --
+    # reuses it rather than paying for generation twice.
+    definition = interest_cache_ops.get_interest_query_expansion(topic)
     if definition is None and guard_model is not None:
-        definition = news_classify.expand_interest_for_retrieval(guard_model, query)
+        definition = news_classify.expand_interest_for_retrieval(guard_model, topic)
         if definition is not None:
-            interest_cache_ops.set_interest_query_expansion(query, definition)
-    query_text = definition or query
+            interest_cache_ops.set_interest_query_expansion(topic, definition)
+    query_text = definition or topic
 
     # Shared with news_push.py: a search result counts as "shown" the
     # same way a delivered digest does, so a later push doesn't re-send
@@ -322,19 +458,35 @@ def search_news(query: str, runtime: ToolRuntime) -> str:
     results = relevant[:SEARCH_MAX_RESULTS]
 
     if not results:
-        return f'No cached articles found for "{query}" (searched as: {query_text}).'
+        return _no_results_message(topic)
 
-    subscriber_ops.mark_links_shown(chat_id, [a["link"] for a in results], datetime.now(timezone.utc))
+    listing = "\n".join(
+        f"- {a['title']} ({a.get('source') or a.get('source_key', '')}, "
+        f"published {a.get('published') or 'date unknown'}) — {a.get('link')}"
+        for a in results
+    )
+    system_prompt = _SEARCH_REPORT_BASE_PROMPT + (
+        f"\n\nThe subscriber's search topic is: {topic}. The candidates "
+        "below already passed a coarse relevance filter based on "
+        "similarity to this topic's definition -- that does NOT confirm "
+        f"they are actually, specifically about {topic}. If NONE of the "
+        "candidates below are genuinely, specifically relevant, reply "
+        f"with EXACTLY this text and nothing else: {_no_results_message(topic)}"
+    )
+    response = model.invoke([
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": listing},
+    ])
+    report = response.content
 
-    lines = [f"Searched as: {query_text}", f"{len(results)} article(s) found:"]
-    for a in results:
-        published = a.get("published") or "date unknown"
-        source = a.get("source") or a.get("source_key", "")
-        lines.append(f"- {a['title']} ({source}, published {published}) — {a.get('link', '')}")
-    return "\n".join(lines)
-
-
-TOOLS = [save_note, search_news]
+    # Only what the report actually cites counts as "shown" -- same
+    # reasoning and same helper as news_push.links_actually_sent: a
+    # candidate the model saw but silently omitted (including every
+    # candidate, in the no-results case) was never actually shown to the
+    # subscriber, so it stays eligible for a later search or push.
+    cited_links = telegram_html.links_actually_sent(report, results)
+    subscriber_ops.mark_links_shown(chat_id, cited_links, datetime.now(timezone.utc))
+    return report
 
 
 # --- Route B: settings dispatch, outside the agent loop -------------------
@@ -600,8 +752,8 @@ def setup_telemetry():
     """Delegates to telemetry.setup_telemetry() -- see that module for
     the real implementation. Kept as a one-line wrapper here (rather
     than updating every caller to `import telemetry` directly) since
-    bot.py/combined_bot.py/tools/run_eval.py all already import
-    setup_telemetry from agent alongside build_agent/run_agent/etc.,
+    bot.py/combined_bot.py/tools/run_eval.py all already import other
+    names from agent (build_model_from_settings, search_news, etc.),
     and none of that has anything to do with telemetry specifically --
     no reason to make them import a second module just for this one
     function."""

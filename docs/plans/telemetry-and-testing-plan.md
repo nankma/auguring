@@ -14,7 +14,7 @@ they're constructed, rather than hardcoded.
 | 2 | Test infrastructure (folder, fixtures, fake LLM, fake logger) | Done |
 | 3 | Telemetry service install + hook (real backend for normal runs) | Done — originally Arize Phoenix via Docker, then a second backend (Logfire) added alongside it 2026-08-21. Superseded 2026-08-24: Phoenix retired, Logfire the sole live backend. **Superseded again 2026-09-03: `logfire_logger.py` (a single hardcoded `LogfireLogger`) was itself replaced by a pluggable-provider architecture** — new top-level `telemetry.py` reads ONE settings list (`telemetry.providers`) and routes each entry to two internally-separate `TracerProvider`s (general app-events vs. LLM-call tracing) purely by the entry's own discovered class's `KIND`; providers (`otlp.py` — generic OTLP, covers Logfire/Grafana Cloud/SigNoz/OpenObserve; `file.py` — local JSON lines; `phoenix.py` — direct OTLP to a self-hosted Phoenix, no `arize-phoenix-otel` dependency) live under `telemetry_providers/`, auto-discovered the same way `news_adapters/` are. `logfire_logger.py`/`tests/test_logfire_logger.py` deleted outright. See `docs/standaloneplan/01-settings-migration.md`'s "Telemetry providers, take two/take three" sections for the full history (take two shipped a real double-export/kind-leak bug, caught by code review the same day; take three is the corrected, currently-live design) and `docs/current/telemetry-catalog.md` for what actually gets emitted. **`docs/current/infrastructure.md` was not updated alongside this and still describes the retired `logfire_logger.py`/`LOGFIRE_ENABLED` shape as current — stale, needs a pass.** |
 | 4 | CI setup (test automation) | Done — GitHub Actions; branch protection pending manual confirmation |
-| 5 | Test cases (actual scenarios) | Done — 732 tests as of 2026-09-04 (started at 16; see below for what's covered vs. not, and its own stale-count disclaimer). `tests/test_users_db.py` was split six ways (`tests/test_subscriber_ops.py`/`test_category_ops.py`/`test_push_outcome_ops.py`/`test_api_budget_ops.py`/`test_interest_cache_ops.py`/`test_source_state_ops.py`) alongside the `users_db.py` -> `storage/` + `*_ops.py` refactor — same bodies, same total count, no coverage lost in the split. New gap the split didn't close: `storage/postgres/__init__.py` (`PostgresStorage`) and the backend-selection dispatch itself (`storage/__init__.py`'s `_build_storage`, `storage/engine.py`'s `build_engine`) have zero test coverage — every test injects a pre-built `SqliteStorage` via `storage.reset_storage_for_tests()` (see `tests/conftest.py`'s `isolated_subscribers_db`), bypassing both files entirely. |
+| 5 | Test cases (actual scenarios) | Done — 735 tests as of 2026-09-05 (started at 16; see below for what's covered vs. not, and its own stale-count disclaimer). `tests/test_users_db.py` was split six ways (`tests/test_subscriber_ops.py`/`test_category_ops.py`/`test_push_outcome_ops.py`/`test_api_budget_ops.py`/`test_interest_cache_ops.py`/`test_source_state_ops.py`) alongside the `users_db.py` -> `storage/` + `*_ops.py` refactor — same bodies, same total count, no coverage lost in the split. New gap the split didn't close: `storage/postgres/__init__.py` (`PostgresStorage`) and the backend-selection dispatch itself (`storage/__init__.py`'s `_build_storage`, `storage/engine.py`'s `build_engine`) have zero test coverage — every test injects a pre-built `SqliteStorage` via `storage.reset_storage_for_tests()` (see `tests/conftest.py`'s `isolated_subscribers_db`), bypassing both files entirely. **2026-09-05: `search_news` redesigned from a LangChain tool into a plain bounded function (see item 5's own entry in `docs/plans/local-news-cache-plan.md`'s Status table for the incident) and `save_note`/`agent.NOTES_FILE` removed outright** — `tests/conftest.py`'s `isolated_notes_file` fixture (referenced in section 2 below) no longer exists, and `tests/test_agent.py`'s search_news tests (section 5 below) no longer drive it through `FakeToolCallingModel`'s tool-calling loop, they call the function directly. `agent.build_agent`/`run_agent` and their own direct tests (`test_run_agent_no_tool_call_direct_answer`, `test_run_agent_records_callback_events`) are unchanged and still pass — that machinery is dormant, not deleted. QA re-verified 2026-09-05: 735/735 passing, 90% combined coverage across `agent.py`/`bot.py`/`news_push.py`/`telegram_html.py`/`combined_bot.py` (agent.py 93%, bot.py 87%, news_push.py 100%, telegram_html.py 98%, combined_bot.py 53% pre-existing and unrelated to this change — its untested lines are `main()`/`run_both()` wiring, never exercised by any test before this change either). One gap flagged back, not written here per this doc's own division of labor: `bot._route_a_reply`'s `except Exception` branch (the `search_news` call raising, returned as `blocked_at="agent_error"`) has no test forcing that path — pre-existing (the same branch existed before this rewrite, under the old `run_agent` call), not newly introduced, but still open. |
 | 6 | LLM-judged end-to-end evaluation | **Built 2026-08-16** — `tools/run_eval.py`, 11/11 passing on first real run, see below |
 
 ## 1. Dependency injection
@@ -32,11 +32,14 @@ over-engineering for a single-file agent).
 
 Built under `tests/`:
 
-- `tests/conftest.py` — `isolated_notes_file` fixture: monkeypatches
+- ~~`tests/conftest.py` — `isolated_notes_file` fixture: monkeypatches
   `agent.NOTES_FILE` to a `tmp_path` file so `save_note` tests never touch the
-  real `notes.jsonl`. (Confirmed necessary the hard way — an ad-hoc
-  verification test before this fixture existed wrote a real "hello test"
-  entry into the actual file; had to be cleaned up by hand.)
+  real `notes.jsonl`.~~ **Removed 2026-09-05** along with `save_note`/
+  `agent.NOTES_FILE` themselves (see item 5's Status-table entry above) —
+  there is no longer a notes file to isolate. (Kept here, struck through
+  rather than deleted, as the historical record of why it existed: an
+  ad-hoc verification test before this fixture existed wrote a real
+  "hello test" entry into the actual file; had to be cleaned up by hand.)
 - `tests/fakes.py`:
   - `FakeToolCallingModel` — a **custom** fake, not a LangChain built-in.
     Both `GenericFakeChatModel` and `FakeMessagesListChatModel`
@@ -357,16 +360,24 @@ deployment chain resolved, not just this).
 
 ## 5. Test cases
 
-16 tests, all passing, all real network/LLM calls mocked out:
+16 tests, all passing, all real network/LLM calls mocked out (this
+snapshot is from very early in the project and is itself long superseded
+by the dated entries further down this section — 735 tests as of
+2026-09-05; kept as the historical starting point, not a description of
+current test content):
 
 **`tests/test_agent.py`** (the agentic loop, via `FakeToolCallingModel`):
-- `save_note` writes the expected JSON line to an isolated temp file and
-  returns the expected confirmation — real `notes.jsonl` untouched.
+- ~~`save_note` writes the expected JSON line to an isolated temp file and
+  returns the expected confirmation — real `notes.jsonl` untouched.~~
+  **`save_note` (and this test) removed outright 2026-09-05** — see the
+  "search_news redesigned into a plain, bounded function" entry below.
 - `search_news` aggregation with one working + one failing mocked source:
   the working source's result and an `ERROR: ...` line for the failing one
   both appear in the tool output, and the agent still reaches a final
   answer — confirms per-source error isolation actually works end-to-end,
-  not just in isolated unit logic.
+  not just in isolated unit logic. **Superseded 2026-09-04/2026-09-05** —
+  `search_news` no longer fetches from any live source or runs inside an
+  agent tool-calling loop at all; see the dated entries below.
 - A turn with no tool calls at all — direct answer, no `ToolMessage` in the
   result.
 - `run_agent`'s `callbacks` param actually reaches the model —
@@ -552,6 +563,36 @@ behaviour rather than more of an existing one:
   written here per this doc's own division of labor): no test asserts
   `SEARCH_MAX_RESULTS` actually truncates a pool bigger than 5, and no
   test asserts multiple relevant results come back newest-first.
+
+- **`search_news` redesigned into a plain, bounded function (2026-09-05)**
+  — see `docs/plans/local-news-cache-plan.md` item 5's own updated entry
+  for the incident (a live INT test found the old tool-calling version
+  searching one question 5-7 times) and `agent.py`'s own module note
+  above `search_news`. `tests/test_agent.py`'s search_news tests no
+  longer drive it through `FakeToolCallingModel`'s tool-calling loop
+  (the two now-removed `_search_news_call`/`isolated_notes_file` helpers)
+  — they call `agent.search_news(chat_id, query, history, model,
+  guard_model, embedder)` directly, and assert against a `_RecordingModel`
+  (a `FakeToolCallingModel` subclass capturing exactly what was passed to
+  `model.invoke()`) rather than parsing a `ToolMessage`. New coverage
+  added: the empty-candidate-pool short-circuit calls `model.invoke.
+  assert_not_called()` — confirming "no is no" is a real early return,
+  not just a prompt instruction; three query-rewrite cases (a successful
+  rewrite using conversation history actually changing what gets
+  searched, `guard_model=None` skipping the rewrite, and
+  `guard_model.invoke()` raising falling back to the raw query). `agent.
+  build_agent`/`run_agent` keep their own pre-existing direct tests
+  unmodified (`test_run_agent_no_tool_call_direct_answer`,
+  `test_run_agent_records_callback_events`) — that machinery is dormant,
+  not deleted, per explicit user direction. `telegram_html.
+  links_actually_sent` (moved from `news_push.py`, now shared by both
+  `write_push_digest` and `search_news`) took its five existing tests
+  with it into `tests/test_telegram_html.py`, unchanged in substance.
+  QA re-verified 2026-09-05: 735/735 passing, 90% combined coverage
+  across `agent.py`/`bot.py`/`news_push.py`/`telegram_html.py`/
+  `combined_bot.py` — see item 5's Status-table entry above for the
+  per-file breakdown and the one gap flagged back
+  (`bot._route_a_reply`'s `except Exception` branch, pre-existing).
 
 **Not covered yet** (candidates for later):
 - ~~`agent._logfire_processor`'s actual body, and the Logfire-only wiring

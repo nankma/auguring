@@ -46,7 +46,6 @@ that lost one cycle's cut was excluded permanently, without ever having
 been seen by anyone.
 """
 
-import re
 from datetime import datetime, timedelta, timezone
 
 import agent
@@ -770,26 +769,6 @@ def write_push_digest(model, articles: list[dict], topic: str | None = None,
     )
     return response.content
 
-
-_HREF_RE = re.compile(r"""href=["']([^"']+)["']""", re.IGNORECASE)
-
-
-def links_actually_sent(digest: str, candidates: list[dict]) -> list[str]:
-    """Which candidate articles genuinely appear in the delivered digest.
-
-    The digest is free-form prose the model writes from the candidate list,
-    and _PUSH_DIGEST_PROMPT explicitly tells it to omit candidates that
-    aren't relevant -- so "what we offered" and "what the subscriber saw"
-    are different sets. Only the latter should count as seen: marking an
-    omitted candidate as sent would retire an article nobody ever read.
-
-    Recovered by matching the digest's own <a href> targets against the
-    candidate links, since TREND_REPORT_STRUCTURE requires every cited item
-    to carry its source link and forbids inventing URLs."""
-    hrefs = {h.strip() for h in _HREF_RE.findall(digest or "")}
-    return [a["link"] for a in candidates if a.get("link") in hrefs]
-
-
 # Liveness for the dead man's switch in
 # docs/plans/observability-platform-plan.md.
 #
@@ -1178,7 +1157,7 @@ async def run_push_cycle(model, send: "callable", now: datetime | None = None, e
                 # instruction below -- a stricter prompt makes the model
                 # MORE likely to reject everything, which makes this
                 # exact gap more likely to fire, not less.
-                if not digest or not _HREF_RE.search(digest):
+                if not digest or not telegram_html.links_actually_sent(digest, new_articles):
                     # Stage 2 judged none of this interest's candidates
                     # genuinely relevant -- see _PUSH_DIGEST_PROMPT's
                     # explicit "write nothing" instruction. Not an error,
@@ -1211,8 +1190,8 @@ async def run_push_cycle(model, send: "callable", now: datetime | None = None, e
 
                 # Only what the subscriber actually saw is retired. A
                 # candidate the model left out stays eligible for a later
-                # digest -- see links_actually_sent.
-                delivered.extend(links_actually_sent(digest, new_articles))
+                # digest -- see telegram_html.links_actually_sent.
+                delivered.extend(telegram_html.links_actually_sent(digest, new_articles))
                 subscriber_ops.mark_interest_pushed(chat_id, topic, now)
                 sent += 1
 

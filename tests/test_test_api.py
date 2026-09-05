@@ -20,7 +20,7 @@ def running_server(monkeypatch):
     behavior."""
     monkeypatch.setattr(test_api, "PORT", 0)  # ephemeral port, avoids clashing with a real deploy
 
-    async def fake_process_message(chat_id, text, agent, guard_model, embedder=None):
+    async def fake_process_message(chat_id, text, model, guard_model, embedder=None):
         return {"blocked_at": None, "category": "news_query", "reply": f"echo:{text}"}
 
     monkeypatch.setattr(bot, "process_message", fake_process_message)
@@ -32,7 +32,7 @@ def running_server(monkeypatch):
     # _Server's constructor is plain sync code (binds a socket, stores a
     # reference to `loop` for the handler to target later via
     # run_coroutine_threadsafe) -- no need to run it "on" the loop itself.
-    server = test_api._Server(loop, "fake-agent", "fake-model")
+    server = test_api._Server(loop, "fake-model", "fake-guard-model")
     serve_thread = threading.Thread(target=server.serve_forever, daemon=True)
     serve_thread.start()
 
@@ -100,7 +100,7 @@ def test_process_message_failure_returns_500(running_server, monkeypatch, isolat
     having created the real subscribers.db table) -- failed for real on
     CI, a fresh environment with no such luck (sqlite3.OperationalError:
     no such table: subscribers)."""
-    async def failing_process_message(chat_id, text, agent, guard_model, embedder=None):
+    async def failing_process_message(chat_id, text, model, guard_model, embedder=None):
         raise RuntimeError("simulated pipeline failure")
     monkeypatch.setattr(bot, "process_message", failing_process_message)
 
@@ -125,7 +125,7 @@ def test_server_binds_to_all_interfaces_inside_the_container(running_server):
 
 def test_start_does_nothing_when_env_var_unset(monkeypatch):
     monkeypatch.delenv("ENABLE_TEST_API", raising=False)
-    assert test_api.start(agent="fake", guard_model="fake") is None
+    assert test_api.start(model="fake", guard_model="fake") is None
 
 
 def test_start_returns_server_when_env_var_set(monkeypatch):
@@ -133,7 +133,7 @@ def test_start_returns_server_when_env_var_set(monkeypatch):
     monkeypatch.setattr(test_api, "PORT", 0)
 
     async def _run():
-        server = test_api.start(agent="fake", guard_model="fake")
+        server = test_api.start(model="fake", guard_model="fake")
         try:
             assert server is not None
             assert server.server_address[0] == "0.0.0.0"

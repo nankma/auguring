@@ -3,9 +3,10 @@
 `news_sources.py` is a pluggable source registry — free/no-key sources
 are always enabled; key-gated sources turn on automatically once their
 env var is set. It powers `news_ingest.py`'s scheduled background pulls,
-which populate the local cache `news_push.py`'s digests and `agent.py`'s
-`search_news` tool both read (`agent.py`'s `search_news` stopped calling
-any source here live, 2026-09-04 — see
+which populate the local cache both `news_push.py`'s digests and
+`agent.py`'s `search_news` read (`agent.py`'s `search_news` stopped
+calling any source here live, 2026-09-04, and stopped being a
+LangChain tool at all, 2026-09-05 — see
 `docs/plans/local-news-cache-plan.md` item 5). This doc tracks what's
 wired up, what's just documented for later, and how to add more.
 

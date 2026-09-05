@@ -1620,49 +1620,6 @@ def test_run_push_cycle_isolates_one_subscribers_failure(monkeypatch, isolated_s
     send.assert_called_once_with(7, '<b>Digest</b> <a href="https://example.com/ok">s</a>', topic="AI")
 
 
-# --- links_actually_sent --------------------------------------------------
-#
-# This decides what gets recorded as "already seen", so a bug here either
-# retires articles nobody read or re-sends ones they already got.
-
-
-def test_links_actually_sent_returns_only_candidates_present_in_the_digest():
-    candidates = [_article("https://example.com/a"), _article("https://example.com/b")]
-    digest = '<b>News</b><a href="https://example.com/a">Only A</a>'
-
-    assert news_push.links_actually_sent(digest, candidates) == ["https://example.com/a"]
-
-
-def test_links_actually_sent_handles_single_quoted_hrefs():
-    candidates = [_article("https://example.com/a")]
-
-    assert news_push.links_actually_sent(
-        "<a href='https://example.com/a'>A</a>", candidates
-    ) == ["https://example.com/a"]
-
-
-def test_links_actually_sent_returns_nothing_for_a_digest_with_no_anchors():
-    """A digest the model wrote without any links means nothing verifiable
-    reached the subscriber, so nothing is recorded as seen."""
-    candidates = [_article("https://example.com/a")]
-
-    assert news_push.links_actually_sent("Just prose, no links at all", candidates) == []
-
-
-def test_links_actually_sent_ignores_hrefs_that_match_no_candidate():
-    """The model can cite a URL that wasn't in the candidate list. Only
-    candidate links are recorded -- pushed_links is keyed to the cache."""
-    candidates = [_article("https://example.com/a")]
-    digest = '<a href="https://elsewhere.com/x">Elsewhere</a>'
-
-    assert news_push.links_actually_sent(digest, candidates) == []
-
-
-def test_links_actually_sent_on_empty_digest_is_empty():
-    assert news_push.links_actually_sent("", [_article("https://example.com/a")]) == []
-    assert news_push.links_actually_sent(None, [_article("https://example.com/a")]) == []
-
-
 # --- push outcomes: what _record reports each cycle -----------------------
 #
 # Each of these asserts the OUTCOME recorded, not the print. The point of

@@ -36,7 +36,7 @@ Run:
 import asyncio
 import signal
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
-from agent import build_agent, build_model_from_settings, run_agent, setup_telemetry
+from agent import build_model_from_settings, setup_telemetry
 from app_settings import get_settings
 from ptb_error_handler import register_error_handler
 import bot as info_bot
@@ -48,9 +48,9 @@ import storage
 import subscriber_ops
 
 
-def build_info_app(agent, admin_chat_id: int, admin_bot_token: str, guard_model=None, embedder=None) -> Application:
+def build_info_app(model, admin_chat_id: int, admin_bot_token: str, guard_model=None, embedder=None) -> Application:
     app = Application.builder().token(get_settings().resolved("delivery.telegram.bot-token", required=True)).build()
-    app.bot_data["agent"] = agent
+    app.bot_data["model"] = model
     # guard_model is independently configurable from agent's own model via
     # LLM_MODEL_CLASSIFIER -- see agent.build_model and
     # docs/plans/model-portability-plan.md's Level 2 per-stage routing.
@@ -99,7 +99,7 @@ async def run_both(
         await admin_app.updater.start_polling()
 
         test_api_server = test_api.start(
-            info_app.bot_data["agent"], info_app.bot_data["guard_model"], info_app.bot_data.get("embedder")
+            info_app.bot_data["model"], info_app.bot_data["guard_model"], info_app.bot_data.get("embedder")
         )
 
         print("Both bots ready (polling). Ctrl+C to stop.")
@@ -144,10 +144,9 @@ def main():
     # user's own message, not a background batch job. See
     # build_model_from_config's own docstring.
     guard_model = build_model_from_settings(settings, "models.guardrail", default_timeout=20.0)
-    agent = build_agent(model)
     embedder = news_embed.build_embedder()
 
-    info_app = build_info_app(agent, admin_chat_id, admin_bot_token, guard_model=guard_model, embedder=embedder)
+    info_app = build_info_app(model, admin_chat_id, admin_bot_token, guard_model=guard_model, embedder=embedder)
     admin_app = build_admin_app(admin_chat_id, info_bot_token)
 
     asyncio.run(run_both(info_app, admin_app, admin_bot_token, admin_chat_id))
