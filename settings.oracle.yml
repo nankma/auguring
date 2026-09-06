@@ -34,6 +34,18 @@ storage:
         trailsign-resolve: environment-variable
         name: SUBSCRIBERS_DB_FILE
 
+# Pluggable news-cache backend (vector_store/) -- PROD stays on
+# yaml_files (today's behavior, unchanged) until sqlite_vec is proven on
+# INT first, same "prove it there before PROD" pattern as
+# storage.database's own postgres option above.
+news_cache:
+  backend:
+    type: yaml_files
+    # sqlite_vec:
+    #   path:
+    #     trailsign-resolve: environment-variable
+    #     name: NEWS_VECTOR_DB_FILE
+
 # Bridges to the same DEEPSEEK_API_KEY env var docker-entrypoint.sh
 # already vault-fetches -- zero behavior change from before this was
 # migrated to Settings.

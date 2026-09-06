@@ -1,18 +1,21 @@
 """
-Local file cache for news articles -- see docs/plans/local-news-cache-plan.md.
+Local cache for news articles -- see docs/plans/local-news-cache-plan.md.
 
-One YAML file per article, named `{source}-{id}.yaml` where `id` is a
-short hash of the article's link. Hashing the link (rather than an
-incrementing counter, or a per-source ID field not every source provides)
-means re-fetching the same article in a later ingestion cycle produces the
-same filename and just overwrites harmlessly -- free deduplication, no
-separate tracking state needed.
+Thin delegator, as of 2026-09-05: the actual storage is pluggable (see
+vector_store/__init__.py's get_vector_store(), selected by
+news_cache.backend.type) -- YamlFilesStore (one YAML file per article,
+today's default/unchanged behavior) or SqliteVecStore (a SQLite table +
+the sqlite-vec extension, for fast bulk reads and indexed similarity
+search at larger corpus sizes). Every function here just forwards to
+whichever backend is active, so callers (news_ingest.py, news_push.py,
+agent.py) never need to know which one -- same "callers never see
+get_storage()" shape as subscriber_ops.py.
 
-CACHE_DIR is configurable via storage.news_cache_dir (settings.yml, see
-app_settings.py), same reasoning as storage.database.sqlite.path
--- local dev and the deployed container need different paths, and a
-container restart shouldn't lose the cache if news_cache_dir points at
-the same mounted volume as subscribers.db.
+DEFAULT_TTL_HOURS stays here, not per-backend: retention policy (how long
+an article counts as current news) is a news_cache-level decision that
+applies regardless of which backend stores the data, unlike CACHE_DIR/
+ARCHIVE_DIR (backend-specific paths, now resolved inside each backend's
+own __init__ -- see vector_store/yaml_files.py).
 
 Retention is judged by `fetched_at` (when THIS system pulled the article),
 not `published_dt` (the source's own claimed publish time) -- some
@@ -21,191 +24,38 @@ fetched_at is always known and controlled by our own code, so cleanup can
 always trust it.
 """
 
-import hashlib
 from datetime import datetime
 from pathlib import Path
 
-import yaml
-
 from app_settings import get_settings
+from vector_store import get_vector_store
 
-# required=True, no default -- this is a value the service always needs
-# a real one for; settings.yml not having it is a deployment mistake and
-# should fail loudly at startup, not silently fall back to anything
-# (including the old NEWS_CACHE_DIR env var). See
-# docs/standaloneplan/01-settings-migration.md's "Migration methodology".
-CACHE_DIR = get_settings().resolved("storage.news_cache_dir.path", required=True)
 DEFAULT_TTL_HOURS = get_settings().resolved("storage.news_cache_dir.ttl_hours", default=48)
-
-# Where expired articles go instead of being deleted. Unset (the default)
-# keeps the original behaviour -- cleanup_expired unlinks them.
-#
-# The point of archiving is corpus size. Every clustering and retrieval
-# measurement in docs/analysis/cluster-measurements.md ran against ~2,262
-# articles, which is a 48-hour window, and several conclusions were limited
-# by it: HDBSCAN needs 8 articles to form a cluster at all, so topics real
-# subscribers follow (semiconductors: 13 articles, optical: 6, AAOI: 0)
-# could never produce one. A month of accumulation is roughly 33,000
-# articles at the current rate -- about 130 MB, against 33 GB free on the
-# VM, so disk is not a consideration.
-#
-# IMPORTANT: both this and news_cache_dir must point INSIDE the mounted
-# volume (/data on the deployed container). They don't by default, and
-# that is not a theoretical risk: as of 2026-08-19 the live cache sat at
-# /app/news_cache, on the container filesystem, so every redeploy silently
-# destroyed it. 2,202 articles existed only because the container happened
-# not to have restarted in three days.
-# default=None here is a real, intentional value (archiving off), not a
-# stand-in for "figure this out" -- unlike CACHE_DIR above, an absent
-# key here is a legitimate, expected state, so this one stays optional.
-ARCHIVE_DIR = get_settings().resolved("storage.news_archive_dir", default=None)
-
-
-def _cache_dir() -> Path:
-    path = Path(CACHE_DIR)
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _archive_dir(fetched_at: datetime | None) -> Path:
-    """Archived articles land in a per-day subdirectory. A month at the
-    current ingestion rate is ~33k files; one flat directory of those is
-    slow to list and awkward to copy off the VM in pieces, and the day
-    boundary is the natural unit for both."""
-    day = (fetched_at or datetime(1970, 1, 1)).date().isoformat()
-    path = Path(ARCHIVE_DIR) / day
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _article_id(link: str) -> str:
-    return hashlib.sha256(link.encode("utf-8")).hexdigest()[:12]
-
-
-def _file_path(source_key: str, link: str) -> Path:
-    return _cache_dir() / f"{source_key}-{_article_id(link)}.yaml"
-
-
-def _iso(dt: datetime | None) -> str | None:
-    return dt.isoformat() if dt else None
-
-
-def _parse_iso(raw: str | None) -> datetime | None:
-    return datetime.fromisoformat(raw) if raw else None
 
 
 def write_article(source_key: str, article: dict, categories: list[str] | None,
-                  fetched_at: datetime, embedding: list[float] | None = None) -> Path:
-    """`source_key` is the registry key (e.g. "bbc_business", matching
-    SOURCE_REGISTRY in news_sources.py), not the article's own "source"
-    field (a display name like "BBC Business") -- the filename needs the
-    short, filesystem-clean key, not the human-readable name. `article` is
-    the normalized shape news_sources.py's fetch_* functions return
-    (title/link/source/summary/published/published_dt). Overwrites
-    silently if this exact link was already cached (from an earlier cycle,
-    or a different source pulling the same story) -- the newer fetch and
-    classification simply replace the older one.
-
-    `embedding` is optional and None by default -- an article cached
-    before news_embed.py existed, or one whose embedding call failed
-    (see news_embed's module docstring on why that must never block
-    caching), simply has none. Every consumer (near-duplicate collapse,
-    offbeat selection in news_push.select_candidate_articles) already
-    treats a missing embedding as "skip this feature for this article",
-    the same fail-open shape as a missing `categories`."""
-    link = article["link"]
-    record = {
-        "source": article.get("source"),
-        "source_key": source_key,
-        "title": article.get("title"),
-        "link": link,
-        "summary": article.get("summary"),
-        "published": article.get("published"),
-        "published_dt": _iso(article.get("published_dt")),
-        "fetched_at": _iso(fetched_at),
-        # None, not [], when the article was never classified. The two are
-        # different facts -- "nothing applied" versus "we don't know" -- and
-        # writing [] for both is what made a three-day classification outage
-        # indistinguishable from normal operation. news_ingest writes
-        # category_ops.UNCLASSIFIABLE for the first case.
-        "categories": list(categories) if categories is not None else None,
-        "embedding": list(embedding) if embedding is not None else None,
-    }
-    path = _file_path(source_key, link)
-    with open(path, "w", encoding="utf-8") as f:
-        yaml.safe_dump(record, f, allow_unicode=True, sort_keys=False)
-    return path
+                  fetched_at: datetime, embedding: list[float] | None = None) -> Path | None:
+    """See vector_store.VectorStore.write_article -- every backend
+    implements the same contract described there. Only YamlFilesStore
+    returns a real Path (the file it wrote); other backends return None."""
+    return get_vector_store().write_article(source_key, article, categories, fetched_at, embedding)
 
 
 def read_all() -> list[dict]:
-    """Every currently-cached article, parsed back with published_dt and
-    fetched_at as real datetimes (not the raw ISO strings written to disk)
-    -- mirrors news_sources.py's own published/published_dt shape so
-    downstream filtering code doesn't need to know the difference between
-    a freshly-fetched article and one read back from the cache."""
-    articles = []
-    for path in _cache_dir().glob("*.yaml"):
-        try:
-            with open(path, encoding="utf-8") as f:
-                record = yaml.safe_load(f)
-        except (OSError, yaml.YAMLError):
-            continue
-        if not record:
-            continue
-        record["published_dt"] = _parse_iso(record.get("published_dt"))
-        record["fetched_at"] = _parse_iso(record.get("fetched_at"))
-        articles.append(record)
-    return articles
-
-
-def _retire(path: Path, fetched_at: datetime | None) -> None:
-    """Removes `path` from the active cache -- by moving it to the archive
-    if one is configured, otherwise by deleting it.
-
-    A same-named file already in the archive is replaced. The filename is a
-    hash of the article's link, so a collision means the same article was
-    re-fetched and re-expired; keeping the newer record is right, and it
-    also means the archive is deduplicated by link for free, the same
-    property write_article relies on."""
-    if ARCHIVE_DIR:
-        target = _archive_dir(fetched_at) / path.name
-        try:
-            path.replace(target)
-            return
-        except OSError:
-            # Cross-device rename, a read-only archive path, a full disk.
-            # Fall through to deleting rather than leaving the file in the
-            # active cache forever, which would make it a permanent
-            # candidate and re-attempt this on every single cycle.
-            print(f"[news_cache] could not archive {path.name}, deleting instead")
-    path.unlink(missing_ok=True)
+    """See vector_store.VectorStore.read_all."""
+    return get_vector_store().read_all()
 
 
 def cleanup_expired(now: datetime, ttl_hours: int = DEFAULT_TTL_HOURS) -> int:
-    """Retires every cached file whose fetched_at is older than ttl_hours,
-    and returns how many. A file with no parseable fetched_at (shouldn't
-    happen -- we always write it -- but cheap to guard) is treated as
-    expired rather than kept forever by accident.
+    """See vector_store.VectorStore.cleanup_expired."""
+    return get_vector_store().cleanup_expired(now, ttl_hours)
 
-    "Retires" rather than "deletes" because NEWS_ARCHIVE_DIR turns this
-    into a move -- see ARCHIVE_DIR. Either way the file leaves the active
-    cache, so read_all() and everything downstream see no difference; the
-    TTL still governs what the bot considers current news."""
-    retired = 0
-    for path in _cache_dir().glob("*.yaml"):
-        try:
-            with open(path, encoding="utf-8") as f:
-                record = yaml.safe_load(f)
-        except (OSError, yaml.YAMLError):
-            # Unparseable: retire it, but with no usable fetched_at to file
-            # it under. It lands in the archive's epoch bucket rather than
-            # today's, so a corrupt file can't masquerade as fresh data in
-            # whatever later reads the archive.
-            _retire(path, None)
-            retired += 1
-            continue
-        fetched_at = _parse_iso((record or {}).get("fetched_at"))
-        if fetched_at is None or (now - fetched_at).total_seconds() > ttl_hours * 3600:
-            _retire(path, fetched_at)
-            retired += 1
-    return retired
+
+def search_similar(query_vector: list[float], top_k: int,
+                   exclude_links: set[str] | None = None) -> list[dict]:
+    """See vector_store.VectorStore.search_similar. Not called by any
+    production code yet (agent.py's search_news still does its own
+    read_all() + news_embed.filter_by_relevance pass) -- exposed here so
+    a future caller doesn't need to know about vector_store directly,
+    consistent with everything else in this module."""
+    return get_vector_store().search_similar(query_vector, top_k, exclude_links)

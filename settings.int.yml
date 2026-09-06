@@ -45,6 +45,19 @@ storage:
     #     trailsign-resolve: environment-variable
     #     name: POSTGRES_PASSWORD
 
+# Pluggable news-cache backend (vector_store/) -- INT is where sqlite_vec
+# gets proven live first, same "test infra lives here before PROD"
+# pattern as storage.database's own Postgres test above. yaml_files
+# block kept commented out, not deleted, for a one-line revert.
+news_cache:
+  backend:
+    type: sqlite_vec
+    # yaml_files: {}
+    sqlite_vec:
+      path:
+        trailsign-resolve: environment-variable
+        name: NEWS_VECTOR_DB_FILE
+
 # main: identical to production on purpose (the model that matters for
 # actual reply quality). guardrail: routed through a SEPARATE Together.ai
 # account instead of DeepSeek direct, deliberately -- so INT's high

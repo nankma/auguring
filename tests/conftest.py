@@ -4,12 +4,15 @@ import app_settings
 from trailsign import Settings
 
 # Required settings, injected before the imports below -- module-level
-# constants like news_cache.CACHE_DIR are computed once at import time,
-# so this has to run before those imports, not inside a fixture
+# constants like message_archive.ARCHIVE_DIR are computed once at import
+# time, so this has to run before those imports, not inside a fixture
 # (fixtures run per-test, long after collection-time imports already
 # happened). Values are placeholders -- individual tests that care
 # override them via monkeypatch.setattr on the module constant directly
-# (see isolated_news_cache etc. below), not by touching Settings again.
+# (see isolated_message_archive below), or, for news_cache's now-pluggable
+# backend (2026-09-05), by injecting a fresh backend instance via
+# vector_store.reset_vector_store_for_tests (see isolated_news_cache
+# below) -- not by touching Settings again.
 # See docs/standaloneplan/01-settings-migration.md's "Migration
 # methodology" for why these are required=True with no code-level
 # fallback in the modules themselves.
@@ -64,17 +67,31 @@ import message_archive
 import news_cache
 import news_keyness
 import storage
+import vector_store
 from storage.sqlite import SqliteStorage
+from vector_store.yaml_files import YamlFilesStore
 from tests.fakes import fake_pos_tag, fake_word_tokenize
 
 
 @pytest.fixture
-def isolated_news_cache(monkeypatch, tmp_path):
-    """Point news_cache.CACHE_DIR at a temp directory for the duration of a
-    test, so cache tests never touch the real news_cache/ directory."""
-    path = tmp_path / "news_cache"
-    monkeypatch.setattr(news_cache, "CACHE_DIR", str(path))
-    return path
+def isolated_news_cache(tmp_path):
+    """Points the active YamlFilesStore backend at a temp directory for
+    the duration of a test, so cache tests never touch the real
+    news_cache/ directory. Injects a fresh instance via
+    vector_store.reset_vector_store_for_tests (a module-level singleton,
+    like storage.reset_storage_for_tests) -- 2026-09-05's pluggable
+    news-cache-backend split moved CACHE_DIR/ARCHIVE_DIR off news_cache.py
+    itself and into YamlFilesStore's own __init__, so this can no longer
+    be a plain monkeypatch.setattr on a module constant. A test that needs
+    to change ARCHIVE_DIR mid-test reaches this same instance via
+    vector_store.get_vector_store() and monkeypatches its
+    _archive_dir_path attribute directly."""
+    store = YamlFilesStore.__new__(YamlFilesStore)
+    store._cache_dir_path = str(tmp_path / "news_cache")
+    store._archive_dir_path = None
+    vector_store.reset_vector_store_for_tests(store)
+    yield tmp_path / "news_cache"
+    vector_store.reset_vector_store_for_tests(None)
 
 
 @pytest.fixture(autouse=True)

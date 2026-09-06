@@ -97,6 +97,43 @@ pass first, per that rule.
   backlog of spans carrying the raw id" -- hygiene rather than privacy
   engineering at this project's current stage, but not yet done project-wide.
 
+- [ ] **Alert on low available memory.** No alert exists for the deploy
+  target running low on memory -- worth having before the `vector_store`
+  work (news_cache's pluggable `sqlite_vec` backend, 2026-09-05) loads
+  more into a single SQLite file than the old one-YAML-file-per-article
+  cache ever held at once. `VM.Standard.E2.1.Micro` historically had very
+  little free memory to begin with (~420MB when `news_embed.py`'s
+  model2vec choice was measured) -- a threshold-based Logfire alert (or a
+  simple periodic `free -h`-equivalent check) would catch this before an
+  OOM kill does.
+
+- [ ] **Alert on DB size exceeding some threshold.** No alert exists for
+  `subscribers.db`/the new vector-store SQLite file growing past a
+  reasonable size. Directly relevant once `vector_store`'s `sqlite_vec`
+  backend ships: unlike the old per-article YAML files (which the OS
+  filesystem just held individually), a single growing `.db` file is
+  easier to lose track of size-wise until it's already a problem.
+
+- [ ] **Alert on total on-disk storage exceeding some threshold.**
+  Broader than the DB-size alert above -- covers `NEWS_ARCHIVE_DIR`
+  (already growing, unbounded, see the next item), `NEWS_CACHE_DIR`/the
+  vector store, and `message_archive` together. The free-tier VM's disk
+  is finite even though `news_cache.py`'s own comment currently frames it
+  as "not a consideration" at 48h-retention scale (~130MB/month) -- worth
+  a real number once retention windows grow past that assumption.
+
+- [ ] **Decide a retention TTL for archived (expired) vector-store data,
+  don't keep it forever.** `vector_store`'s `sqlite_vec` backend
+  (2026-09-05) marks expired articles `archived_at` instead of deleting
+  them (preserving their embeddings for later analysis, matching
+  `NEWS_ARCHIVE_DIR`'s existing behavior for the `yaml_files` backend) --
+  but neither backend's archive has ever had its own expiration. This was
+  raised and deliberately left open during that design pass rather than
+  decided on the spot: at minimum needs a real number (30 days? 90? tied
+  to one of `docs/analysis/cluster-measurements.md`'s findings?) and a
+  cleanup mechanism, before archived data quietly becomes the same kind
+  of unbounded-growth risk the three alerts above exist to catch.
+
 - [ ] **Create the two remaining HTML-validation Logfire alerts.**
   `news_push._emit_html_validation_attempt` has been emitting an
   `html_validation_attempt` span per retry attempt since the 2026-08-28
