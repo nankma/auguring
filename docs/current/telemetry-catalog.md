@@ -104,10 +104,48 @@ Every row also carries `otel.status_code=ERROR` and a recorded exception
 | `interest_expand_failed` | `argus.news_classify` | `news_classify.expand_interest_for_retrieval` | WARN | `interest` | |
 | `router_failed` | `argus.guardrails` | `guardrails.classify_message` (layer 2) | **ERROR** | — | load-bearing: silent fail-open here is the exact 2026-08-21 incident (`docs/plans/guardrails-plan.md`) — don't let a future alert audit downgrade this to WARN |
 | `output_check_failed` | `argus.guardrails` | `guardrails.is_output_on_topic` (layer 4) | **ERROR** | — | same reasoning as `router_failed`, its layer-4 mirror |
+| `search_query_rewrite_failed` | `argus.agent` | `agent._rewrite_search_query` | WARN | `query` | added 2026-09-05 alongside search_news's query-rewrite step; missing from this table until now, not a new event |
 
-None of these eleven have a dedicated alert yet — they're new visibility,
+None of these twelve have a dedicated alert yet — they're new visibility,
 not new paging. `router_failed`/`output_check_failed` are the strongest
 candidates for one, given the incident they're already tied to.
+
+### `search_news` per-call latency (`EventLogger`-emitted, `level=INFO`)
+
+Added 2026-09-05, after a live INT test found one search_news question
+taking 75-100+ seconds (the tool-calling-loop design that PR #85 replaced
+— see `docs/plans/local-news-cache-plan.md` item 5's "2026-09-05
+redesign" note for the full incident) and a follow-up investigation on
+the fixed, deterministic pipeline still measured ~11-20s per question.
+These seven events exist to make that breakdown queryable going forward
+instead of needing another one-off `print()`-based diagnostic pass —
+each wraps exactly one real API call (or, for `latency_cache_read_relevance_filter`,
+one non-API but previously-slow step) in `agent.search_news`'s pipeline,
+in the order they execute:
+
+| `span_name` (`event`) | `otel_scope_name` | Emitted by | Attributes beyond `message` | Fires |
+|---|---|---|---|---|
+| `latency_layer2_classify` | `argus.bot` | `bot.process_message` | `duration_seconds` (float) | Every message, all categories — not search_news-specific |
+| `latency_query_rewrite` | `argus.agent` | `agent._rewrite_search_query` | `duration_seconds` | Every search_news call with a non-None `guard_model` |
+| `latency_definition_generation` | `argus.agent` | `agent.search_news` | `duration_seconds` | Only on a cache-miss for the (rewritten) topic — skipped entirely once a topic's definition is cached |
+| `latency_cache_read_relevance_filter` | `argus.agent` | `agent.search_news` | `duration_seconds` | Every search_news call (news_cache.read_all() + news_embed.filter_by_relevance) |
+| `latency_report_writing` | `argus.agent` | `agent.search_news` | `duration_seconds` | Every search_news call that reaches the model (i.e. the candidate pool wasn't empty) |
+| `latency_search_news_total` | `argus.bot` | `bot._route_a_reply` | `duration_seconds` | Every news_query turn -- wall-clock for the whole search_news call, should roughly equal the sum of the four `agent.*` events above plus DB/quota overhead not separately timed |
+| `latency_layer4_output_check` | `argus.bot` | `bot._route_a_reply` | `duration_seconds` | Every news_query turn |
+
+**Real numbers measured live on INT, 2026-09-05** (two genuinely new
+topics, each a real cache-miss so all seven events fired): 11.23s and
+7.89s total. **`latency_definition_generation` was the single largest
+contributor in both runs** (4.71s and 2.66s) — bigger than
+`latency_report_writing` (1.88s and, in the second run, whatever the
+no-results branch's write cost was), which had been the assumed
+bottleneck before measuring. `latency_cache_read_relevance_filter` was
+consistently ~0.1s, confirming the `vector_store`/`SqliteVecStore`
+migration (this same day) closed that gap as intended. See
+`docs/plans/local-news-cache-plan.md`'s latency section for the full
+investigation writeup. Not yet re-measured on a topic with an
+ALREADY-cached definition (`latency_definition_generation` skipped
+entirely) — expected to be meaningfully faster, not yet confirmed.
 
 ## Auto-instrumented spans (not hand-written — `openinference-instrumentation-langchain`)
 
