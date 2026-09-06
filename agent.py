@@ -25,6 +25,7 @@ Run:
     python agent.py
 """
 
+import time
 from datetime import datetime, timezone
 from langchain.agents import create_agent
 from langchain.agents.middleware import dynamic_prompt
@@ -348,7 +349,10 @@ def _rewrite_search_query(query: str, history: list, guard_model) -> str:
         + [{"role": "user", "content": query}]
     )
     try:
+        _t0 = time.monotonic()
         response = guard_model.invoke(messages)
+        _events.log("latency_query_rewrite", {"message": "query-rewrite call returned",
+                     "duration_seconds": round(time.monotonic() - _t0, 3)})
         rewritten = (response.content or "").strip()
     except Exception as exc:
         _events.log("search_query_rewrite_failed",
@@ -429,7 +433,10 @@ def search_news(chat_id: int, query: str, history: list, model, guard_model, emb
     # reuses it rather than paying for generation twice.
     definition = interest_cache_ops.get_interest_query_expansion(topic)
     if definition is None and guard_model is not None:
+        _t0 = time.monotonic()
         definition = news_classify.expand_interest_for_retrieval(guard_model, topic)
+        _events.log("latency_definition_generation", {"message": "definition-generation call returned",
+                     "duration_seconds": round(time.monotonic() - _t0, 3)})
         if definition is not None:
             interest_cache_ops.set_interest_query_expansion(topic, definition)
     query_text = definition or topic
@@ -444,6 +451,7 @@ def search_news(chat_id: int, query: str, history: list, model, guard_model, emb
     # split this depends on.
     already_shown = set(subscriber_ops.get_pushed_links(chat_id))
     epoch = datetime.min.replace(tzinfo=timezone.utc)
+    _t0 = time.monotonic()
     pool = sorted(
         (a for a in news_cache.read_all() if a.get("link") and a["link"] not in already_shown),
         key=lambda a: a.get("published_dt") or epoch,
@@ -455,6 +463,8 @@ def search_news(chat_id: int, query: str, history: list, model, guard_model, emb
         keep_min=SEARCH_RELEVANCE_KEEP_MIN,
         keep_max=SEARCH_RELEVANCE_KEEP_MAX,
     )
+    _events.log("latency_cache_read_relevance_filter", {"message": "news_cache read + relevance filter completed",
+                 "duration_seconds": round(time.monotonic() - _t0, 3)})
     results = relevant[:SEARCH_MAX_RESULTS]
 
     if not results:
@@ -473,10 +483,13 @@ def search_news(chat_id: int, query: str, history: list, model, guard_model, emb
         "candidates below are genuinely, specifically relevant, reply "
         f"with EXACTLY this text and nothing else: {_no_results_message(topic)}"
     )
+    _t0 = time.monotonic()
     response = model.invoke([
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": listing},
     ])
+    _events.log("latency_report_writing", {"message": "report-writing call returned",
+                 "duration_seconds": round(time.monotonic() - _t0, 3)})
     report = response.content
 
     # Only what the report actually cites counts as "shown" -- same

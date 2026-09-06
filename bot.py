@@ -28,6 +28,7 @@ Run:
 
 import asyncio
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from langchain_core.messages import AIMessage, HumanMessage
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -441,7 +442,10 @@ async def _route_a_reply(
     either, so a caller that hasn't built one yet (or a test) can pass
     embedder=None."""
     try:
+        _t0 = time.monotonic()
         report = await asyncio.to_thread(search_news, chat_id, user_text, history, model, guard_model, embedder)
+        _events.log("latency_search_news_total", {"message": "search_news returned",
+                     "duration_seconds": round(time.monotonic() - _t0, 3)})
     except Exception as exc:
         return "agent_error", f"Something went wrong: {exc}"
 
@@ -450,7 +454,10 @@ async def _route_a_reply(
     # Guardrail layer 4: re-checks the model's actual output before it's
     # sent -- the layer that catches drift layers 1-3 missed, since the
     # failure is only visible in what the model wrote, not the input.
+    _t0 = time.monotonic()
     output_on_topic = await asyncio.to_thread(guardrails.is_output_on_topic, guard_model, final_content, category)
+    _events.log("latency_layer4_output_check", {"message": "output guardrail checked the reply",
+                 "duration_seconds": round(time.monotonic() - _t0, 3)})
     if not output_on_topic:
         return "layer4_output_check", guardrails.REDIRECT_MESSAGE
 
@@ -572,7 +579,10 @@ async def process_message(chat_id: int, user_text: str, model, guard_model, embe
         # request(s) is this", and (for Route B categories) the arguments each
         # one needs -- gating the expensive agent call and, for settings
         # categories, replacing it entirely.
+        _t0 = time.monotonic()
         classification = await asyncio.to_thread(guardrails.classify_message, guard_model, user_text)
+        _events.log("latency_layer2_classify", {"message": "router classified the message",
+                     "duration_seconds": round(time.monotonic() - _t0, 3)})
         if not classification.on_topic:
             return {"blocked_at": "layer2_router", "category": classification.categories[0], "reply": guardrails.REDIRECT_MESSAGE}
 

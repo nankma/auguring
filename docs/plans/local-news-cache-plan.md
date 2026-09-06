@@ -41,6 +41,76 @@ during item 5's implementation, are new surface with their own future
 tuning questions, e.g. whether 10/day is the right default once real
 usage exists — not tracked in this doc.)
 
+## `search_news` latency investigation (2026-09-05)
+
+The 2026-09-05 redesign (item 5's row above) fixed the *repeated-call*
+problem — one question no longer triggers 5-7 `search_news` invocations
+— but fixing that surfaced the next question: how long does even ONE
+question actually take, and where does the time go? This section is
+that follow-up investigation's writeup, per user request, so the finding
+doesn't need re-deriving next time someone asks "why is search still
+slow."
+
+**Two separate bottlenecks, fixed in two separate changes:**
+
+1. **`news_cache.read_all()` itself was slow** — ~12s against a real
+   ~1600-2000 article corpus, confirmed by direct measurement (opening
+   and YAML-parsing ~2000 individual files has heavy per-file overhead
+   even though the actual data volume is tiny, ~6.5MB). Fixed the same
+   day by making the news-cache backend pluggable (`vector_store/`) and
+   adding a `SqliteVecStore` backend (SQLite + the sqlite-vec extension)
+   — `read_all()` dropped to **0.09s** against the identical 1606-article
+   corpus (measured on INT, real data copied from the old YAML cache, not
+   synthetic) — **~137x faster**. See `vector_store/sqlite_vec_store.py`'s
+   own module docstring for the full design and `TODO.md` for what this
+   doesn't yet answer (a retention TTL for archived rows, memory/disk
+   alerts at larger scale).
+
+2. **Even with that fixed, one question still took ~11-20s** — because
+   the disk read was never the ONLY cost, just the easiest one to
+   measure first. A live per-call timing pass (`docs/current/telemetry-catalog.md`'s
+   "`search_news` per-call latency" section has the full event catalog)
+   found a real question runs through up to **five sequential LLM API
+   calls**: the layer-2 router, `search_news`'s own query-rewrite step,
+   a definition-generation call (only on a cache-miss), the report-writing
+   call, and the layer-4 output guardrail. Two genuinely fresh topics,
+   measured live on INT 2026-09-05:
+
+   | Step | Run 1 | Run 2 |
+   |---|---|---|
+   | layer2_classify | 1.22s | — |
+   | query_rewrite | 1.81s | — |
+   | **definition_generation** | **4.71s** | **2.66s** |
+   | cache_read_relevance_filter | 0.13s | — |
+   | report_writing | 1.88s | — |
+   | search_news_total | 8.65s | 5.12s |
+   | layer4_output_check | 1.18s | — |
+   | **wall-clock total** | **11.23s** | **7.89s** |
+
+   **The definition-generation call was the single largest contributor in
+   both runs — bigger than report-writing itself**, which had been the
+   assumed bottleneck before measuring (never assume; this project's own
+   repeated lesson). It only fires on a genuine cache-miss for the
+   (rewritten) topic — a repeated search of the same topic skips it
+   entirely, via the existing `interest_cache_ops` cache — but the FIRST
+   time any given topic is searched, it's the dominant cost, not the
+   report-writing call it sits next to.
+
+   **Not yet done, flagged rather than silently skipped**: re-measuring a
+   cache-HIT run (an already-searched topic) to confirm how much faster
+   that path actually is with `latency_definition_generation` skipped
+   entirely, and investigating whether the definition-generation call
+   itself can be sped up (a smaller/faster model for this one
+   sub-task? a shorter generated definition? both untested ideas, not
+   decided on).
+
+`cache_read_relevance_filter`'s ~0.1s in both runs confirms the
+`vector_store` migration (item 1 above) closed its own gap completely —
+none of the remaining latency traces back to it. The remaining ~8-11s is
+now entirely LLM round-trip time, which is a different, separate
+optimization target (reducing the number of sequential calls, or making
+individual calls faster) from anything `vector_store` was built to fix.
+
 ## Since-based ingestion (item 7)
 
 **The problem, raised by a subscriber**: pushed digests were consistently
