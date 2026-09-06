@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 import news_cache
+import vector_store
 
 
 def _article(link="https://example.com/a", title="Title", source="BBC Business", summary="Summary"):
@@ -112,7 +113,7 @@ def test_cleanup_archives_instead_of_deleting_when_an_archive_is_configured(
     isolated_news_cache, monkeypatch, tmp_path
 ):
     archive = tmp_path / "archive"
-    monkeypatch.setattr(news_cache, "ARCHIVE_DIR", str(archive))
+    monkeypatch.setattr(vector_store.get_vector_store(), "_archive_dir_path", str(archive))
     now = datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc)
     fetched = now - timedelta(hours=72)
     path = news_cache.write_article("bbc_business", _article(), ["Finance"], fetched)
@@ -128,7 +129,7 @@ def test_cleanup_archives_instead_of_deleting_when_an_archive_is_configured(
 
 def test_archived_article_keeps_its_content(isolated_news_cache, monkeypatch, tmp_path):
     archive = tmp_path / "archive"
-    monkeypatch.setattr(news_cache, "ARCHIVE_DIR", str(archive))
+    monkeypatch.setattr(vector_store.get_vector_store(), "_archive_dir_path", str(archive))
     now = datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc)
     fetched = now - timedelta(hours=72)
     news_cache.write_article("bbc_business", _article(title="Archived title"),
@@ -153,7 +154,7 @@ def test_re_expiring_the_same_link_replaces_the_archived_copy(
     means the same article was fetched and expired twice. Keeping the newer
     copy dedupes the corpus by link for free."""
     archive = tmp_path / "archive"
-    monkeypatch.setattr(news_cache, "ARCHIVE_DIR", str(archive))
+    monkeypatch.setattr(vector_store.get_vector_store(), "_archive_dir_path", str(archive))
     now = datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc)
     fetched = now - timedelta(hours=72)
 
@@ -174,7 +175,7 @@ def test_unarchivable_file_is_deleted_rather_than_left_in_the_cache(
     """If the archive can't be written to, the file must still leave the
     active cache -- otherwise it stays an expiry candidate forever and the
     failure repeats on every single ingestion cycle."""
-    monkeypatch.setattr(news_cache, "ARCHIVE_DIR", str(tmp_path / "archive"))
+    monkeypatch.setattr(vector_store.get_vector_store(), "_archive_dir_path", str(tmp_path / "archive"))
     now = datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc)
     fetched = now - timedelta(hours=72)
     path = news_cache.write_article("bbc_business", _article(), [], fetched)
@@ -182,13 +183,13 @@ def test_unarchivable_file_is_deleted_rather_than_left_in_the_cache(
     def boom(self, target):
         raise OSError("cross-device link")
 
-    monkeypatch.setattr(news_cache.Path, "replace", boom)
+    monkeypatch.setattr(vector_store.yaml_files.Path, "replace", boom)
     assert news_cache.cleanup_expired(now, ttl_hours=48) == 1
     assert not path.exists()
 
 
 def test_cleanup_still_deletes_when_no_archive_is_configured(isolated_news_cache, monkeypatch):
-    monkeypatch.setattr(news_cache, "ARCHIVE_DIR", None)
+    monkeypatch.setattr(vector_store.get_vector_store(), "_archive_dir_path", None)
     now = datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc)
     path = news_cache.write_article("bbc_business", _article(), [], now - timedelta(hours=72))
     assert news_cache.cleanup_expired(now, ttl_hours=48) == 1
@@ -201,7 +202,7 @@ def test_corrupt_file_is_archived_into_the_epoch_bucket(isolated_news_cache, mon
     today's bucket -- whatever later reads the archive to build a corpus
     would otherwise see corrupt data dated as fresh."""
     archive = tmp_path / "archive"
-    monkeypatch.setattr(news_cache, "ARCHIVE_DIR", str(archive))
+    monkeypatch.setattr(vector_store.get_vector_store(), "_archive_dir_path", str(archive))
     now = datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc)
     bad = isolated_news_cache / "bbc_business-deadbeef.yaml"
     isolated_news_cache.mkdir(parents=True, exist_ok=True)
@@ -214,13 +215,58 @@ def test_corrupt_file_is_archived_into_the_epoch_bucket(isolated_news_cache, mon
     assert not (archive / "2026-08-15").exists()
 
 
+def _one_hot(dominant_index: int, dim: int = 8) -> list[float]:
+    """A simple vector so cosine similarity cleanly separates "close to
+    index i" from everything else, without needing real model2vec
+    output -- same convention as tests/test_sqlite_vec_store.py's own
+    _embedding helper."""
+    vector = [0.01] * dim
+    vector[dominant_index] = 1.0
+    return vector
+
+
+def test_search_similar_ranks_by_distance(isolated_news_cache):
+    now = datetime(2026, 8, 13, 12, 0, 0, tzinfo=timezone.utc)
+    news_cache.write_article("a", _article(link="https://x/close"), [], now, embedding=_one_hot(0))
+    news_cache.write_article("a", _article(link="https://x/far"), [], now, embedding=_one_hot(6))
+
+    results = news_cache.search_similar(_one_hot(0), top_k=2)
+
+    assert [a["link"] for a in results] == ["https://x/close", "https://x/far"]
+
+
+def test_search_similar_excludes_given_links(isolated_news_cache):
+    now = datetime(2026, 8, 13, 12, 0, 0, tzinfo=timezone.utc)
+    news_cache.write_article("a", _article(link="https://x/close"), [], now, embedding=_one_hot(0))
+    news_cache.write_article("a", _article(link="https://x/second"), [], now, embedding=_one_hot(1))
+
+    results = news_cache.search_similar(_one_hot(0), top_k=2, exclude_links={"https://x/close"})
+
+    assert [a["link"] for a in results] == ["https://x/second"]
+
+
+def test_search_similar_ignores_articles_with_no_embedding(isolated_news_cache):
+    now = datetime(2026, 8, 13, 12, 0, 0, tzinfo=timezone.utc)
+    news_cache.write_article("a", _article(link="https://x/no-embedding"), [], now, embedding=None)
+
+    assert news_cache.search_similar(_one_hot(0), top_k=5) == []
+
+
+def test_search_similar_returns_at_most_top_k(isolated_news_cache):
+    now = datetime(2026, 8, 13, 12, 0, 0, tzinfo=timezone.utc)
+    for i in range(5):
+        news_cache.write_article("a", _article(link=f"https://x/{i}"), [], now, embedding=_one_hot(i))
+
+    assert len(news_cache.search_similar(_one_hot(0), top_k=3)) == 3
+
+
 def test_archived_files_do_not_come_back_through_read_all(isolated_news_cache, monkeypatch, tmp_path):
     """The archive exists to accumulate a corpus, not to extend the bot's
     working set. read_all globs the cache directory only, so an archived
     article must stay invisible to ingestion and push selection -- the TTL
     still governs what counts as current news."""
     archive = tmp_path / "archive"
-    monkeypatch.setattr(news_cache, "ARCHIVE_DIR", str(archive))
+    monkeypatch.setattr(vector_store.get_vector_store(), "_archive_dir_path", str(archive))
     now = datetime(2026, 8, 15, 12, 0, 0, tzinfo=timezone.utc)
     news_cache.write_article("bbc_business", _article(link="https://example.com/old"),
                              [], now - timedelta(hours=72))

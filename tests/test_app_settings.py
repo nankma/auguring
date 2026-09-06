@@ -79,17 +79,25 @@ def test_resolved_optional_returns_the_resolved_value_when_present():
 def test_required_true_call_site_raises_when_settings_missing(monkeypatch, tmp_path):
     """End-to-end check of the actual fail-loud contract (not just
     app_settings.py in isolation): a required=True call site
-    (news_cache.CACHE_DIR) must raise SettingsError at import time when
-    no settings.yml is present, not silently fall back to anything. Run
-    in a fresh subprocess since the constant is computed once at first
-    import, which has already happened by the time any test in this
-    process runs -- see docs/standaloneplan/01-settings-migration.md's
-    "Migration methodology" rule 1."""
+    (vector_store.yaml_files.YamlFilesStore's storage.news_cache_dir.path)
+    must raise SettingsError when no settings.yml is present, not
+    silently fall back to anything.
+
+    Unlike before 2026-09-05's pluggable-news-cache-backend split, this is
+    no longer an import-time failure -- news_cache.py itself no longer
+    resolves any backend-specific setting eagerly; CACHE_DIR moved into
+    YamlFilesStore's own __init__, built lazily on first real call (the
+    same lazy-per-backend shape storage.build_engine() already used for
+    storage.database.sqlite.path). So this drives the failure through
+    news_cache.read_all() -- the first call that actually needs the
+    setting -- instead of a bare `import news_cache`. Still run in a
+    fresh subprocess so this test's own already-imported news_cache
+    doesn't mask the real fresh-process behavior."""
     monkeypatch.delenv("SETTINGS_FILE", raising=False)
     env = os.environ.copy()
     env["PYTHONPATH"] = str(_REPO_ROOT)
     result = subprocess.run(
-        [sys.executable, "-c", "import news_cache"],
+        [sys.executable, "-c", "import news_cache; news_cache.read_all()"],
         cwd=str(tmp_path),  # no settings.yml here
         env=env,
         capture_output=True,

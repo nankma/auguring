@@ -40,6 +40,19 @@ storage:
   # ttl_hours -- nothing prunes this directory by age):
   # news_archive_dir: news_archive
 
+# Pluggable news-cache backend (vector_store/) -- `type` selects
+# YamlFilesStore (default, one YAML file per article, uses storage.
+# news_cache_dir/news_archive_dir above) or SqliteVecStore (a single
+# SQLite file + the sqlite-vec extension -- faster bulk reads and, later,
+# indexed similarity search; see vector_store/sqlite_vec_store.py's own
+# docstring for the measured bottleneck this fixes). Only the matching
+# sub-block below is read.
+news_cache:
+  backend:
+    type: yaml_files
+    # sqlite_vec:
+    #   path: news_cache_vec.db
+
 # The AI connector -- works with any provider speaking the OpenAI
 # /chat/completions wire format (Together.ai, Groq, Fireworks, a
 # self-hosted vLLM server, ...). `main` is the agent's own model;

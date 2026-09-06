@@ -80,3 +80,13 @@ dependencies:
       # see docs/README.md's pointer for the extraction history).
       # PyPI-only, no conda-forge recipe.
       - trailsign
+      # vector_store/sqlite_vec_store.py -- a pluggable, faster
+      # news_cache backend (see that module's own docstring for the
+      # measured ~12s/2000-file bottleneck it fixes). No conda-forge
+      # recipe. Measured 2026-09-05 on the actual deploy target's
+      # container: ~176KB installed, zero transitive dependencies (unlike
+      # model2vec above, this one genuinely has none to worry about), and
+      # ~180KB real incremental memory once numpy is already loaded
+      # (which it already is, via model2vec) -- confirmed via real
+      # before/after RSS measurement, not assumed.
+      - sqlite-vec

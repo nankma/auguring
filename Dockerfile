@@ -59,6 +59,7 @@ COPY --chown=$MAMBA_USER:$MAMBA_USER agent.py app_settings.py news_sources.py ne
 COPY --chown=$MAMBA_USER:$MAMBA_USER news_adapters ./news_adapters
 COPY --chown=$MAMBA_USER:$MAMBA_USER telemetry_providers ./telemetry_providers
 COPY --chown=$MAMBA_USER:$MAMBA_USER storage ./storage
+COPY --chown=$MAMBA_USER:$MAMBA_USER vector_store ./vector_store
 RUN chmod +x docker-entrypoint.sh
 
 # Real incident, 2026-08-09: `docker logs` returned zero lines for this
