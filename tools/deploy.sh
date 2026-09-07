@@ -113,9 +113,21 @@ step "Preflight"
 
 [ -f "$INFRA" ] || die "$INFRA not found -- it is gitignored, so a fresh clone has to obtain it separately"
 
-VM_IP=$(grep -m1 -E '^\s+public_ip:' "$INFRA" | awk '{print $2}')
-SSH_KEY=$(grep -m1 -E '^\s+private_key:' "$INFRA" | sed 's/^[^:]*: *//' | tr -d '\r')
-SSH_USER=$(grep -m1 -E '^\s+user:' "$INFRA" | awk '{print $2}')
+# Scoped to the vm_bot:/ssh: top-level blocks specifically, not just the
+# first match in the whole file. Found live 2026-09-07 deploying 6059823:
+# an unscoped `grep -m1 -E '^\s+user:'` matched
+# local-dev-machine-postgres:'s `user: myfirstagent` (a Postgres DB user,
+# sitting earlier in the file) instead of ssh:'s `user: ubuntu` -- same
+# "unscoped first match" failure class DOCKER_RUN below was already fixed
+# for on 2026-09-01, just not applied here yet. Caught before any harm:
+# the wrong SSH_USER made every SSH call in this script auth-fail, so the
+# Transfer step died cleanly rather than doing anything to the VM -- but
+# it burned a full build+preflight cycle to find out. Anchoring to
+# `/^vm_bot:/`/`/^ssh:/` (column 0, so only a real top-level key matches)
+# closes this the same way DOCKER_RUN's own comment already explains.
+VM_IP=$(awk '/^vm_bot:/{f=1} f && /^\s+public_ip:/{print $2; exit}' "$INFRA")
+SSH_KEY=$(awk '/^ssh:/{f=1} f && /^\s+private_key:/{sub(/^[^:]*: */,""); print; exit}' "$INFRA" | tr -d '\r')
+SSH_USER=$(awk '/^ssh:/{f=1} f && /^\s+user:/{print $2; exit}' "$INFRA")
 [ -n "$VM_IP" ] && [ -n "$SSH_KEY" ] && [ -n "$SSH_USER" ] || die "could not read VM details from $INFRA"
 # Windows path from the yaml -> a path ssh can use under Git Bash.
 case "$SSH_KEY" in
@@ -258,12 +270,30 @@ ok "entrypoint runs"
 # the conda env, and docker exec skips the entrypoint. The first run of
 # this script reported an error string as if it were the baseline data,
 # which is worse than not checking: it printed "ok".
+#
+# Uses raw sqlite3 against SUBSCRIBERS_DB_FILE directly, not a Python
+# module call -- found broken 2026-09-07 deploying 6059823: this used to
+# import users_db and call list_push_enabled_subscribers(), but PR #79
+# (commit 8a1d379, already on main well before this) split users_db.py
+# into storage/'s pluggable backend + subscriber_ops.py's thin wrapper,
+# so plain `import users_db` has raised ModuleNotFoundError on every
+# deploy since -- silently, since a baseline-read failure is a `warn`,
+# not a `die`. Every deploy between 8a1d379 and this fix ran with no
+# pre/post subscriber-count comparison at all and nothing said so loudly.
+# Raw SQL against the sqlite file is used instead of subscriber_ops
+# (rather than just swapping the import) because vm_bot is sqlite-only by
+# design (settings.oracle.yml pins storage.database.type: sqlite, see its
+# own comment) -- this avoids re-breaking again the next time the
+# in-process storage API's shape changes for an unrelated reason.
 remote_counts() {
     local out
     out=$("${SSH[@]}" "sudo docker exec -e SUBSCRIBERS_DB_FILE=/data/subscribers.db $CONTAINER \
         /opt/conda/bin/python -c \"
-import os, users_db
-print(len(users_db.list_push_enabled_subscribers()),
+import os, sqlite3
+conn = sqlite3.connect(os.environ['SUBSCRIBERS_DB_FILE'])
+total = conn.execute('SELECT COUNT(*) FROM subscribers').fetchone()[0]
+push_enabled = conn.execute('SELECT COUNT(*) FROM subscribers WHERE push_enabled = 1').fetchone()[0]
+print(total, push_enabled,
       len(os.listdir(os.environ.get('NEWS_CACHE_DIR', '/data/news_cache'))))
 \"" 2>/dev/null | tr -d '\r')
     # Only numbers are data. Anything else is an error message.
@@ -275,7 +305,7 @@ print(len(users_db.list_push_enabled_subscribers()),
 
 step "Baseline from the running container"
 if BASE=$(remote_counts); then
-    ok "push-enabled subscribers / cached articles: $BASE"
+    ok "total subscribers / push-enabled / cached articles: $BASE"
 else
     BASE=""
     warn "could not read a baseline -- continuing, but the post-deploy comparison is lost"
@@ -319,10 +349,30 @@ step "Restart"
 # outage, caught and fixed live, not by inspection. `/^vm_bot:/` anchors to
 # column 0, so it only matches the real top-level key, never an indented
 # occurrence.
+# Stops on INDENTATION dropping to <=4 spaces, not on "looks like a YAML
+# key" -- the actual YAML rule for a `|` block scalar's extent, which no
+# specific character class can approximate (see the paragraph above,
+# which already predicted this). Found broken a THIRD time, live,
+# 2026-09-07 deploying 6059823: the widened `[A-Za-z0-9_]+:` character
+# class still didn't match a `STATUS 2026-09-04 (FAILED DEPLOY, ROLLED
+# BACK -- PROD is currently commit` freeform history line (spaces and
+# parens before the first colon, not a plain identifier) -- so awk read
+# straight through it into several paragraphs of deploy-history prose,
+# appended all of it to docker-run.txt, and executed the lot over SSH.
+# The `docker run -d ...` line itself is one contiguous command (no stray
+# newline inside it) so it completed and the container actually started
+# correctly *before* the trailing prose hit a real shell syntax error
+# (`syntax error near unexpected token '('`) and made the whole `${SSH[@]}`
+# call return non-zero -- `die()` fired on a deploy that had, underneath,
+# already succeeded. Caught by checking the live container by hand
+# (commit label, docker logs) after this die(), not by anything in this
+# script. Indentation is the one dimension of a `|` block scalar that
+# cannot drift out from under a fixed-width regex the way key-naming
+# conventions repeatedly have.
 DOCKER_RUN=$(awk '
     /^vm_bot:/{invm=1}
     invm && /^    command: \|/{f=1;next}
-    f && /^    [A-Za-z0-9_]+:/{exit}
+    f && $0 !~ /^[[:space:]]*$/ && $0 !~ /^ {6,}/{exit}
     f
 ' "$INFRA" | sed 's/^      //')
 [ -n "$DOCKER_RUN" ] || die "could not read docker_run.command from $INFRA"
