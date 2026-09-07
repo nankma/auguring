@@ -34,17 +34,24 @@ storage:
         trailsign-resolve: environment-variable
         name: SUBSCRIBERS_DB_FILE
 
-# Pluggable news-cache backend (vector_store/) -- PROD stays on
-# yaml_files (today's behavior, unchanged) until sqlite_vec is proven on
-# INT first, same "prove it there before PROD" pattern as
-# storage.database's own postgres option above.
+# Pluggable news-cache backend (vector_store/) -- switched to sqlite_vec
+# 2026-09-07, same day it was proven on INT, as an urgent fix: a live
+# PROD measurement (deploying commit 6059823) found news_cache.read_all()
+# taking 62-136s against PROD's real ~1860-article cache on the actual
+# constrained VM (1/8 OCPU, real memory pressure/swapping observed) --
+# worse than the original pre-PR-#85 75-100s bug in the worst case, and a
+# live, currently-affecting-real-users problem, not a theoretical one.
+# sqlite_vec measured ~137x faster against a similar-sized real corpus on
+# INT; yaml_files block kept commented out, not deleted, for a one-line
+# revert if sqlite_vec turns out to need more headroom than this VM has.
 news_cache:
   backend:
-    type: yaml_files
-    # sqlite_vec:
-    #   path:
-    #     trailsign-resolve: environment-variable
-    #     name: NEWS_VECTOR_DB_FILE
+    type: sqlite_vec
+    # yaml_files: {}
+    sqlite_vec:
+      path:
+        trailsign-resolve: environment-variable
+        name: NEWS_VECTOR_DB_FILE
 
 # Bridges to the same DEEPSEEK_API_KEY env var docker-entrypoint.sh
 # already vault-fetches -- zero behavior change from before this was
