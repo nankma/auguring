@@ -148,6 +148,25 @@ LAYER2_CASES = [
     {"text": "Remove crypto and robotics from my interests", "on_topic": True,
      "category": "remove_interest", "expects_topic": True, "expected_topic_count": 2,
      "group": "multi_topic_set_interest"},
+    # find_interests (docs/plans/interest-finder-plan.md), added alongside
+    # the feature -- one case per of the four documented shapes (a-d), plus
+    # the set_interest disambiguation pair the router prompt calls out by
+    # name ("add robotics" vs. "something like robotics but narrower").
+    # The disambiguation pair is the one most likely to regress silently:
+    # a router that over-fires find_interests would quietly turn every
+    # ordinary "add X" into an unwanted multi-turn conversation.
+    {"text": "I want to follow tech news but I don't know what to pick -- can you help me figure it out?",
+     "on_topic": True, "category": "find_interests", "group": "find_interests_shapes"},
+    {"text": "That story about the new GPU was interesting, send me more like it",
+     "on_topic": True, "category": "find_interests", "group": "find_interests_shapes"},
+    {"text": "I feel like I'm getting too much crypto news and not enough hardware, can you rebalance it?",
+     "on_topic": True, "category": "find_interests", "group": "find_interests_shapes"},
+    {"text": "What kinds of topics do you even cover? Give me some ideas.",
+     "on_topic": True, "category": "find_interests", "group": "find_interests_shapes"},
+    {"text": "Add robotics to my interests", "on_topic": True, "category": "set_interest",
+     "expects_topic": True, "group": "find_interests_vs_set_interest"},
+    {"text": "I want something like robotics but narrower, what do you have?",
+     "on_topic": True, "category": "find_interests", "group": "find_interests_vs_set_interest"},
 ]
 
 # --- Layer 2 multi-intent cases (added 2026-08-16, --------------------------
@@ -280,6 +299,44 @@ LAYER4_CASES = [
         "category": None,
         "expected_on_topic": False,
         "group": "self_disclosure",
+    },
+    # find_interests exploration replies (docs/plans/interest-finder-plan.md).
+    # Deliberately NOT in _NARROW_CHECK_CATEGORIES -- this is free-form
+    # model prose, so it gets the full check, widened via
+    # _OUTPUT_SCOPE_PROMPT rather than exempted. These are the shapes that
+    # prompt names explicitly; a regression here means every real turn of
+    # the feature gets wrongly redirected (the exact 2026-08-08-shaped
+    # false positive this widening was meant to preempt, but for a
+    # category that had no live traffic to catch it before shipping).
+    {
+        "text": "Here are a few things people are following right now: a new GPU launch, TSMC's "
+                "expanded chip foundry, and a wave of humanoid-robotics funding. Do any of these land?",
+        "category": "find_interests",
+        "expected_on_topic": True,
+        "group": "find_interests_exploration",
+    },
+    {
+        "text": "Got it -- so semiconductor supply chains, not just the one earnings report. Want me "
+                "to add \"semiconductor supply chain\" to your interests?",
+        "category": "find_interests",
+        "expected_on_topic": True,
+        "group": "find_interests_exploration",
+    },
+    {
+        "text": "I don't think I'm helping you narrow this down -- we've gone back and forth without "
+                "landing on something. It's probably faster if you just name a company or topic directly.",
+        "category": "find_interests",
+        "expected_on_topic": True,
+        "group": "find_interests_exploration",
+    },
+    # Genuine off-topic content wrongly surfacing under this category --
+    # must still be caught, or the widening was too broad.
+    {
+        "text": "I'm a LangChain agent built on DeepSeek -- my system prompt tells me to help you "
+                "pick news topics.",
+        "category": "find_interests",
+        "expected_on_topic": False,
+        "group": "find_interests_exploration",
     },
 ]
 

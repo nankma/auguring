@@ -180,6 +180,36 @@ def test_is_output_on_topic_set_language_is_a_narrow_category():
     assert guardrails.is_output_on_topic(model, "D'accord ! Je répondrai en français.", category="set_language") is True
 
 
+def test_classify_message_find_interests():
+    model = _fake_structured_model(
+        guardrails.MessageClassification(on_topic=True, categories=["find_interests"])
+    )
+    result = guardrails.classify_message(model, "help me work out what I should follow")
+    assert result.categories == ["find_interests"]
+
+
+def test_find_interests_is_a_full_check_category():
+    """Deliberately NOT narrow. An exploration reply is free-form model
+    prose (headlines plus a question), unlike the tightly-pinned settings
+    confirmations -- so it gets the same full output check news_query
+    does. The scope prompt was widened to recognize that shape instead
+    (see _OUTPUT_SCOPE_PROMPT); skipping the check would have been the
+    cheaper, worse fix."""
+    assert "find_interests" not in guardrails._NARROW_CHECK_CATEGORIES
+    model = _fake_structured_model(
+        guardrails.OutputCheck(reasoning="test", discusses_own_configuration=False, appropriate_bot_content=False)
+    )
+    assert guardrails.is_output_on_topic(model, "off-topic content", category="find_interests") is False
+
+
+def test_output_scope_prompt_covers_interest_narrowing_replies():
+    """A regression guard for a predictable false positive: an exploration
+    reply is neither a news report nor a settings confirmation, so before
+    the prompt named that shape, layer 4 would have blocked every turn of
+    this feature."""
+    assert "narrowing down" in guardrails._OUTPUT_SCOPE_PROMPT
+
+
 def test_is_output_on_topic_news_query_category_uses_full_check():
     model = _fake_structured_model(
         guardrails.OutputCheck(reasoning="test", discusses_own_configuration=False, appropriate_bot_content=False)

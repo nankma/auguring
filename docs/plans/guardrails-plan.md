@@ -696,6 +696,43 @@ tracked here per this doc's own convention of recording every dataset
 addition's first measurement, not just re-measurements of an existing
 one.
 
+## Added 2026-09-08: `find_interests` category (docs/plans/interest-finder-plan.md)
+
+New router category plus a widened `_OUTPUT_SCOPE_PROMPT`, both measured
+before being considered shipped, per this doc's own discipline.
+`tools/measure_guardrails.py` gained a `find_interests_shapes` /
+`find_interests_vs_set_interest` group (layer 2) and a
+`find_interests_exploration` group (layer 4) — one case per documented
+shape, plus the disambiguation pair the router prompt calls out by name
+("add robotics" vs. "something like robotics but narrower"), which is the
+one most likely to regress silently: a router that over-fires
+`find_interests` would quietly turn ordinary `set_interest` requests into
+an unwanted multi-turn conversation.
+
+`python tools/measure_guardrails.py --group find_interests --trials 5` (both layers):
+
+| group | layer | pass rate |
+|---|---|---|
+| `find_interests_shapes` | 2 | **100% (20/20)** |
+| `find_interests_vs_set_interest` | 2 | **100% (10/10)** |
+| `find_interests_exploration` | 4 | **100% (20/20)** |
+
+No prior baseline exists for these groups (new category) — this is the
+baseline a future change should be measured against.
+
+Also re-ran the **full existing dataset** at `--trials 3` (81 layer-2
+single-intent calls, 18 layer-2 multi-intent calls, 36 layer-4 calls) to
+confirm the router-prompt/output-scope-prompt widening didn't regress any
+existing category:
+
+| | pass rate |
+|---|---|
+| layer 2 (single-intent, all existing groups) | **100% (81/81)** |
+| layer 2 multi-intent | 94% (17/18) — the `mixed_language_control` case's known trial-to-trial variance (documented above at the time it was added), not a new regression |
+| layer 4 (all existing groups, incl. `set_language_confirmation`) | **100% (36/36)** |
+
+No fix needed — nothing regressed.
+
 ## Open questions
 
 - ~~Exact wording/pattern list for layer 1~~ — built in `guardrails.py`'s

@@ -425,7 +425,7 @@ def search_news(chat_id: int, query: str, history: list, model, guard_model, emb
 
     topic = _rewrite_search_query(query, history, guard_model)
 
-    # Same cache-check-then-generate pattern as _add_one_interest: a
+    # Same cache-check-then-generate pattern as add_one_interest: a
     # generated definition is a measurably better embedding query than
     # the bare string (see news_classify.expand_interest_for_retrieval),
     # and it's cached under the (rewritten) topic itself so a repeated
@@ -522,7 +522,7 @@ def search_news(chat_id: int, query: str, history: list, model, guard_model, emb
 ROUTE_B_CATEGORIES = {"set_interest", "remove_interest", "start_push", "stop_push", "set_language"}
 
 
-def _add_one_interest(chat_id: int, topic: str, model, known: list[str]) -> str:
+def add_one_interest(chat_id: int, topic: str, model, known: list[str]) -> str:
     """Normalizes and stores ONE interest, returning its confirmation
     sentence. `known` is the subscriber's interests resolved so far --
     prior interests plus any earlier topic from the SAME "add X, Y, Z"
@@ -649,7 +649,7 @@ def dispatch_settings(category: str, chat_id: int, classification, model=None) -
         known = subscriber_ops.get_interests(chat_id)
         replies = []
         for topic in topics:
-            replies.append(_add_one_interest(chat_id, topic, model, known))
+            replies.append(add_one_interest(chat_id, topic, model, known))
         return "\n\n".join(replies)
 
     if category == "remove_interest":
@@ -701,16 +701,42 @@ def dispatch_settings(category: str, chat_id: int, classification, model=None) -
 
 # --- Agent construction & invocation ------------------------------------
 
-def build_agent(model):
-    return create_agent(model=model, tools=TOOLS, middleware=[compose_prompt])
+def build_agent(model, tools=None, middleware=None):
+    """Builds a LangChain tool-calling agent -- an open-ended loop where
+    the MODEL decides how many steps to take. Reserved for tasks that
+    genuinely can't be bounded in advance; everything bounded goes
+    through a fixed pipeline instead (see search_news's own note, and
+    dispatch_settings below, for the two shapes this codebase uses).
+
+    `tools`/`middleware` default to this module's own (currently empty)
+    TOOLS and news-query prompt, preserving the original single-argument
+    behavior. interest_finder.py passes its own of each -- it's a
+    different agent with a different job, not a variant of this one, and
+    parameterizing here beats duplicating the create_agent wiring."""
+    return create_agent(
+        model=model,
+        tools=TOOLS if tools is None else tools,
+        middleware=[compose_prompt] if middleware is None else middleware,
+    )
 
 
 def run_agent(
-    agent, messages: list, callbacks: list | None = None, context: dict | None = None
+    agent, messages: list, callbacks: list | None = None, context: dict | None = None,
+    recursion_limit: int | None = None,
 ) -> list:
-    config = {"callbacks": callbacks} if callbacks else None
+    """`recursion_limit` caps how many model/tool steps ONE invocation may
+    take (LangGraph's own config key). Left unset the graph default (25)
+    applies. It exists because a loop's cost is unbounded per turn, not
+    just per conversation -- PR #85's regression was a single question
+    fanning out into 5-7 internal searches -- so a caller that runs a
+    loop interactively should set a ceiling it's willing to pay for."""
+    config = {}
+    if callbacks:
+        config["callbacks"] = callbacks
+    if recursion_limit is not None:
+        config["recursion_limit"] = recursion_limit
     kwargs = {"context": context} if context is not None else {}
-    result = agent.invoke({"messages": messages}, config=config, **kwargs)
+    result = agent.invoke({"messages": messages}, config=config or None, **kwargs)
     return result["messages"]
 
 

@@ -105,8 +105,13 @@ Every row also carries `otel.status_code=ERROR` and a recorded exception
 | `router_failed` | `argus.guardrails` | `guardrails.classify_message` (layer 2) | **ERROR** | — | load-bearing: silent fail-open here is the exact 2026-08-21 incident (`docs/plans/guardrails-plan.md`) — don't let a future alert audit downgrade this to WARN |
 | `output_check_failed` | `argus.guardrails` | `guardrails.is_output_on_topic` (layer 4) | **ERROR** | — | same reasoning as `router_failed`, its layer-4 mirror |
 | `search_query_rewrite_failed` | `argus.agent` | `agent._rewrite_search_query` | WARN | `query` | added 2026-09-05 alongside search_news's query-rewrite step; missing from this table until now, not a new event |
+| `interest_exploration_failed` | `argus.bot` | `bot._process_find_interests` | ERROR | `chat_id` | the exploration agent loop raising; the session is cleared, so the subscriber sees an error rather than being stuck in a mode |
+| `interest_exploration_out_of_turns` | `argus.bot` | `bot._process_find_interests` | WARN | `chat_id`, `turns` | not an error — a subscriber who never converged. Worth watching as a RATE: frequent hits mean the elicitation method isn't working, which nothing else measures |
+| `interest_turn_out_of_steps` | `argus.interest_finder` | `interest_finder.run_turn` | WARN | `chat_id`, `max_steps` | ONE turn hit the LangGraph step ceiling — measured cause is a topic with no coverage the model keeps rephrasing. Distinct from `interest_exploration_out_of_turns`, which is the whole conversation |
+| `interest_saved_from_exploration` | `argus.interest_finder` | `interest_finder.save_interest` | INFO | `chat_id`, `topic`, `turns` | the outcome event — the numerator in "how many explorations produce an interest" |
+| `interest_exploration_ended` | `argus.interest_finder` | `interest_finder.end_exploration` | INFO | `chat_id`, `reason`, `turns`, `saved_count`, `dropped_count` | fires on every model-ended exploration, INCLUDING ones that saved nothing; the denominator for the row above |
 
-None of these twelve have a dedicated alert yet — they're new visibility,
+None of these seventeen have a dedicated alert yet — they're new visibility,
 not new paging. `router_failed`/`output_check_failed` are the strongest
 candidates for one, given the incident they're already tied to.
 
@@ -132,6 +137,7 @@ in the order they execute:
 | `latency_report_writing` | `argus.agent` | `agent.search_news` | `duration_seconds` | Every search_news call that reaches the model (i.e. the candidate pool wasn't empty) |
 | `latency_search_news_total` | `argus.bot` | `bot._route_a_reply` | `duration_seconds` | Every news_query turn -- wall-clock for the whole search_news call, should roughly equal the sum of the four `agent.*` events above plus DB/quota overhead not separately timed |
 | `latency_layer4_output_check` | `argus.bot` | `bot._route_a_reply` | `duration_seconds` | Every news_query turn |
+| `latency_interest_turn` | `argus.bot` | `bot._process_find_interests` | `duration_seconds` | Every turn of a `find_interests` exploration — the one place in this codebase that still runs an agent LOOP, so this is where a per-turn blowup (PR #85's failure) would show up first |
 
 **Real numbers measured live on INT, 2026-09-05** (two genuinely new
 topics, each a real cache-miss so all seven events fired): 11.23s and

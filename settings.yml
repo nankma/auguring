@@ -251,6 +251,23 @@ search:
     min: 20
     max: 50
 
+# The "help me find my interests" conversation (interest_finder.py).
+# max_examples: how many real headlines one example-showing step puts in
+# front of the subscriber -- a "how much can a person weigh at once"
+# number (docs/analysis/interest-elicitation-survey.md), not a retrieval
+# one. max_turns: hard ceiling on user turns in one exploration, enforced
+# by bot.py, so a subscriber who keeps switching direction gets told
+# honestly it isn't working instead of looping. max_steps_per_turn: cap
+# measured, not guessed -- an uncovered topic makes the model rephrase and
+# re-search ~15 times, so 10 (the first value) cut real work off; see
+# docs/plans/interest-finder-plan.md's "two ceilings" section.
+# on model/tool steps WITHIN one turn -- the unbounded-cost failure PR #85
+# measured, and a different thing from max_turns.
+interest_finder:
+  max_examples: 5
+  max_turns: 8
+  max_steps_per_turn: 20
+
 # Per-subscriber account settings. default_interval_hours/
 # min_interval_hours: push-frequency default and floor a subscriber can
 # set. pushed_link_retention_hours: how long the "already sent this

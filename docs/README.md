@@ -50,6 +50,7 @@ Status table.
 | `deployment-plan.md` | Containerization, cloud provider, CI/CD |
 | `guardrails-plan.md` | The four-layer guardrail design and its incidents |
 | `incident-monitoring-plan.md` | What counts as an incident; the three criteria, criterion 1 built |
+| `interest-finder-plan.md` | The "help me find my interests" conversation — why it gets an agent loop, session state, the two ceilings |
 | `observability-platform-plan.md` | Where telemetry and alerting live — moving to hosted Logfire, retiring the Phoenix VM |
 | `dev-environment-plan.md` | Running the pipeline against a scratch database instead of production |
 | `local-news-cache-plan.md` | Periodic ingestion + local cache, two-stage filtering |

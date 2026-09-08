@@ -359,7 +359,7 @@ def test_a_near_duplicate_within_one_topic_stays_eligible_for_another(isolated_s
 # --- query text resolution (2026-08-25) -------------------------------------
 # The retrieval query used against news_embed is not always the bare topic
 # string -- a cached, generated definition (interest_cache_ops.interest_query_expansions,
-# populated once by agent.py's _add_one_interest) measurably outranks the
+# populated once by agent.py's add_one_interest) measurably outranks the
 # bare phrase. See news_classify.expand_interest_for_retrieval.
 
 def test_resolve_query_text_uses_the_cached_expansion_when_present(isolated_subscribers_db):

@@ -201,6 +201,11 @@ search:
     min: 20
     max: 50
 
+interest_finder:
+  max_examples: 5
+  max_turns: 8
+  max_steps_per_turn: 20
+
 subscription:
   default_interval_hours: 24
   min_interval_hours: 1

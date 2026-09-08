@@ -258,7 +258,7 @@ def run_cases(chat_id: int, timeout: int) -> list[dict]:
     # Uses "cloud infrastructure" as the third topic, not the acronym
     # "LLM" this case used before 2026-08-27. Found live on that day's
     # deploy: "LLM" gets expanded by news_classify's normalization on the
-    # Add path (_add_one_interest calls the model to turn ambiguous
+    # Add path (add_one_interest calls the model to turn ambiguous
     # abbreviations into an unambiguous English phrase), but that
     # expansion is itself an LLM call and NOT deterministic call to call
     # -- two different smoke runs normalized it to "Large Language Model"
@@ -285,6 +285,38 @@ def run_cases(chat_id: int, timeout: int) -> list[dict]:
             "17 multi-topic set_interest (three topics, one message)",
             r["blocked_at"] is None and r["category"] == "set_interest" and added_count == 3,
             f"blocked_at={r['blocked_at']} category={r['category']} added_count={added_count} reply={reply!r}",
+        )
+    )
+
+    # Case 18 -- the find_interests exploration (docs/plans/interest-finder-plan.md).
+    # Two messages on purpose: the first exercises the router choosing the
+    # category, the SECOND exercises the thing that can't be tested any
+    # other way -- a reply with no topical signal of its own ("the first
+    # one") still reaching the exploration, because bot.interest_sessions
+    # is checked before layer 2. Route it by content and it lands
+    # somewhere unrelated; that's the whole reason the session exists.
+    #
+    # Dedicated chat_id, same reasoning as cases 14/17. One wrinkle worth
+    # knowing: if a previous run left an exploration open on this id (the
+    # model never called end_exploration), these two messages continue
+    # THAT conversation instead of starting a new one, and once the turn
+    # counter passes MAX_TURNS the ceiling closes it and replies with
+    # out_of_turns_message. Every one of those states still returns
+    # category="find_interests" with blocked_at=None, so this case gets
+    # weaker in that situation but never fails falsely -- and the ceiling
+    # self-heals the id for the run after.
+    find_interests_chat_id = chat_id + 3
+    r = send(find_interests_chat_id, "I'd like to follow tech news but I'm not sure what — can you help me work out what to follow?", timeout)
+    opened_ok = r["blocked_at"] is None and r["category"] == "find_interests"
+    r = send(find_interests_chat_id, "the first one", timeout)
+    followup_ok = r["blocked_at"] is None and r["category"] == "find_interests"
+    results.append(
+        _check(
+            "18 find_interests exploration (opens, then a contextless follow-up stays in it)",
+            opened_ok and followup_ok,
+            f"opened_ok={opened_ok} followup_ok={followup_ok} followup_category={r['category']} "
+            f"followup_blocked_at={r['blocked_at']} (a followup routed to news_query/set_interest means "
+            "the session check is no longer running before layer 2)",
         )
     )
 
