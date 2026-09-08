@@ -571,7 +571,7 @@ def _resolve_query_text(topic: str) -> str:
     subject would use, measurably ranks genuine matches much higher (the
     same worst case dropped from needing the top 83% of a pool kept down
     to 44%). See news_classify.expand_interest_for_retrieval for what's
-    generated and cached, and agent.py's _add_one_interest for when.
+    generated and cached, and agent.py's add_one_interest for when.
 
     Falls back to the bare `topic` when nothing is cached -- an interest
     added before this feature existed, or one whose generation call

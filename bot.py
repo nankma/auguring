@@ -39,6 +39,7 @@ from agent import ROUTE_B_CATEGORIES, build_model_from_settings, dispatch_settin
 from app_settings import get_settings
 import admin_bot
 import guardrails
+import interest_finder
 import message_archive
 import news_classify
 import news_embed
@@ -93,6 +94,29 @@ chat_histories: dict[int, tuple[list, list[datetime]]] = {}
 # on a new question), so there's little value in keeping much around.
 MAX_HISTORY_AGE = timedelta(hours=1)
 MAX_HISTORY_MESSAGES = 20
+
+# Per-chat "an interest exploration is in progress" state -- the one piece
+# of real conversational MODE this bot has (see interest_finder.py).
+#
+# It exists because every other path here is stateless per message: layer
+# 2 classifies each message on its own, which works fine when every
+# message carries its own topical signal. An exploration's follow-ups
+# don't -- "yes", "the second one", "more like that but hardware" mean
+# nothing to a classifier reading them cold, and would be routed
+# somewhere unrelated. agent.add_one_interest's own comment already named
+# this gap from the other side, explaining why it offers a hint rather
+# than asking a question: "asking would need state ('this subscriber owes
+# me an answer') that the next message would otherwise be routed straight
+# past". This is that state.
+#
+# In-memory, same as chat_histories and with the same consequence: a
+# container restart drops an in-flight exploration and the subscriber
+# has to start over. Accepted deliberately -- this is a conversation, not
+# a transaction, and nothing is half-written when it's lost (interests
+# are only ever saved on an explicit confirmed step).
+#
+# {chat_id: {"turns": int, "done": bool, "saved": [...], "dropped": [...]}}
+interest_sessions: dict[int, dict] = {}
 
 
 def _trim_history(messages: list, timestamps: list[datetime], now: datetime) -> tuple[list, list[datetime]]:
@@ -464,6 +488,71 @@ async def _route_a_reply(
     return None, final_content
 
 
+async def _process_find_interests(chat_id: int, user_text: str, model, guard_model, embedder=None) -> dict:
+    """One exchange of an interest-finding exploration -- both the first
+    one (routed here by layer 2) and every follow-up (routed here by the
+    session check in process_message, bypassing layer 2 entirely).
+
+    Two ceilings, deliberately separate. interest_finder.MAX_STEPS_PER_TURN
+    caps what ONE turn may spend internally; MAX_TURNS below caps the
+    conversation. The second one is enforced here rather than by the model
+    because "we're going in circles" is exactly the self-assessment models
+    are unreliable at -- a counter is not.
+
+    The session is cleared on every exit that isn't "keep going": the
+    model finishing, the turn ceiling, or an error. Leaving a stale entry
+    behind would silently swallow the subscriber's next message, which is
+    a far worse failure than making them re-open an exploration."""
+    session = interest_sessions.setdefault(chat_id, {"turns": 0})
+    session["turns"] += 1
+
+    history, history_timestamps = _get_trimmed_history(chat_id)
+
+    if session["turns"] > interest_finder.MAX_TURNS:
+        interest_sessions.pop(chat_id, None)
+        _events.log("interest_exploration_out_of_turns",
+                     {"message": "exploration hit the turn ceiling without converging",
+                      "chat_id": chat_id, "turns": session["turns"]}, level=Level.WARN)
+        reply = interest_finder.out_of_turns_message()
+        new_messages = [HumanMessage(content=user_text), AIMessage(content=reply)]
+        _persist_turn(chat_id, history + new_messages, history_timestamps, new_messages)
+        return {"blocked_at": None, "category": "find_interests", "reply": reply}
+
+    try:
+        _t0 = time.monotonic()
+        reply, done = await asyncio.to_thread(
+            interest_finder.run_turn, chat_id, user_text, history, session, model, guard_model, embedder
+        )
+        _events.log("latency_interest_turn", {"message": "interest_finder turn returned",
+                     "duration_seconds": round(time.monotonic() - _t0, 3)})
+    except Exception as exc:
+        interest_sessions.pop(chat_id, None)
+        _events.log("interest_exploration_failed", {"message": "exploration turn raised", "chat_id": chat_id},
+                     level=Level.ERROR, exc=exc)
+        return {"blocked_at": "agent_error", "category": "find_interests",
+                "reply": f"Something went wrong: {exc}"}
+
+    final_content = _strip_report_preamble(_normalize_markdown_bold(reply))
+
+    # Layer 4, same as every other model-generated reply. guardrails'
+    # output-scope prompt was extended for this category specifically --
+    # an exploration reply is headlines plus a question, which is neither
+    # a news report nor a settings confirmation.
+    output_on_topic = await asyncio.to_thread(
+        guardrails.is_output_on_topic, guard_model, final_content, "find_interests")
+    if not output_on_topic:
+        interest_sessions.pop(chat_id, None)
+        return {"blocked_at": "layer4_output_check", "category": "find_interests",
+                "reply": guardrails.REDIRECT_MESSAGE}
+
+    if done:
+        interest_sessions.pop(chat_id, None)
+
+    new_messages = [HumanMessage(content=user_text), AIMessage(content=final_content)]
+    _persist_turn(chat_id, history + new_messages, history_timestamps, new_messages)
+    return {"blocked_at": None, "category": "find_interests", "reply": final_content}
+
+
 def _persist_turn(chat_id: int, all_messages: list, history_timestamps: list[datetime], new_messages: list) -> None:
     """Stores `all_messages` (the full list to keep, including everything
     already in history) as this chat's new history, with a fresh shared
@@ -574,6 +663,18 @@ async def process_message(chat_id: int, user_text: str, model, guard_model, embe
         if guardrails.fails_local_prefilter(user_text):
             return {"blocked_at": "layer1_prefilter", "category": None, "reply": guardrails.REDIRECT_MESSAGE}
 
+        # An in-flight interest exploration takes precedence over layer 2 --
+        # deliberately, and this ordering is the whole point of
+        # interest_sessions. A follow-up like "yes" or "the second one"
+        # carries no topical signal for the router to classify, so letting
+        # layer 2 see it first would route it somewhere unrelated and the
+        # conversation would silently fall apart mid-flow. Layer 1 still
+        # runs above (it is free, local, and an injection attempt mid-
+        # exploration is still an injection attempt); layer 4 still runs
+        # below on whatever the exploration replies.
+        if chat_id in interest_sessions:
+            return await _process_find_interests(chat_id, user_text, model, guard_model, embedder)
+
         # Guardrail layer 2 -- the router (docs/plans/context-management-plan.md):
         # one structured-output call answers "is this on-topic", "what kind of
         # request(s) is this", and (for Route B categories) the arguments each
@@ -585,6 +686,15 @@ async def process_message(chat_id: int, user_text: str, model, guard_model, embe
                      "duration_seconds": round(time.monotonic() - _t0, 3)})
         if not classification.on_topic:
             return {"blocked_at": "layer2_router", "category": classification.categories[0], "reply": guardrails.REDIRECT_MESSAGE}
+
+        # find_interests opens a conversational MODE, so it can't be one
+        # segment of a multi-category reply the way the settings
+        # categories can -- it owns the turns that follow. If the router
+        # sees it at all, the whole message goes to the exploration; the
+        # agent there can act on the rest of what they said itself (it
+        # can save/drop interests), which a joined reply could not.
+        if "find_interests" in classification.categories:
+            return await _process_find_interests(chat_id, user_text, model, guard_model, embedder)
 
         history, history_timestamps = _get_trimmed_history(chat_id)
 

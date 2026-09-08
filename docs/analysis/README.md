@@ -1,8 +1,9 @@
 # analysis/
 
-Research and measurement for **how news gets ranked** — what makes an
-article important, how to find what a subscriber actually wants, and how
-many items a digest should carry.
+Research and measurement for **how news gets ranked and how we find out
+what a subscriber wants** — what makes an article important, how to
+work out what someone is actually interested in, and how many items a
+digest should carry.
 
 Separate from `docs/plans/` on purpose. Those documents track *what we
 decided and built*. These track *what we measured and what the literature
@@ -16,13 +17,16 @@ numbers behind a decision, which would bury a plan doc.
 | [`news-ranking-plan.md`](news-ranking-plan.md) | The main survey: how importance gets defined (journalism news values, computational signals, LLM-as-judge), how user preference gets matched, how digest size gets decided. Five concrete options with cost/risk. Also carries the 2026-08-18 source-collapse diagnosis |
 | [`sample-diversity-survey.md`](sample-diversity-survey.md) | Cross-domain companion: how statistics, ecology, finance, clinical trials, astronomy, genomics, IR/ML and search engines each handle an over-concentrated sample — and the four different pipeline stages they intervene at |
 | [`cluster-measurements.md`](cluster-measurements.md) | The measured numbers: how many story clusters the real cache contains, how big they are, and five findings that came out of measuring rather than assuming. **Links to the interactive scatter plots** |
+| [`interest-elicitation-survey.md`](interest-elicitation-survey.md) | Cross-domain survey for a proposed "help me find my interests" conversation: what IR theory, career-interest inventories, journalism/clinical interviewing, personal construct psychology, motivational interviewing, conversational recommenders and onboarding UX each do about the same problem — plus what this codebase already has, and the constraints its own measured history imposes |
 
 `news-ranking-plan.zh.md` and `sample-diversity-survey.zh.md` are Chinese
 translations. **Keep each pair in sync** — a translation that drifts from
 its original is worse than no translation.
 
-Nothing in here is built. These documents inform a decision that hasn't
-been made yet.
+Mostly not built — these documents inform decisions that haven't been
+made yet. The one exception is `interest-elicitation-survey.md`, whose
+findings did become code: see `docs/plans/interest-finder-plan.md` for
+which three of them shaped it and how.
 
 ### Documents referenced from here
 

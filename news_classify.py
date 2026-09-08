@@ -523,7 +523,7 @@ def expand_interest_for_retrieval(model, interest: str) -> str | None:
     not in how much of it.
 
     Called once per NEWLY-SEEN interest string (agent.py's
-    _add_one_interest, cached in interest_cache_ops's global
+    add_one_interest, cached in interest_cache_ops's global
     interest_query_expansions table, the same shape and same reasoning
     as resolve_interest_categories's cache: the interest text is stable
     vocabulary, so this should be a cache hit for any interest that's
