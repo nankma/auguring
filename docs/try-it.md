@@ -30,6 +30,13 @@ Type these as normal messages — no special syntax needed.
 - *"I'm interested in climate tech and space"*
 - `/interests` — see or clear what it has saved
 
+**Not sure what to follow yet?** Say so, and it walks you through it —
+showing real recent headlines and narrowing down from your reactions,
+instead of making you name a topic up front:
+- *"Help me figure out what to follow"*
+- *"I liked that last story you sent — got more like it?"*
+- *"I'm getting too much of X and not enough of Y, can we rebalance?"*
+
 **Set a reply language:**
 - *"Reply to me in Traditional Chinese from now on"*
 - `/language` — see or clear it
