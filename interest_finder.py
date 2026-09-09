@@ -21,6 +21,20 @@ the code:
 3. **Preferences are constructed, not extracted.** Success is "the user
    now knows what they want AND it's grounded in real coverage" -- not
    "we captured a pre-existing answer".
+4. **A model can narrate an action it never took.** Found live 2026-09-08:
+   a real subscriber confirmed adding a topic in Traditional Chinese, the
+   model replied "好，我已為你加入..." (done, I've added it), and the
+   subscriber's interests stayed empty -- zero save_interest telemetry
+   fired for that whole conversation. The model composed a confident
+   success message without ever calling the tool that would have made it
+   true. Same lesson as MAX_STEPS_PER_TURN's own history below: a prompt
+   instruction is a nudge, not a guarantee. propose_interest/
+   classify_confirmation/execute_save/execute_drop exist because of this
+   -- the highest-stakes action (persisting data) no longer depends on
+   the model remembering to call a tool at the right moment; it depends
+   only on classifying one short reply as affirm/decline/unclear, the
+   same bounded, already-reliable shape as guardrails.classify_message's
+   router. See propose_interest's own docstring for the mechanism.
 
 **This is the one feature in this codebase that genuinely justifies an
 agent loop** (agent.build_agent/run_agent, dormant since PR #85). The
@@ -41,10 +55,13 @@ calls -- which is why the caller caps turns and this module keeps each
 tool cheap.
 """
 
+from typing import Literal
+
 from langchain.agents.middleware import dynamic_prompt
 from langchain.tools import ToolRuntime
 from langchain_core.tools import tool
 from langgraph.errors import GraphRecursionError
+from pydantic import BaseModel
 
 import agent
 import news_cache
@@ -131,9 +148,17 @@ _SYSTEM_PROMPT = (
     "(d) They want suggestions before committing -- show examples, let "
     "them pick.\n\n"
 
-    "BEFORE SAVING: say plainly which topic you are about to add and "
-    "wait for them to confirm. Do not save on a guess. Once they "
-    "confirm, call save_interest, then call end_exploration.\n\n"
+    "BEFORE SAVING OR REMOVING: call propose_interest(topic, action) in "
+    "the SAME turn you say plainly which topic you are about to add or "
+    "remove, then ask them to confirm -- do not save on a guess. "
+    "propose_interest only records the proposal; it changes nothing by "
+    "itself, so calling it is always safe, and the system uses it to "
+    "complete the change reliably once they agree even in a turn where "
+    "you don't get the chance to call save_interest/drop_interest "
+    "yourself. If you are ever unsure whether a proposal you made "
+    "earlier actually went through, call save_interest/drop_interest "
+    "again rather than just saying it worked -- only say something is "
+    "saved after a tool call has actually told you so.\n\n"
 
     "WHEN TO STOP: call end_exploration as soon as they are satisfied, "
     "or if they say they are done, or if they have changed direction "
@@ -206,20 +231,22 @@ def list_current_interests(runtime: ToolRuntime) -> str:
     return "Currently following: " + ", ".join(interests)
 
 
-@tool
-def save_interest(topic: str, runtime: ToolRuntime) -> str:
-    """Add a topic to this subscriber's interests. Only call this AFTER
-    they have confirmed the specific topic."""
-    chat_id = runtime.context["chat_id"]
-    session = _session(runtime)
-    # agent.add_one_interest, not subscriber_ops.add_interest directly:
-    # it also normalizes the phrasing and generates/caches the retrieval
-    # definition, which is what makes the saved interest actually work at
-    # push time. Same path the single-turn "add X" route uses, so an
-    # interest arrived at here is indistinguishable from one typed
-    # directly -- no second class of interest.
+def execute_save(chat_id: int, topic: str, guard_model, session: dict) -> str:
+    """Actually persists one interest -- the single place both the
+    save_interest tool below AND bot.py's deterministic confirmation gate
+    (see propose_interest's docstring) call, so there is exactly ONE code
+    path that can make "this subscriber follows X" true, and exactly one
+    place the interest_saved_from_exploration event fires from, regardless
+    of which path triggered it.
+
+    agent.add_one_interest, not subscriber_ops.add_interest directly: it
+    also normalizes the phrasing and generates/caches the retrieval
+    definition, which is what makes the saved interest actually work at
+    push time. Same path the single-turn "add X" route uses, so an
+    interest arrived at here is indistinguishable from one typed directly
+    -- no second class of interest."""
     known = subscriber_ops.get_interests(chat_id)
-    reply = agent.add_one_interest(chat_id, topic, runtime.context.get("guard_model"), known)
+    reply = agent.add_one_interest(chat_id, topic, guard_model, known)
     session.setdefault("saved", []).append(topic)
     # The one outcome that says this feature worked. bot.py already logs
     # the failure shapes (out-of-turns, an exception); without this there
@@ -231,16 +258,55 @@ def save_interest(topic: str, runtime: ToolRuntime) -> str:
     return reply
 
 
-@tool
-def drop_interest(topic: str, runtime: ToolRuntime) -> str:
-    """Remove a topic this subscriber no longer wants. Only call this
-    after they have confirmed removing it."""
-    chat_id = runtime.context["chat_id"]
+def execute_drop(chat_id: int, topic: str, session: dict) -> str:
+    """The drop_interest counterpart to execute_save above -- same
+    reasoning, same single-code-path rule."""
     remaining = subscriber_ops.remove_interest(chat_id, topic)
-    _session(runtime).setdefault("dropped", []).append(topic)
+    session.setdefault("dropped", []).append(topic)
     if not remaining:
         return f"Removed {topic}. They now follow nothing."
     return f"Removed {topic}. They now follow: " + ", ".join(remaining)
+
+
+@tool
+def propose_interest(topic: str, action: Literal["add", "remove"], runtime: ToolRuntime) -> str:
+    """Call this in the SAME turn you tell the subscriber which specific
+    topic you are about to add or remove and ask them to confirm --
+    BEFORE they have answered. Records the proposal so the system can act
+    on it reliably once they agree, even in a turn where you don't get
+    the chance to call save_interest/drop_interest yourself. Does not
+    change anything by itself, so calling it is always safe.
+
+    Exists because of a real 2026-09-08 incident: a model once told a
+    subscriber an interest was added, in its own confident prose, without
+    ever calling save_interest -- see this module's own docstring. The
+    fix moved the actual write out of the model's hands: once this
+    proposal is recorded, bot.py classifies the subscriber's NEXT reply
+    as affirm/decline/unclear itself (classify_confirmation below) and,
+    on affirm, calls execute_save/execute_drop directly -- the write no
+    longer depends on you remembering to call a tool at the right
+    moment."""
+    _session(runtime)["pending_proposal"] = {"topic": topic, "action": action}
+    return f"Proposal recorded ({action}: {topic}). Now ask the subscriber to confirm in your reply."
+
+
+@tool
+def save_interest(topic: str, runtime: ToolRuntime) -> str:
+    """Add a topic to this subscriber's interests. Only call this AFTER
+    they have confirmed the specific topic -- normally bot.py's own
+    confirmation gate (see propose_interest) completes this for you, so
+    you should rarely need to call this directly; it remains available
+    for the case where a message already contains unambiguous
+    confirmation in one go."""
+    return execute_save(runtime.context["chat_id"], topic, runtime.context.get("guard_model"), _session(runtime))
+
+
+@tool
+def drop_interest(topic: str, runtime: ToolRuntime) -> str:
+    """Remove a topic this subscriber no longer wants. Only call this
+    after they have confirmed removing it -- same caveat as save_interest
+    above: bot.py's confirmation gate normally handles this for you."""
+    return execute_drop(runtime.context["chat_id"], topic, _session(runtime))
 
 
 @tool
@@ -264,7 +330,53 @@ def end_exploration(reason: str, runtime: ToolRuntime) -> str:
     return "Exploration marked finished. Give the subscriber a short closing reply."
 
 
-TOOLS = [find_example_articles, list_current_interests, save_interest, drop_interest, end_exploration]
+TOOLS = [find_example_articles, list_current_interests, propose_interest, save_interest, drop_interest, end_exploration]
+
+
+class _ConfirmationCheck(BaseModel):
+    reasoning: str
+    verdict: Literal["affirm", "decline", "unclear"]
+
+
+_CONFIRMATION_PROMPT = (
+    "A conversational assistant just proposed adding or removing ONE "
+    "specific topic and asked the subscriber to confirm. Classify the "
+    "subscriber's reply that follows, in whatever language it's written:\n"
+    "- affirm: they agree (e.g. \"yes\", \"sure\", \"go ahead\", \"是的\", "
+    "\"好\", \"sí\", \"confirm\") -- including a short reply that ONLY "
+    "confirms.\n"
+    "- decline: they say no, or clearly want something different instead.\n"
+    "- unclear: anything else -- a new question, a change of direction, "
+    "ambiguous phrasing, or a reply that doesn't clearly do either."
+)
+
+
+def classify_confirmation(guard_model, user_text: str) -> Literal["affirm", "decline", "unclear"]:
+    """Whether a reply to a propose_interest confirmation question
+    agrees, declines, or is unclear. Deliberately NOT a reading of the
+    model's own subsequent prose -- a model composing text that CLAIMS a
+    change happened is exactly the failure this whole mechanism exists to
+    route around (see propose_interest's docstring). This is instead a
+    small, single-purpose, bounded classification call -- the same shape
+    and reliability class as guardrails.classify_message's router, not a
+    new open-ended loop. Fails open to "unclear", which is always safe:
+    the caller simply falls through to the normal agent turn, exactly as
+    if no proposal were pending."""
+    if guard_model is None:
+        return "unclear"
+    try:
+        structured = guard_model.with_structured_output(_ConfirmationCheck, method="function_calling")
+        result = structured.invoke([
+            {"role": "system", "content": _CONFIRMATION_PROMPT},
+            {"role": "user", "content": user_text},
+        ])
+        if result is None:
+            return "unclear"
+        return result.verdict
+    except Exception as exc:
+        _events.log("confirmation_check_failed", {"message": "pending-proposal confirmation check failed"},
+                     level=Level.WARN, exc=exc)
+        return "unclear"
 
 
 def _compose_prompt(request) -> str:
@@ -286,6 +398,24 @@ def _compose_prompt(request) -> str:
             parts.append(
                 f"Write your ENTIRE reply in {language}, regardless of what "
                 "language their message is written in."
+            )
+        session = context.get("session") or {}
+        pending = session.get("pending_proposal")
+        if pending:
+            # Reached only when bot.py's own confirmation classifier
+            # returned "unclear" for the subscriber's last reply (an
+            # "affirm" is handled deterministically before the model ever
+            # runs -- see propose_interest's docstring). Surfacing it here
+            # is defense in depth: if their reply really was a clear yes
+            # that the classifier missed, the model still has a chance to
+            # notice and call save_interest/drop_interest itself.
+            parts.append(
+                f"You previously proposed to {pending['action']} "
+                f"\"{pending['topic']}\" and are waiting on their answer. "
+                "If their latest message actually confirms it, call "
+                f"{'save_interest' if pending['action'] == 'add' else 'drop_interest'} "
+                "yourself now. If they declined or want something else, "
+                "drop this proposal and continue from what they said."
             )
     return "\n\n".join(parts)
 

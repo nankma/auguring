@@ -488,6 +488,58 @@ async def _route_a_reply(
     return None, final_content
 
 
+async def _execute_pending_proposal(
+    chat_id: int, user_text: str, pending: dict, session: dict, guard_model,
+    history: list, history_timestamps: list[datetime],
+) -> dict:
+    """Deterministically completes a propose_interest that the subscriber
+    just confirmed -- see interest_finder.propose_interest's docstring for
+    why this exists (a real 2026-09-08 incident: a model claimed it saved
+    an interest without ever calling the tool). No agent loop runs here;
+    the write happens directly, in code, the moment classify_confirmation
+    says "affirm" -- it cannot depend on the model remembering to act.
+
+    Mirrors _route_b_reply's shape (execute, translate if needed, re-run
+    layer 4) since this is functionally the same kind of deterministic
+    settings write, just triggered from inside an exploration instead of
+    the router -- except layer 4 always runs here, even without
+    translation, unlike _route_b_reply's plain fixed-template case:
+    execute_save's reply embeds a model-normalized topic name, not a
+    fixed string, so it's real model-adjacent output every time, not
+    just when translated."""
+    topic, action = pending["topic"], pending["action"]
+    try:
+        reply = (
+            interest_finder.execute_save(chat_id, topic, guard_model, session) if action == "add"
+            else interest_finder.execute_drop(chat_id, topic, session)
+        )
+    except Exception as exc:
+        # Same invariant as every other exit from _process_find_interests:
+        # an error clears the session rather than leaving it stuck in a
+        # mode the subscriber can't get out of.
+        interest_sessions.pop(chat_id, None)
+        _events.log("interest_exploration_failed",
+                     {"message": "executing a confirmed proposal raised", "chat_id": chat_id, "topic": topic},
+                     level=Level.ERROR, exc=exc)
+        return {"blocked_at": "agent_error", "category": "find_interests",
+                "reply": f"Something went wrong: {exc}"}
+
+    language = subscriber_ops.get_language(chat_id)
+    if language:
+        reply = await asyncio.to_thread(_translate_confirmation, guard_model, reply, language)
+        reply = _strip_report_preamble(_normalize_markdown_bold(reply))
+
+    output_on_topic = await asyncio.to_thread(guardrails.is_output_on_topic, guard_model, reply, "find_interests")
+    if not output_on_topic:
+        interest_sessions.pop(chat_id, None)
+        return {"blocked_at": "layer4_output_check", "category": "find_interests",
+                "reply": guardrails.REDIRECT_MESSAGE}
+
+    new_messages = [HumanMessage(content=user_text), AIMessage(content=reply)]
+    _persist_turn(chat_id, history + new_messages, history_timestamps, new_messages)
+    return {"blocked_at": None, "category": "find_interests", "reply": reply}
+
+
 async def _process_find_interests(chat_id: int, user_text: str, model, guard_model, embedder=None) -> dict:
     """One exchange of an interest-finding exploration -- both the first
     one (routed here by layer 2) and every follow-up (routed here by the
@@ -517,6 +569,24 @@ async def _process_find_interests(chat_id: int, user_text: str, model, guard_mod
         new_messages = [HumanMessage(content=user_text), AIMessage(content=reply)]
         _persist_turn(chat_id, history + new_messages, history_timestamps, new_messages)
         return {"blocked_at": None, "category": "find_interests", "reply": reply}
+
+    # A pending propose_interest takes priority over the agent loop
+    # entirely -- classify_confirmation is a small, bounded call (same
+    # shape as guardrails.classify_message), not a new open-ended loop.
+    # "affirm" executes the write directly in code, never depending on
+    # the model to call save_interest/drop_interest itself. "decline"/
+    # "unclear" fall through to the normal turn below -- exactly as if no
+    # proposal were pending -- so a miss here is never worse than before
+    # this mechanism existed, only ever an improvement over it.
+    pending = session.get("pending_proposal")
+    if pending is not None:
+        verdict = await asyncio.to_thread(interest_finder.classify_confirmation, guard_model, user_text)
+        if verdict == "affirm":
+            session.pop("pending_proposal", None)
+            return await _execute_pending_proposal(
+                chat_id, user_text, pending, session, guard_model, history, history_timestamps)
+        if verdict == "decline":
+            session.pop("pending_proposal", None)
 
     try:
         _t0 = time.monotonic()

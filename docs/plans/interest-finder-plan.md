@@ -1,17 +1,19 @@
 # "Help me find my interests" — an elicitation conversation
 
-Written 2026-09-08. Status: **built, not yet deployed.**
+Written 2026-09-08. Status: **deployed to INT, one incident found and fixed
+on first live use.**
 
 | Piece | Status |
 |---|---|
 | Cross-domain research survey | Done — `docs/analysis/interest-elicitation-survey.md` |
 | `find_interests` router category + output-scope widening | Built (`guardrails.py`) |
-| `interest_finder.py` — prompt, five tools, `run_turn` | Built |
+| `interest_finder.py` — prompt, six tools, `run_turn` | Built |
 | Per-chat session state + turn ceiling in `bot.py` | Built |
 | `build_agent`/`run_agent` parameterization | Built (`agent.py`) |
 | Settings entries (all three environments) | Built |
 | Tests | Built — `tests/test_interest_finder.py`, additions to `tests/test_guardrails.py` |
-| Live verification on INT | **Not done** |
+| Live verification on INT | Done — 2026-09-08, found the false-confirmation incident below on first real use |
+| False-confirmation fix (`propose_interest` + deterministic confirmation gate) | Built and verified live against the real pinned model, incl. cross-language (zh-Hant/zh-Hans/es/en) and direct DB persistence checks — not yet redeployed |
 
 ## The problem
 
@@ -208,13 +210,79 @@ otherwise have blocked every turn of this feature — the same class of
 false positive as the 2026-08-08 "already covered interest" incident
 (`docs/plans/guardrails-plan.md`).
 
+## A false confirmation, found on the first real deploy
+
+Found 2026-09-08, minutes after the first INT deploy, by the user testing
+the feature live in Traditional Chinese. The model walked them all the
+way through the flow correctly — showed real headlines, narrowed down,
+proposed a specific topic, asked "確認加入嗎？" (confirm adding?) — and
+after they confirmed, replied "好，我已為你加入「GPU與AI加速硬體」這個
+主題" (done, I've added it), naming it in a "current list" summary.
+
+The subscriber's interests stayed empty. Confirmed three ways: the raw
+`subscribers.db` row showed `interests: '[]'`; the container's full log
+had **zero** occurrences of `interest_saved_from_exploration` for that
+chat despite `interest_finder turn returned` firing 7+ times; the
+`message_archive` transcript showed the confirmation question and the
+false "done" reply back to back, with no tool-call evidence between them.
+The model composed a confident success message without ever calling
+`save_interest`.
+
+This is the same shape as the step-ceiling incident above, generalized:
+**a prompt instruction is a nudge, not a guarantee — this codebase's own
+lesson, twice now.** The fix follows the same principle: move the
+highest-stakes decision (persisting data) out of the model's hands
+entirely, into a bounded, deterministic backstop.
+
+**The fix**, in `interest_finder.py` and `bot.py`:
+
+1. `propose_interest(topic, action)` — a new tool the model calls in the
+   SAME turn it asks for confirmation. It doesn't save anything; it just
+   records `session["pending_proposal"]`, a structurally visible fact the
+   code can act on (unlike free text, which is exactly what failed).
+2. `bot._process_find_interests` checks for a pending proposal BEFORE
+   running the agent loop at all. It classifies the subscriber's reply
+   with `classify_confirmation` — a small, single-purpose structured-
+   output call, the same shape and reliability class as
+   `guardrails.classify_message`'s router, not a new open-ended loop.
+   - **affirm** → `execute_save`/`execute_drop` run directly in code.
+     `run_turn` is never even invoked for this turn — there's no step at
+     which the model could fail to follow through, because it isn't
+     asked to.
+   - **decline** → clears the proposal, falls through to a normal turn.
+   - **unclear** → leaves the proposal in place, falls through to a
+     normal turn. `_compose_prompt` now also surfaces a pending proposal
+     to the model itself, as defense in depth: if the classifier missed
+     a genuine yes, the model still gets a chance to notice and call
+     `save_interest`/`drop_interest` on its own.
+3. `execute_save`/`execute_drop` are the single code path that can make
+   "this subscriber follows X" true — both the tools (for the case a
+   message is unambiguous enough that the model saves directly, no
+   confirmation round trip needed) and the deterministic gate call the
+   same functions, so there's exactly one place `interest_saved_from_
+   exploration` fires from regardless of which path triggered it.
+
+Every failure mode of the new classifier itself is safe by construction:
+a miss (affirm classified as unclear, or the call erroring out) simply
+falls through to the pre-fix behavior — the model's own turn — never
+worse than before this mechanism existed, only ever an improvement on it.
+The one thing that changed forever is that "affirm" no longer needs the
+model at all.
+
 ## Open
 
-- **No live verification yet.** Nothing here has met a real model. The
-  prompt's method instructions are the part most likely to need
-  adjustment against real behavior — particularly "only propose topics
-  you have seen", which is a rule a model can drift from without any
-  error surfacing.
+- The prompt's method instructions are otherwise the part most likely to
+  need adjustment against real behavior — particularly "only propose
+  topics you have seen", which is a rule a model can drift from without
+  any error surfacing.
+- **A leaked DeepSeek internal special token was observed once in ~15
+  real-model turns during the confirmation-gate fix's verification**
+  (`&lt;/｜｜DSML｜｜parameter&gt;` inside an otherwise normal reply,
+  breaking one HTML tag). Not reproduced elsewhere, and not a delivery
+  risk today — `bot.handle_message`'s existing `BadRequest` fallback to
+  plain text already covers a malformed-HTML reply — but worth watching
+  for recurrence; if it becomes frequent it would need its own fix rather
+  than relying on the fallback.
 - **Outcome telemetry exists but nothing reads it.**
   `interest_saved_from_exploration` over `interest_exploration_ended`
   gives the "how many explorations produce an interest" rate, and

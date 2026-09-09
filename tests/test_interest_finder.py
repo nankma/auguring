@@ -69,6 +69,17 @@ def cached_articles(isolated_news_cache, monkeypatch):
     return ARTICLES
 
 
+def _fake_structured_model(return_value) -> MagicMock:
+    """Same shape as test_guardrails.py's own helper -- a MagicMock whose
+    with_structured_output(...).invoke(...) returns a fixed value, no real
+    model call."""
+    fake_structured = MagicMock()
+    fake_structured.invoke.return_value = return_value
+    model = MagicMock()
+    model.with_structured_output.return_value = fake_structured
+    return model
+
+
 def _runtime(chat_id=1, session=None, embedder=None):
     """Stand-in for LangChain's ToolRuntime -- the tools only ever read
     `.context`, so a namespace with that one attribute is the whole
@@ -154,6 +165,57 @@ def test_drop_interest_removes_it_and_records_it(isolated_subscribers_db):
     assert "robotics" in reply
 
 
+def test_propose_interest_records_the_proposal_without_changing_anything(isolated_subscribers_db):
+    session = {}
+    result = interest_finder.propose_interest.func("semiconductors", "add", _runtime(chat_id=7, session=session))
+    assert session["pending_proposal"] == {"topic": "semiconductors", "action": "add"}
+    assert subscriber_ops.get_interests(7) == []
+    assert "semiconductors" in result
+
+
+def test_classify_confirmation_affirm():
+    model = _fake_structured_model(interest_finder._ConfirmationCheck(reasoning="t", verdict="affirm"))
+    assert interest_finder.classify_confirmation(model, "yes please") == "affirm"
+
+
+def test_classify_confirmation_decline():
+    model = _fake_structured_model(interest_finder._ConfirmationCheck(reasoning="t", verdict="decline"))
+    assert interest_finder.classify_confirmation(model, "no, something else") == "decline"
+
+
+def test_classify_confirmation_fails_open_to_unclear_on_exception():
+    model = MagicMock()
+    model.with_structured_output.side_effect = RuntimeError("boom")
+    assert interest_finder.classify_confirmation(model, "yes") == "unclear"
+
+
+def test_classify_confirmation_fails_open_to_unclear_on_none_result():
+    model = _fake_structured_model(None)
+    assert interest_finder.classify_confirmation(model, "yes") == "unclear"
+
+
+def test_classify_confirmation_with_no_guard_model_is_unclear():
+    """No guard_model means no way to classify -- unclear is the only
+    honest answer, and it's the safe one (falls through to the normal
+    turn, same as if nothing were pending)."""
+    assert interest_finder.classify_confirmation(None, "yes") == "unclear"
+
+
+def test_execute_save_and_save_interest_tool_go_through_the_same_path(isolated_subscribers_db, monkeypatch):
+    """The whole point of the refactor: one function, one telemetry
+    event, regardless of whether the agent's own tool call or bot.py's
+    deterministic gate triggers it."""
+    add = MagicMock(return_value="Added chips.")
+    monkeypatch.setattr(agent, "add_one_interest", add)
+    session_a, session_b = {}, {}
+
+    reply_a = interest_finder.execute_save(7, "chips", "guard", session_a)
+    reply_b = interest_finder.save_interest.func("chips", _runtime(chat_id=7, session=session_b))
+
+    assert reply_a == reply_b == "Added chips."
+    assert session_a["saved"] == session_b["saved"] == ["chips"]
+
+
 def test_end_exploration_marks_the_session_done():
     session = {}
     interest_finder.end_exploration.func("user confirmed", _runtime(session=session))
@@ -202,6 +264,23 @@ def test_the_prompt_carries_a_language_preference(isolated_subscribers_db):
     subscriber_ops.set_language(7, "Spanish")
     request = SimpleNamespace(runtime=SimpleNamespace(context={"chat_id": 7}))
     assert "Spanish" in interest_finder._compose_prompt(request)
+
+
+def test_the_prompt_surfaces_a_pending_proposal(isolated_subscribers_db):
+    """Defense in depth for the 2026-09-08 incident: if bot.py's own
+    classify_confirmation call returns "unclear" for what was actually a
+    clear yes, the model still gets a chance to notice and act, because
+    it can see what it's waiting on."""
+    session = {"pending_proposal": {"topic": "robotics", "action": "add"}}
+    request = SimpleNamespace(runtime=SimpleNamespace(context={"chat_id": 7, "session": session}))
+    prompt = interest_finder._compose_prompt(request)
+    assert "robotics" in prompt
+    assert "save_interest" in prompt
+
+
+def test_the_prompt_has_no_pending_proposal_note_when_none_is_set(isolated_subscribers_db):
+    request = SimpleNamespace(runtime=SimpleNamespace(context={"chat_id": 7, "session": {}}))
+    assert "waiting on their answer" not in interest_finder._compose_prompt(request)
 
 
 # --- The agent loop -------------------------------------------------------
@@ -295,6 +374,139 @@ def test_router_choosing_find_interests_opens_a_session(monkeypatch):
     assert result["reply"] == "Which of these interest you?"
     assert 7 in bot.interest_sessions
     run_turn.assert_called_once()
+
+
+# --- bot.py's deterministic confirmation gate -----------------------------
+# The fix for the 2026-09-08 incident: a real subscriber confirmed adding a
+# topic, the model replied "I've added it" in its own words, and nothing
+# was ever saved -- zero save_interest telemetry for that whole
+# conversation. These tests exercise the gate that makes the actual write
+# independent of the model remembering to call a tool.
+
+
+def test_an_affirmed_proposal_is_saved_without_the_agent_loop_running(monkeypatch, isolated_subscribers_db):
+    """The core guarantee: on "affirm", the write happens in code and
+    run_turn is never even called for this turn -- there is no step at
+    which the model could fail to follow through, because it isn't asked
+    to."""
+    run_turn = MagicMock()
+    monkeypatch.setattr(bot.interest_finder, "run_turn", run_turn)
+    monkeypatch.setattr(bot.guardrails, "is_output_on_topic", MagicMock(return_value=True))
+    monkeypatch.setattr(bot.interest_finder, "classify_confirmation", MagicMock(return_value="affirm"))
+    monkeypatch.setattr(agent, "add_one_interest", MagicMock(return_value="Added semiconductors."))
+    bot.interest_sessions[7] = {"turns": 1, "pending_proposal": {"topic": "semiconductors", "action": "add"}}
+
+    result = asyncio.run(bot.process_message(7, "yes", "m", "g"))
+
+    run_turn.assert_not_called()
+    assert result == {"blocked_at": None, "category": "find_interests", "reply": "Added semiconductors."}
+    assert "pending_proposal" not in bot.interest_sessions[7]
+
+
+def test_an_affirmed_removal_proposal_is_dropped_without_the_agent_loop(monkeypatch, isolated_subscribers_db):
+    subscriber_ops.add_interest(7, "crypto")
+    run_turn = MagicMock()
+    monkeypatch.setattr(bot.interest_finder, "run_turn", run_turn)
+    monkeypatch.setattr(bot.guardrails, "is_output_on_topic", MagicMock(return_value=True))
+    monkeypatch.setattr(bot.interest_finder, "classify_confirmation", MagicMock(return_value="affirm"))
+    bot.interest_sessions[7] = {"turns": 1, "pending_proposal": {"topic": "crypto", "action": "remove"}}
+
+    result = asyncio.run(bot.process_message(7, "yes", "m", "g"))
+
+    run_turn.assert_not_called()
+    assert "crypto" not in subscriber_ops.get_interests(7)
+    assert "Removed crypto" in result["reply"]
+
+
+def test_a_declined_proposal_clears_and_falls_through_to_the_agent_turn(monkeypatch, isolated_subscribers_db):
+    run_turn = MagicMock(return_value=("What would you like instead?", False))
+    monkeypatch.setattr(bot.interest_finder, "run_turn", run_turn)
+    monkeypatch.setattr(bot.guardrails, "is_output_on_topic", MagicMock(return_value=True))
+    monkeypatch.setattr(bot.interest_finder, "classify_confirmation", MagicMock(return_value="decline"))
+    save = MagicMock()
+    monkeypatch.setattr(agent, "add_one_interest", save)
+    bot.interest_sessions[7] = {"turns": 1, "pending_proposal": {"topic": "semiconductors", "action": "add"}}
+
+    result = asyncio.run(bot.process_message(7, "no, something else", "m", "g"))
+
+    save.assert_not_called()
+    run_turn.assert_called_once()
+    assert "pending_proposal" not in bot.interest_sessions[7]
+    assert result["reply"] == "What would you like instead?"
+
+
+def test_an_unclear_reply_leaves_the_proposal_pending_and_falls_through(monkeypatch, isolated_subscribers_db):
+    """The safe default: an ambiguous reply neither saves anything nor
+    discards the proposal -- the model gets another look at it (see
+    _compose_prompt's own pending-proposal note) before it's lost."""
+    run_turn = MagicMock(return_value=("Can you say more?", False))
+    monkeypatch.setattr(bot.interest_finder, "run_turn", run_turn)
+    monkeypatch.setattr(bot.guardrails, "is_output_on_topic", MagicMock(return_value=True))
+    monkeypatch.setattr(bot.interest_finder, "classify_confirmation", MagicMock(return_value="unclear"))
+    save = MagicMock()
+    monkeypatch.setattr(agent, "add_one_interest", save)
+    bot.interest_sessions[7] = {"turns": 1, "pending_proposal": {"topic": "semiconductors", "action": "add"}}
+
+    result = asyncio.run(bot.process_message(7, "hmm what else is there", "m", "g"))
+
+    save.assert_not_called()
+    run_turn.assert_called_once()
+    assert bot.interest_sessions[7]["pending_proposal"] == {"topic": "semiconductors", "action": "add"}
+    assert result["reply"] == "Can you say more?"
+
+
+def test_no_pending_proposal_never_calls_the_confirmation_classifier(monkeypatch):
+    """The classifier is a real extra model call -- it must only fire
+    when there's actually something to confirm, not on every turn."""
+    run_turn = MagicMock(return_value=("ok", False))
+    monkeypatch.setattr(bot.interest_finder, "run_turn", run_turn)
+    monkeypatch.setattr(bot.guardrails, "is_output_on_topic", MagicMock(return_value=True))
+    classify = MagicMock()
+    monkeypatch.setattr(bot.interest_finder, "classify_confirmation", classify)
+    bot.interest_sessions[7] = {"turns": 1}
+
+    asyncio.run(bot.process_message(7, "the second one", "m", "g"))
+
+    classify.assert_not_called()
+    run_turn.assert_called_once()
+
+
+def test_a_layer_4_block_on_an_affirmed_proposal_clears_the_session(monkeypatch, isolated_subscribers_db):
+    monkeypatch.setattr(bot.interest_finder, "classify_confirmation", MagicMock(return_value="affirm"))
+    monkeypatch.setattr(bot.guardrails, "is_output_on_topic", MagicMock(return_value=False))
+    monkeypatch.setattr(agent, "add_one_interest", MagicMock(return_value="Added semiconductors."))
+    bot.interest_sessions[7] = {"turns": 1, "pending_proposal": {"topic": "semiconductors", "action": "add"}}
+
+    result = asyncio.run(bot.process_message(7, "yes", "m", "g"))
+
+    assert result["blocked_at"] == "layer4_output_check"
+    assert 7 not in bot.interest_sessions
+
+
+def test_a_failing_execution_clears_the_session(monkeypatch, isolated_subscribers_db):
+    monkeypatch.setattr(bot.interest_finder, "classify_confirmation", MagicMock(return_value="affirm"))
+    monkeypatch.setattr(agent, "add_one_interest", MagicMock(side_effect=RuntimeError("db down")))
+    bot.interest_sessions[7] = {"turns": 1, "pending_proposal": {"topic": "semiconductors", "action": "add"}}
+
+    result = asyncio.run(bot.process_message(7, "yes", "m", "g"))
+
+    assert result["blocked_at"] == "agent_error"
+    assert 7 not in bot.interest_sessions
+
+
+def test_an_affirmed_proposal_translates_the_confirmation(monkeypatch, isolated_subscribers_db):
+    subscriber_ops.set_language(7, "Spanish")
+    monkeypatch.setattr(bot.interest_finder, "classify_confirmation", MagicMock(return_value="affirm"))
+    monkeypatch.setattr(bot.guardrails, "is_output_on_topic", MagicMock(return_value=True))
+    monkeypatch.setattr(agent, "add_one_interest", MagicMock(return_value="Added semiconductors."))
+    translate = MagicMock(return_value="Se agregó semiconductores.")
+    monkeypatch.setattr(bot, "_translate_confirmation", translate)
+    bot.interest_sessions[7] = {"turns": 1, "pending_proposal": {"topic": "semiconductors", "action": "add"}}
+
+    result = asyncio.run(bot.process_message(7, "si", "m", "g"))
+
+    translate.assert_called_once()
+    assert result["reply"] == "Se agregó semiconductores."
 
 
 def test_a_bare_yes_mid_exploration_skips_the_router_entirely(monkeypatch):
