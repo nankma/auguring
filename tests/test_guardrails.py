@@ -210,6 +210,29 @@ def test_output_scope_prompt_covers_interest_narrowing_replies():
     assert "narrowing down" in guardrails._OUTPUT_SCOPE_PROMPT
 
 
+def test_output_scope_prompt_covers_definition_refinement_replies():
+    """docs/plans/interest-definition-plan.md: showing/proposing a
+    retrieval definition is a new reply shape this feature introduces,
+    and it needed the same treatment as narrowing-down replies."""
+    assert "retrieval definition" in guardrails._OUTPUT_SCOPE_PROMPT
+
+
+def test_a_definition_naming_a_tool_the_bot_itself_uses_is_not_self_disclosure():
+    """A predictable false positive: the auto-generated definition for
+    the interest "AI Agent" names LangChain/AutoGen/CrewAI -- and
+    LangChain is one of this bot's own listed self-disclosure trigger
+    words. Discussing what an AI-agent NEWS TOPIC covers must not be
+    confused with the bot describing its own implementation, the same
+    class of false positive the 2026-08-08 "already covered interest"
+    incident was."""
+    model = _fake_structured_model(
+        guardrails.OutputCheck(reasoning="test", discusses_own_configuration=False, appropriate_bot_content=True)
+    )
+    reply = ("This definition would surface: AI agents built with LangChain, AutoGen, "
+             "and CrewAI, using tool calling and RAG.")
+    assert guardrails.is_output_on_topic(model, reply, category="find_interests") is True
+
+
 def test_is_output_on_topic_news_query_category_uses_full_check():
     model = _fake_structured_model(
         guardrails.OutputCheck(reasoning="test", discusses_own_configuration=False, appropriate_bot_content=False)

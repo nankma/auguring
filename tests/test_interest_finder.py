@@ -21,6 +21,7 @@ from langgraph.errors import GraphRecursionError
 import agent
 import bot
 import guardrails
+import interest_cache_ops
 import interest_finder
 import news_cache
 import subscriber_ops
@@ -223,6 +224,92 @@ def test_end_exploration_marks_the_session_done():
     assert session["end_reason"] == "user confirmed"
 
 
+# --- Definition refinement (docs/plans/interest-definition-plan.md) -------
+
+
+def test_show_definition_returns_the_resolved_definition(isolated_subscribers_db):
+    interest_cache_ops.set_interest_query_expansion("AI", "the shared definition")
+    result = interest_finder.show_definition.func("AI", _runtime(chat_id=7))
+    assert "the shared definition" in result
+
+
+def test_show_definition_prefers_the_subscribers_own_override(isolated_subscribers_db):
+    interest_cache_ops.set_interest_query_expansion("AI", "the shared definition")
+    interest_cache_ops.set_subscriber_interest_definition(7, "AI", "chat 7's own definition")
+    result = interest_finder.show_definition.func("AI", _runtime(chat_id=7))
+    assert "chat 7's own definition" in result
+    assert "the shared definition" not in result
+
+
+def test_show_definition_says_so_when_none_exists(isolated_subscribers_db):
+    """The exact gap this feature exists to fix (Defect 2): a bare
+    interest has no definition at all. The tool must say so plainly, not
+    silently show nothing or crash."""
+    result = interest_finder.show_definition.func("AI", _runtime(chat_id=7))
+    assert "No definition exists yet" in result
+
+
+def test_propose_definition_previews_real_cached_articles(cached_articles):
+    """The preview is the whole point -- baked into propose_definition
+    itself so it can never be skipped (docs/plans/interest-definition-plan.md,
+    finding 5: definition effects are measured to be counter-intuitive)."""
+    result = interest_finder.propose_definition.func(
+        "chips", "GPUs and data center chip hardware", _runtime(chat_id=7, embedder=FakeEmbedder()))
+    assert "Nvidia unveils a new GPU for data centers" in result
+
+
+def test_propose_definition_records_a_pending_redefine_proposal(cached_articles):
+    session = {}
+    interest_finder.propose_definition.func(
+        "chips", "GPUs and data center chip hardware",
+        _runtime(chat_id=7, session=session, embedder=FakeEmbedder()))
+    assert session["pending_proposal"] == {
+        "topic": "chips", "action": "redefine", "definition": "GPUs and data center chip hardware",
+    }
+
+
+def test_propose_definition_does_not_change_anything_yet(cached_articles, isolated_subscribers_db):
+    """Proposing is not saving -- same invariant as propose_interest."""
+    interest_finder.propose_definition.func(
+        "chips", "GPUs and data center chip hardware", _runtime(chat_id=7, embedder=FakeEmbedder()))
+    assert interest_cache_ops.resolve_interest_definition(7, "chips") is None
+
+
+def test_propose_definition_warns_when_nothing_would_surface(isolated_news_cache):
+    """A definition that surfaces nothing is a bad proposal -- the model
+    needs to know not to present it as a good option, per its own
+    docstring."""
+    result = interest_finder.propose_definition.func(
+        "chips", "something with zero cache coverage", _runtime(chat_id=7))
+    assert "NOTHING relevant" in result
+
+
+def test_execute_redefine_and_save_definition_tool_go_through_the_same_path(isolated_subscribers_db):
+    """Same single-code-path rule as execute_save/save_interest."""
+    session_a, session_b = {}, {}
+
+    reply_a = interest_finder.execute_redefine(7, "AI", "a new definition", session_a)
+    reply_b = interest_finder.save_definition.func(
+        "AI", "another definition", _runtime(chat_id=7, session=session_b))
+
+    assert "AI" in reply_a and "AI" in reply_b
+    assert session_a["redefined"] == ["AI"]
+    assert session_b["redefined"] == ["AI"]
+
+
+def test_execute_redefine_writes_to_the_subscribers_own_tier_only(isolated_subscribers_db):
+    """A personal refinement must never touch the shared/global default
+    -- other subscribers following the same interest word must be
+    unaffected."""
+    interest_cache_ops.set_interest_query_expansion("AI", "the shared default")
+
+    interest_finder.execute_redefine(7, "AI", "chat 7's own definition", {})
+
+    assert interest_cache_ops.get_interest_query_expansion("AI") == "the shared default"
+    assert interest_cache_ops.get_subscriber_interest_definition(7, "AI") == "chat 7's own definition"
+    assert interest_cache_ops.resolve_interest_definition(8, "AI") == "the shared default"
+
+
 def test_saving_and_ending_are_both_logged(isolated_subscribers_db, monkeypatch):
     """These two events are the only way to ask whether narrowing down
     actually works -- how many explorations end in a saved interest,
@@ -418,6 +505,27 @@ def test_an_affirmed_removal_proposal_is_dropped_without_the_agent_loop(monkeypa
     assert "Removed crypto" in result["reply"]
 
 
+def test_an_affirmed_redefine_proposal_is_saved_without_the_agent_loop(monkeypatch, isolated_subscribers_db):
+    """The redefine branch of the same gate -- docs/plans/interest-definition-plan.md.
+    Same guarantee as add/remove: the write happens in code, never
+    dependent on the model calling save_definition itself."""
+    run_turn = MagicMock()
+    monkeypatch.setattr(bot.interest_finder, "run_turn", run_turn)
+    monkeypatch.setattr(bot.guardrails, "is_output_on_topic", MagicMock(return_value=True))
+    monkeypatch.setattr(bot.interest_finder, "classify_confirmation", MagicMock(return_value="affirm"))
+    bot.interest_sessions[7] = {
+        "turns": 1,
+        "pending_proposal": {"topic": "AI", "action": "redefine", "definition": "a hands-on/experimental focus"},
+    }
+
+    result = asyncio.run(bot.process_message(7, "yes", "m", "g"))
+
+    run_turn.assert_not_called()
+    assert result["blocked_at"] is None
+    assert interest_cache_ops.get_subscriber_interest_definition(7, "AI") == "a hands-on/experimental focus"
+    assert "pending_proposal" not in bot.interest_sessions[7]
+
+
 def test_a_declined_proposal_clears_and_falls_through_to_the_agent_turn(monkeypatch, isolated_subscribers_db):
     run_turn = MagicMock(return_value=("What would you like instead?", False))
     monkeypatch.setattr(bot.interest_finder, "run_turn", run_turn)
@@ -487,6 +595,29 @@ def test_a_failing_execution_clears_the_session(monkeypatch, isolated_subscriber
     monkeypatch.setattr(bot.interest_finder, "classify_confirmation", MagicMock(return_value="affirm"))
     monkeypatch.setattr(agent, "add_one_interest", MagicMock(side_effect=RuntimeError("db down")))
     bot.interest_sessions[7] = {"turns": 1, "pending_proposal": {"topic": "semiconductors", "action": "add"}}
+
+    result = asyncio.run(bot.process_message(7, "yes", "m", "g"))
+
+    assert result["blocked_at"] == "agent_error"
+    assert 7 not in bot.interest_sessions
+
+
+def test_an_unknown_pending_proposal_action_fails_loudly_and_clears_the_session(
+    monkeypatch, isolated_subscribers_db
+):
+    """QA-flagged gap: the explicit add/remove/redefine elif chain in
+    _execute_pending_proposal has a ValueError fallback for anything
+    else, added by code review specifically so a mystery fourth action
+    fails loudly instead of silently misbehaving (e.g. calling
+    execute_redefine with a missing "definition" key). This is the only
+    path that can construct one -- pending_proposal is only ever built by
+    propose_interest ("add"/"remove") and propose_definition
+    ("redefine") -- but it had zero test coverage. The ValueError is
+    caught by the same except Exception block every other execution
+    failure in this function goes through, so the session still gets
+    cleared and the failure still gets logged."""
+    monkeypatch.setattr(bot.interest_finder, "classify_confirmation", MagicMock(return_value="affirm"))
+    bot.interest_sessions[7] = {"turns": 1, "pending_proposal": {"topic": "x", "action": "bogus"}}
 
     result = asyncio.run(bot.process_message(7, "yes", "m", "g"))
 

@@ -364,13 +364,29 @@ def test_a_near_duplicate_within_one_topic_stays_eligible_for_another(isolated_s
 
 def test_resolve_query_text_uses_the_cached_expansion_when_present(isolated_subscribers_db):
     interest_cache_ops.set_interest_query_expansion("AI coding", "a rich generated definition")
-    assert news_push._resolve_query_text("AI coding") == "a rich generated definition"
+    assert news_push._resolve_query_text(None, "AI coding") == "a rich generated definition"
 
 
 def test_resolve_query_text_falls_back_to_the_bare_topic_when_nothing_cached(
     isolated_subscribers_db
 ):
-    assert news_push._resolve_query_text("AI coding") == "AI coding"
+    assert news_push._resolve_query_text(None, "AI coding") == "AI coding"
+
+
+def test_resolve_query_text_prefers_the_subscribers_own_definition(isolated_subscribers_db):
+    """docs/plans/interest-definition-plan.md: a personal refinement must
+    outrank the shared default, not the other way around."""
+    interest_cache_ops.set_interest_query_expansion("AI coding", "the shared default definition")
+    interest_cache_ops.set_subscriber_interest_definition(7, "AI coding", "this subscriber's own definition")
+    assert news_push._resolve_query_text(7, "AI coding") == "this subscriber's own definition"
+
+
+def test_resolve_query_text_with_chat_id_still_falls_back_to_shared_default(isolated_subscribers_db):
+    """A subscriber who never refined anything still gets the shared
+    default, not the bare topic -- personalisation is additive, not a
+    replacement for the existing behavior."""
+    interest_cache_ops.set_interest_query_expansion("AI coding", "the shared default definition")
+    assert news_push._resolve_query_text(7, "AI coding") == "the shared default definition"
 
 
 # select_candidate_articles's wiring of _resolve_query_text's output into
@@ -1008,6 +1024,72 @@ def test_resolve_interest_categories_does_not_cache_a_failure(monkeypatch, isola
     assert result == {}, "unresolved, so the next cycle retries it"
 
 
+# --- backfill_missing_interest_definitions ----------------------------------
+# docs/plans/interest-definition-plan.md "Defect 2": an interest added
+# before expand_interest_for_retrieval existed (or whose one-shot
+# generation at add time failed) has no cached definition, and nothing on
+# the read path (_resolve_query_text) ever retries it. This backfill,
+# called once per push cycle, is the fix.
+
+
+def test_backfill_skips_an_interest_that_already_has_a_definition(monkeypatch, isolated_subscribers_db):
+    interest_cache_ops.set_interest_query_expansion("AI", "already has one")
+    expand = MagicMock()
+    monkeypatch.setattr(news_push.news_classify, "expand_interest_for_retrieval", expand)
+
+    news_push.backfill_missing_interest_definitions("fake-model", ["AI"])
+
+    expand.assert_not_called()
+    assert interest_cache_ops.get_interest_query_expansion("AI") == "already has one"
+
+
+def test_backfill_generates_and_caches_a_missing_definition(monkeypatch, isolated_subscribers_db):
+    monkeypatch.setattr(news_push.news_classify, "expand_interest_for_retrieval",
+                        lambda model, interest: f"a generated definition of {interest}")
+
+    news_push.backfill_missing_interest_definitions("fake-model", ["AI"])
+
+    assert interest_cache_ops.get_interest_query_expansion("AI") == "a generated definition of AI"
+
+
+def test_backfill_writes_to_the_shared_tier_not_a_subscriber_tier(monkeypatch, isolated_subscribers_db):
+    """This is an automatic, global backfill -- same tier
+    add_one_interest already writes to -- not a personal refinement.
+    interest_cache_ops.resolve_interest_definition has no chat_id to
+    scope it to here; there's no subscriber in scope at all."""
+    monkeypatch.setattr(news_push.news_classify, "expand_interest_for_retrieval",
+                        lambda model, interest: "the backfilled definition")
+
+    news_push.backfill_missing_interest_definitions("fake-model", ["AI"])
+
+    assert interest_cache_ops.get_subscriber_interest_definition(999, "AI") is None
+    assert interest_cache_ops.resolve_interest_definition(999, "AI") == "the backfilled definition"
+
+
+def test_backfill_does_not_cache_a_failed_generation(monkeypatch, isolated_subscribers_db):
+    """Same non-poisoning discipline as resolve_interest_categories: a
+    generation failure (None) must not be cached as a permanent answer,
+    so the next cycle retries it instead of being stuck with the bare
+    topic string forever."""
+    monkeypatch.setattr(news_push.news_classify, "expand_interest_for_retrieval",
+                        lambda model, interest: None)
+
+    news_push.backfill_missing_interest_definitions("fake-model", ["AI"])
+
+    assert interest_cache_ops.get_interest_query_expansion("AI") is None
+
+
+def test_backfill_only_generates_for_interests_actually_missing_one(monkeypatch, isolated_subscribers_db):
+    interest_cache_ops.set_interest_query_expansion("AI", "already cached")
+    calls = []
+    monkeypatch.setattr(news_push.news_classify, "expand_interest_for_retrieval",
+                        lambda model, interest: calls.append(interest) or "new definition")
+
+    news_push.backfill_missing_interest_definitions("fake-model", ["AI", "robotics"])
+
+    assert calls == ["robotics"]
+
+
 # --- write_push_digest ------------------------------------------------------
 
 
@@ -1233,6 +1315,12 @@ def _stub_cache_and_categories(monkeypatch, cached_articles=(), topic_categories
     monkeypatch.setattr(
         news_push, "resolve_interest_categories", lambda model, interests: topic_categories or {}
     )
+    # Same reasoning as the resolve_interest_categories stub above: this
+    # also calls `model` (see backfill_missing_interest_definitions's own
+    # docstring), and a test using a FakeToolCallingModel with a specific
+    # scripted response sequence for write_push_digest must not have one
+    # silently consumed by this unrelated call.
+    monkeypatch.setattr(news_push, "backfill_missing_interest_definitions", lambda model, interests: None)
 
 
 def test_run_push_cycle_skips_subscriber_with_no_interests(monkeypatch, isolated_subscribers_db):
@@ -1291,6 +1379,43 @@ def test_run_push_cycle_sends_and_records_when_new_articles_found(monkeypatch, i
     send.assert_called_once_with(3, digest, topic="AI")
     mark_links_shown.assert_called_once_with(3, ["https://example.com/new"], now)
     advance_last_push_at.assert_called_once_with(3, now)
+
+
+def test_run_push_cycle_passes_the_subscribers_chat_id_to_select_candidate_articles(
+    monkeypatch, isolated_subscribers_db
+):
+    """select_candidate_articles needs chat_id to prefer this subscriber's
+    own refined definition over the shared default
+    (docs/plans/interest-definition-plan.md) -- a regression here would
+    silently fall back to shared-only retrieval for everyone."""
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(subscriber_ops, "list_push_enabled_subscribers", lambda: [_subscriber(3)])
+    monkeypatch.setattr(subscriber_ops, "mark_links_shown", MagicMock())
+    monkeypatch.setattr(subscriber_ops, "advance_last_push_at", MagicMock())
+    _stub_cache_and_categories(monkeypatch)
+    select = MagicMock(return_value=[])
+    monkeypatch.setattr(news_push, "select_candidate_articles", select)
+    send = AsyncMock()
+
+    asyncio.run(news_push.run_push_cycle(model="fake-model", send=send, now=now))
+
+    assert select.call_args.kwargs["chat_id"] == 3
+
+
+def test_run_push_cycle_backfills_missing_definitions_before_selecting(monkeypatch, isolated_subscribers_db):
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(subscriber_ops, "list_push_enabled_subscribers", lambda: [_subscriber(3)])
+    monkeypatch.setattr(subscriber_ops, "mark_links_shown", MagicMock())
+    monkeypatch.setattr(subscriber_ops, "advance_last_push_at", MagicMock())
+    monkeypatch.setattr(news_cache, "read_all", lambda: [])
+    monkeypatch.setattr(news_push, "resolve_interest_categories", lambda model, interests: {})
+    backfill = MagicMock()
+    monkeypatch.setattr(news_push, "backfill_missing_interest_definitions", backfill)
+    send = AsyncMock()
+
+    asyncio.run(news_push.run_push_cycle(model="fake-model", send=send, now=now))
+
+    backfill.assert_called_once_with("fake-model", ["AI"])
 
 
 def test_run_push_cycle_only_records_articles_the_digest_actually_cited(
@@ -1602,7 +1727,7 @@ def test_run_push_cycle_isolates_one_subscribers_failure(monkeypatch, isolated_s
     call_count = {"n": 0}
 
     def select_side_effect(cached_articles, topics, topic_categories, since, pushed_links,
-                           include_restricted=False, now=None, embedder=None):
+                           include_restricted=False, now=None, embedder=None, chat_id=None):
         call_count["n"] += 1
         if call_count["n"] == 1:
             raise RuntimeError("boom")

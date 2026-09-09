@@ -505,6 +505,91 @@ fixed on 2026-08-20, on the article side, and it needs a `classified_at`
 field on the cached record. Tracked separately; it is not part of this
 plan and blocks the current 17% categorization rate from improving.
 
+### A8. Duplicate names — no gate exists (added 2026-09-09)
+
+Status: **proposed, nothing built.** Measured against live PROD; see
+`docs/analysis/retrieval-quality-measurements.md` finding 6.
+
+The taxonomy has grown to **245 active categories** and contains at least
+four classes of duplicate:
+
+| Class | Live examples |
+|---|---|
+| Case variants | `Real Estate` / `Real estate` / `RealEstate`, `Social media` / `Social Media`, `Private equity` / `Private Equity` |
+| Plural variants | `Semiconductor(s)`, `Drone(s)`, `Disaster(s)`, `Consumer(s)`, `Pharmaceutical(s)` |
+| Spelling errors | `Techology`, `Techonlogy`, `Minning`, `Entrepeneurship` |
+| Synonyms | `Math` / `Mathematics`, `Labour` / `Labor`, `Ecommerce` / `E-commerce`, `Telecom` / `Telecommunications` |
+
+**Why nothing caught them.** `normalize_category_name` (A3) is scoped to
+formatting safety and says so — its docstring is *"makes a model-proposed
+label safe to round-trip through a Telegram callback."* It does whitespace
+and colon cleanup plus truncation. No case folding, no stemming, no spell
+check, and crucially **no comparison against names that already exist**.
+
+The only real gate is the human admin at A4's threshold. Recognising that
+`Semiconductors` duplicates `Semiconductor` among 245 existing names is
+exactly the kind of recall task humans fail at, so this is a design gap,
+not an admin who was careless.
+
+**Why this matters beyond tidiness.** Categories are the Stage-1 hard
+filter in `news_push.select_candidate_articles`. A split category splits
+the candidate pool: an article tagged `Semiconductors` is invisible to an
+interest mapped to `Semiconductor`. Duplicates silently reduce recall for
+the subscribers whose interests happen to land on the wrong side of a
+split.
+
+**The machinery already exists and is not consulted.** `categories`
+already has `centroid` (A6) and `merged_into` (A5a) — similarity
+comparison and merging are both already modelled. A6 reserved `centroid`
+for a *different* purpose (nearest-centroid classification); this is a
+second, cheaper use for the same column.
+
+#### Proposed gate, cheapest first
+
+Applied in `record_category_sighting`, before a proposed row is created:
+
+1. **Casefold + punctuation/space-stripped exact match** against active
+   and proposed names. Catches every case variant and `E-commerce`/
+   `Ecommerce`. Pure string work, no model call.
+2. **Naive plural/stem match** (trailing `s`/`es`). Catches
+   `Semiconductor(s)`, `Drone(s)`, `Disaster(s)`.
+3. **Edit distance ≤ 2** against existing names. Catches `Techology`,
+   `Minning`, `Entrepeneurship` — typos, which embeddings handle *badly*
+   because a misspelling has no learned vector neighbourhood.
+4. **Centroid cosine** above a threshold. Catches genuine synonyms
+   (`Math`/`Mathematics`, `Labour`/`Labor`) that steps 1–3 cannot.
+
+Steps 1–2 can **auto-route the sighting to the existing category** (they
+are unambiguous). Steps 3–4 must **not** auto-merge — they surface
+`possible duplicate of X` in the A4 admin prompt and let the human decide.
+Keep the human decision; improve the evidence in front of them.
+
+#### One-off cleanup
+
+The 245 existing names need a single merge pass. `merged_into` already
+gives this the right semantics, and A5a already defines what a merge
+touches, so this is an operational task rather than a new mechanism.
+It should be run **after** the gate ships, or the same duplicates will
+re-accumulate.
+
+Two cautions:
+
+- **Merging changes retrieval for live subscribers.** An interest mapped
+  to `Semiconductor` starts matching articles tagged `Semiconductors`.
+  That is the intended fix, but it is a behaviour change on real digests
+  and should be announced in the deploy record, not slipped in.
+- **`Other`, `News`, `Technology`, `Tech`, `Techology`, `Techonlogy`** are
+  not all the same decision. `Tech`→`Technology` is a merge; `Other` is a
+  deliberate catch-all that should probably stay.
+
+#### Not solved here
+
+This does nothing about the taxonomy being *too large* to be useful — 245
+categories for a corpus of 2320 articles is roughly one category per nine
+articles, which makes the Stage-1 filter closer to a pass-through than a
+filter. Whether the taxonomy should be aggressively pruned is a separate
+question and needs its own measurement.
+
 ---
 
 ## B. Admin console

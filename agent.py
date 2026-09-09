@@ -431,7 +431,12 @@ def search_news(chat_id: int, query: str, history: list, model, guard_model, emb
     # and it's cached under the (rewritten) topic itself so a repeated
     # search -- or an interest added later with the same wording --
     # reuses it rather than paying for generation twice.
-    definition = interest_cache_ops.get_interest_query_expansion(topic)
+    #
+    # resolve_interest_definition (not the bare get_*) so this subscriber's
+    # own refined definition (docs/plans/interest-definition-plan.md), if
+    # they have one for this exact topic string, wins over the shared
+    # default -- same precedence news_push's _resolve_query_text applies.
+    definition = interest_cache_ops.resolve_interest_definition(chat_id, topic)
     if definition is None and guard_model is not None:
         _t0 = time.monotonic()
         definition = news_classify.expand_interest_for_retrieval(guard_model, topic)

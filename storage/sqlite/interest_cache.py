@@ -45,6 +45,25 @@ class InterestCacheMixin:
                 """
             ), {"interest": interest, "expansion": expansion})
 
+    def get_subscriber_interest_definition(self, chat_id: int, interest: str) -> str | None:
+        with self._engine.begin() as conn:
+            row = conn.execute(
+                text("SELECT expansion FROM subscriber_interest_definitions "
+                     "WHERE chat_id = :chat_id AND interest = :interest"),
+                {"chat_id": chat_id, "interest": interest},
+            ).fetchone()
+        return row[0] if row else None
+
+    def set_subscriber_interest_definition(self, chat_id: int, interest: str, expansion: str) -> None:
+        with self._engine.begin() as conn:
+            conn.execute(text(
+                """
+                INSERT INTO subscriber_interest_definitions (chat_id, interest, expansion)
+                VALUES (:chat_id, :interest, :expansion)
+                ON CONFLICT(chat_id, interest) DO UPDATE SET expansion = excluded.expansion
+                """
+            ), {"chat_id": chat_id, "interest": interest, "expansion": expansion})
+
     def set_category_keyness(self, category: str, scores: list[tuple[str, float]]) -> None:
         """Replaces `category`'s entire row set atomically -- delete then
         insert, not an upsert, since this is a full recompute every

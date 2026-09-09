@@ -430,6 +430,50 @@ def test_search_news_reuses_a_cached_query_definition(monkeypatch, isolated_subs
     assert result == agent._no_results_message("AI coding")
 
 
+def test_search_news_prefers_the_subscribers_own_definition_over_the_shared_one(
+    monkeypatch, isolated_subscribers_db
+):
+    """docs/plans/interest-definition-plan.md: a subscriber who has
+    refined a definition via find_interests must have search_news use
+    it too, not just push -- retrieval should be consistent across both
+    paths. Captures the actual query text handed to the relevance
+    filter, rather than only checking the no-results message, so this
+    would fail if the wrong tier's definition were ever picked."""
+    interest_cache_ops.set_interest_query_expansion("AI coding", "the shared default")
+    interest_cache_ops.set_subscriber_interest_definition(1, "AI coding", "chat 1's own refinement")
+    monkeypatch.setattr(news_cache, "read_all", lambda: [{"link": "https://ex.invalid/a", "title": "x"}])
+    monkeypatch.setattr(agent, "_rewrite_search_query", lambda query, history, guard_model: query)
+    captured = {}
+    def fake_filter(pool, embedder, query_text, **kw):
+        captured["query_text"] = query_text
+        return []
+    monkeypatch.setattr(news_embed, "filter_by_relevance", fake_filter)
+
+    agent.search_news(1, "AI coding", [], MagicMock(), "fake-guard-model", None)
+
+    assert captured["query_text"] == "chat 1's own refinement"
+
+
+def test_search_news_a_different_subscriber_still_gets_the_shared_definition(
+    monkeypatch, isolated_subscribers_db
+):
+    """The flip side of the test above: chat 1's refinement must not leak
+    into chat 2's retrieval."""
+    interest_cache_ops.set_interest_query_expansion("AI coding", "the shared default")
+    interest_cache_ops.set_subscriber_interest_definition(1, "AI coding", "chat 1's own refinement")
+    monkeypatch.setattr(news_cache, "read_all", lambda: [{"link": "https://ex.invalid/a", "title": "x"}])
+    monkeypatch.setattr(agent, "_rewrite_search_query", lambda query, history, guard_model: query)
+    captured = {}
+    def fake_filter(pool, embedder, query_text, **kw):
+        captured["query_text"] = query_text
+        return []
+    monkeypatch.setattr(news_embed, "filter_by_relevance", fake_filter)
+
+    agent.search_news(2, "AI coding", [], MagicMock(), "fake-guard-model", None)
+
+    assert captured["query_text"] == "the shared default"
+
+
 def test_search_news_no_results_message(monkeypatch, isolated_subscribers_db):
     monkeypatch.setattr(news_cache, "read_all", lambda: [])
 

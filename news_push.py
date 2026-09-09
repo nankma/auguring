@@ -253,6 +253,34 @@ _PUSH_DIGEST_PROMPT = (
 )
 
 
+def backfill_missing_interest_definitions(model, interests: list[str]) -> None:
+    """Stage-1 setup sibling to resolve_interest_categories, for the
+    definition cache rather than the category one. Fixes a real gap
+    (docs/plans/interest-definition-plan.md "Defect 2"): add_one_interest
+    generates a definition only ONCE, at add time -- an interest added
+    before expand_interest_for_retrieval existed, or one whose one-shot
+    generation call failed back then, has no row in
+    interest_query_expansions and nothing ever retries it, because
+    _resolve_query_text deliberately never calls the LLM (see its own
+    docstring). A subscriber measured live with `AI` in exactly this
+    state: no definition, retrieval falling back to embedding the bare
+    two-character string, which is a near-meaningless query
+    (docs/analysis/retrieval-quality-measurements.md finding 4).
+
+    Same cache-check-then-generate shape as resolve_interest_categories,
+    same cache (interest_cache_ops's SHARED/global tier -- the same one
+    add_one_interest already writes to, so this is a retroactive fill of
+    that cache, not a new one). No return value: unlike categories, which
+    select_candidate_articles needs threaded through as a dict, nothing
+    downstream needs the definitions handed back -- _resolve_query_text
+    reads the cache itself, per topic, right after this runs."""
+    missing = [i for i in interests if interest_cache_ops.get_interest_query_expansion(i) is None]
+    for interest in missing:
+        expansion = news_classify.expand_interest_for_retrieval(model, interest)
+        if expansion is not None:
+            interest_cache_ops.set_interest_query_expansion(interest, expansion)
+
+
 def resolve_interest_categories(model, interests: list[str]) -> dict[str, list[str]]:
     """Stage-1 setup: maps each interest to its category tags, using
     interest_cache_ops's persistent cache and classifying only what's missing --
@@ -303,6 +331,7 @@ def select_candidate_articles(
     now: datetime | None = None,
     embedder=None,
     include_novelty_extra: bool = INCLUDE_NOVELTY_EXTRA,
+    chat_id: int | None = None,
 ) -> list[dict]:
     """Stage 1 (category filter): narrows the shared cache to one
     subscriber's candidate articles, before the digest-writing model
@@ -462,8 +491,11 @@ def select_candidate_articles(
         # measurably (docs/analysis/cluster-measurements.md). `topic`
         # itself is still what's used for the category-match check right
         # below and for tagging candidates -- only the embedding calls
-        # use `query_text`.
-        query_text = _resolve_query_text(topic)
+        # use `query_text`. `chat_id` (this function's own parameter)
+        # lets _resolve_query_text prefer THIS subscriber's own refined
+        # definition over the shared default -- see
+        # docs/plans/interest-definition-plan.md.
+        query_text = _resolve_query_text(chat_id, topic)
         # Newest-first, deduplicated, gathered BEFORE the max_per_topic cut
         # (unlike the old single-pass loop), because offbeat selection
         # needs a pool bigger than the final cut to have anything to
@@ -561,7 +593,7 @@ def select_candidate_articles(
     return candidates
 
 
-def _resolve_query_text(topic: str) -> str:
+def _resolve_query_text(chat_id: int | None, topic: str) -> str:
     """The bare topic string is a weak embedding query -- measured,
     2026-08-25: for "AI coding", three genuinely relevant real articles
     ("Claude Cowork...") scored BELOW an unrelated stock-picking article,
@@ -573,12 +605,22 @@ def _resolve_query_text(topic: str) -> str:
     to 44%). See news_classify.expand_interest_for_retrieval for what's
     generated and cached, and agent.py's add_one_interest for when.
 
-    Falls back to the bare `topic` when nothing is cached -- an interest
-    added before this feature existed, or one whose generation call
-    failed and was never retried. Never calls the LLM itself: this runs
-    on every push cycle, and generation is deliberately a write-time,
-    cached, once-per-interest cost, not a read-time one."""
-    return interest_cache_ops.get_interest_query_expansion(topic) or topic
+    Checks this subscriber's own refined definition first (see
+    docs/plans/interest-definition-plan.md), then the shared/global one,
+    then falls back to the bare `topic` -- reached only if BOTH are
+    missing, which backfill_missing_interest_definitions (called once per
+    cycle before this) is meant to make rare. Delegates the subscriber-
+    then-shared precedence to interest_cache_ops.resolve_interest_
+    definition rather than re-expressing it here -- that precedence is
+    this feature's core guarantee (interest-definition-plan.md), and
+    having it live in exactly one place is what keeps it from silently
+    drifting if it's ever changed. `chat_id=None` (test callers with no
+    real subscriber in scope) resolves the same way a chat_id that has no
+    override does: SQL `chat_id = NULL` never matches, so this degrades
+    to the shared tier correctly, not incorrectly. Never calls the LLM
+    itself: this runs on every push cycle, and generation is deliberately
+    a write-time, cached cost, not a read-time one."""
+    return interest_cache_ops.resolve_interest_definition(chat_id, topic) or topic
 
 
 def _novelty_sort_key(scored_item: tuple[dict, bool, tuple[float, str] | None]) -> tuple[int, float]:
@@ -1069,6 +1111,7 @@ async def run_push_cycle(model, send: "callable", now: datetime | None = None, e
         blocked = 0
         try:
             topic_categories = _model_call(resolve_interest_categories, model, interests)
+            _model_call(backfill_missing_interest_definitions, model, interests)
             # One message per interest, longest-un-pushed first. Two
             # reasons this replaced a single combined digest:
             #
@@ -1102,6 +1145,7 @@ async def run_push_cycle(model, send: "callable", now: datetime | None = None, e
                     include_restricted=subscriber["restricted_sources_enabled"],
                     now=now,
                     embedder=embedder,
+                    chat_id=chat_id,
                 )
                 if not new_articles:
                     continue
