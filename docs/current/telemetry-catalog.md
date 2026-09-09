@@ -111,8 +111,9 @@ Every row also carries `otel.status_code=ERROR` and a recorded exception
 | `interest_saved_from_exploration` | `argus.interest_finder` | `interest_finder.execute_save` | INFO | `chat_id`, `topic`, `turns` | the outcome event — the numerator in "how many explorations produce an interest". `execute_save` is the single write path, reached from both the `save_interest` tool and `bot._execute_pending_proposal`'s deterministic confirmation gate, so this fires exactly once per real save regardless of which path triggered it |
 | `interest_exploration_ended` | `argus.interest_finder` | `interest_finder.end_exploration` | INFO | `chat_id`, `reason`, `turns`, `saved_count`, `dropped_count` | fires on every model-ended exploration, INCLUDING ones that saved nothing; the denominator for the row above |
 | `confirmation_check_failed` | `argus.interest_finder` | `interest_finder.classify_confirmation` | WARN | — | the affirm/decline/unclear classifier failing; fails open to "unclear", which just falls through to the normal agent turn -- never worse than before this mechanism existed |
+| `interest_definition_redefined` | `argus.interest_finder` | `interest_finder.execute_redefine` | INFO | `chat_id`, `topic`, `turns` | docs/plans/interest-definition-plan.md's outcome event, mirroring `interest_saved_from_exploration` -- fires exactly once per real per-subscriber definition write, from `execute_redefine`, the single write path reached from both the `save_definition` tool and the deterministic confirmation gate |
 
-None of these eighteen have a dedicated alert yet — they're new visibility,
+None of these nineteen have a dedicated alert yet — they're new visibility,
 not new paging. `router_failed`/`output_check_failed` are the strongest
 candidates for one, given the incident they're already tied to.
 

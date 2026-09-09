@@ -35,6 +35,21 @@ the code:
    only on classifying one short reply as affirm/decline/unclear, the
    same bounded, already-reliable shape as guardrails.classify_message's
    router. See propose_interest's own docstring for the mechanism.
+5. **The retrieval DEFINITION is a far bigger lever than the interest word
+   itself, and a subscriber can't see or touch it.** Measured 2026-09-09
+   (docs/analysis/retrieval-quality-measurements.md finding 4): rewriting
+   one cached paragraph moved a target article from rank 467 to rank 2 in
+   the same corpus. This module's show_definition/propose_definition/
+   save_definition tools exist because that lever needed a handle a
+   subscriber could actually turn. A tempting alternative -- classifying
+   articles by "story genre" (demo vs. announcement vs. analysis) so a
+   subscriber could ask for more of one -- was measured and DISCARDED
+   (finding 5): a genre written into a definition barely separates wanted
+   from unwanted articles (~0.09 cosine spread), because static
+   embeddings encode subject matter, not story shape. The definition
+   lever works through topical vocabulary, so refinement stays topical:
+   concrete directions drawn from the cache ("more hands-on/experimental",
+   "more enterprise/deployment"), never an abstract genre label.
 
 **This is the one feature in this codebase that genuinely justifies an
 agent loop** (agent.build_agent/run_agent, dormant since PR #85). The
@@ -64,6 +79,7 @@ from langgraph.errors import GraphRecursionError
 from pydantic import BaseModel
 
 import agent
+import interest_cache_ops
 import news_cache
 import news_embed
 import subscriber_ops
@@ -136,7 +152,7 @@ _SYSTEM_PROMPT = (
     "direction -- rephrasing the same idea a third and fourth time does "
     "not find coverage that isn't there, and it makes them wait.\n\n"
 
-    "THE FOUR WAYS THEY MIGHT ARRIVE, all handled here:\n"
+    "THE FIVE WAYS THEY MIGHT ARRIVE, all handled here:\n"
     "(a) They want help finding interests from scratch -- start with a "
     "broad sense of what the corpus covers, then narrow.\n"
     "(b) They liked a story they were sent and want more like it -- "
@@ -146,19 +162,37 @@ _SYSTEM_PROMPT = (
     "save_interest/drop_interest to rebalance. Adjust the interest LIST "
     "only; you cannot change push frequency or volume here.\n"
     "(d) They want suggestions before committing -- show examples, let "
-    "them pick.\n\n"
+    "them pick.\n"
+    "(e) They already follow a topic but what it sends isn't what they "
+    "wanted (\"I follow AI but I never get the interesting stuff\") -- "
+    "this is the topic's DEFINITION, not the topic word itself, that "
+    "needs adjusting. Call show_definition to see what's currently "
+    "driving their pushes, then find_example_articles a few different "
+    "ways to see what the cache actually has for this topic. Offer 2-3 "
+    "concrete directions drawn from what you found (e.g. \"more hands-on "
+    "experiments and demos\" vs. \"more enterprise/deployment news\" vs. "
+    "\"more research papers\") -- never an abstract quality label like "
+    "\"more interesting\", which cannot be turned into a retrieval query. "
+    "Once they pick a direction, write a candidate definition and call "
+    "propose_definition with it -- this shows you (and them) exactly "
+    "which real cached articles it would surface, BEFORE anything is "
+    "saved. Definition effects are measured to be counter-intuitive, so "
+    "always look at the preview yourself before describing it to them, "
+    "and never call save_definition on a definition you haven't "
+    "previewed via propose_definition.\n\n"
 
-    "BEFORE SAVING OR REMOVING: call propose_interest(topic, action) in "
-    "the SAME turn you say plainly which topic you are about to add or "
-    "remove, then ask them to confirm -- do not save on a guess. "
-    "propose_interest only records the proposal; it changes nothing by "
-    "itself, so calling it is always safe, and the system uses it to "
-    "complete the change reliably once they agree even in a turn where "
-    "you don't get the chance to call save_interest/drop_interest "
-    "yourself. If you are ever unsure whether a proposal you made "
-    "earlier actually went through, call save_interest/drop_interest "
-    "again rather than just saying it worked -- only say something is "
-    "saved after a tool call has actually told you so.\n\n"
+    "BEFORE SAVING, REMOVING, OR REDEFINING: call propose_interest(topic, "
+    "action) or propose_definition(topic, definition) in the SAME turn "
+    "you say plainly what you are about to change, then ask them to "
+    "confirm -- do not save on a guess. Neither propose call changes "
+    "anything by itself, so calling either is always safe, and the "
+    "system uses it to complete the change reliably once they agree even "
+    "in a turn where you don't get the chance to call "
+    "save_interest/drop_interest/save_definition yourself. If you are "
+    "ever unsure whether a proposal you made earlier actually went "
+    "through, call the matching save/drop tool again rather than just "
+    "saying it worked -- only say something is saved after a tool call "
+    "has actually told you so.\n\n"
 
     "WHEN TO STOP: call end_exploration as soon as they are satisfied, "
     "or if they say they are done, or if they have changed direction "
@@ -178,46 +212,57 @@ def _session(runtime: ToolRuntime) -> dict:
     return runtime.context["session"]
 
 
+def _relevant_cached_articles(embedder, query_text: str) -> list[dict]:
+    """The shared retrieval step behind both find_example_articles and
+    propose_definition's preview -- same pool, same relevance filter,
+    same clamp constants. Deliberately NOT search_news: three
+    differences, each load-bearing.
+
+    1. No quota. Narrowing down (or previewing a definition) must not
+       spend the subscriber's daily search allowance -- they are being
+       helped, not served results.
+    2. No mark_links_shown. An article shown as an EXAMPLE or PREVIEW
+       here has not been delivered as news; retiring it would silently
+       remove it from a future digest the subscriber would otherwise
+       have gotten.
+    3. No definition generation. expand_interest_for_retrieval is the
+       single most expensive step in the search pipeline (2.7-4.7s
+       measured, see docs/current/telemetry-catalog.md) and it caches
+       per topic -- but exploration tries many one-off phrasings, so it
+       would miss the cache nearly every time and pay full price on
+       every turn. Raw-query embedding is a weaker retrieval signal
+       (news_classify.expand_interest_for_retrieval's own docstring has
+       the measurement); accepted here because these results only need
+       to be good enough to react to. Whatever finally gets SAVED (an
+       interest via agent.add_one_interest, or a definition via
+       execute_redefine) uses the real thing -- a generated definition
+       for a new interest, or the subscriber's own hand-refined text for
+       an existing one."""
+    pool = [a for a in news_cache.read_all() if a.get("link")]
+    return news_embed.filter_by_relevance(
+        pool, embedder, query_text,
+        keep_fraction=agent.SEARCH_RELEVANCE_KEEP_FRACTION,
+        keep_min=agent.SEARCH_RELEVANCE_KEEP_MIN,
+        keep_max=agent.SEARCH_RELEVANCE_KEEP_MAX,
+    )
+
+
+def _format_article_lines(articles: list[dict]) -> list[str]:
+    return [f"- {a['title']} ({a.get('source') or a.get('source_key', '')})" for a in articles]
+
+
 @tool
 def find_example_articles(query: str, runtime: ToolRuntime) -> str:
     """Search the already-ingested news cache for real recent articles
     matching a topic or phrase, to show the subscriber as concrete
     examples. Use this before proposing any topic -- it is the only way
     to know the topic has real coverage."""
-    embedder = runtime.context.get("embedder")
-    # Deliberately NOT search_news: three differences, each load-bearing.
-    #
-    # 1. No quota. Narrowing down must not spend the subscriber's daily
-    #    search allowance -- they are being helped, not served results.
-    # 2. No mark_links_shown. An article shown as an EXAMPLE here has not
-    #    been delivered as news; retiring it would silently remove it
-    #    from a future digest the subscriber would otherwise have gotten.
-    # 3. No definition generation. expand_interest_for_retrieval is the
-    #    single most expensive step in the search pipeline (2.7-4.7s
-    #    measured, see docs/current/telemetry-catalog.md) and it caches
-    #    per topic -- but exploration tries many one-off phrasings, so it
-    #    would miss the cache nearly every time and pay full price on
-    #    every turn. Raw-query embedding is a weaker retrieval signal
-    #    (news_classify.expand_interest_for_retrieval's own docstring has
-    #    the measurement); accepted here because these results only need
-    #    to be good enough to react to, and the interest that finally
-    #    gets SAVED goes through agent.add_one_interest, which generates
-    #    and caches the real definition then.
-    pool = [a for a in news_cache.read_all() if a.get("link")]
-    relevant = news_embed.filter_by_relevance(
-        pool, embedder, query,
-        keep_fraction=agent.SEARCH_RELEVANCE_KEEP_FRACTION,
-        keep_min=agent.SEARCH_RELEVANCE_KEEP_MIN,
-        keep_max=agent.SEARCH_RELEVANCE_KEEP_MAX,
-    )
-    examples = relevant[:MAX_EXAMPLES]
+    examples = _relevant_cached_articles(runtime.context.get("embedder"), query)[:MAX_EXAMPLES]
     if not examples:
         return (f'Nothing in the cache matches "{query}". Do not propose this '
                 "topic -- it has no coverage. Try a broader or different phrasing.")
     lines = [f"{len(examples)} real cached article(s) for \"{query}\":"]
-    for article in examples:
-        source = article.get("source") or article.get("source_key", "")
-        lines.append(f"- {article['title']} ({source})")
+    lines.extend(_format_article_lines(examples))
     return "\n".join(lines)
 
 
@@ -229,6 +274,23 @@ def list_current_interests(runtime: ToolRuntime) -> str:
     if not interests:
         return "This subscriber follows nothing yet."
     return "Currently following: " + ", ".join(interests)
+
+
+@tool
+def show_definition(topic: str, runtime: ToolRuntime) -> str:
+    """Shows this subscriber's current retrieval definition for one of
+    their existing interests -- the paragraph that actually decides what
+    gets pushed for it, not the topic word itself
+    (docs/plans/interest-definition-plan.md). Call this before proposing
+    a redefinition, so you're working from what's actually driving their
+    pushes today, not guessing at it."""
+    chat_id = runtime.context["chat_id"]
+    definition = interest_cache_ops.resolve_interest_definition(chat_id, topic)
+    if definition is None:
+        return (f'No definition exists yet for "{topic}" -- retrieval currently falls back '
+                "to embedding the bare topic string, which is a weak query. Any definition "
+                "you propose would be a genuine improvement, not just a change.")
+    return f'Current definition for "{topic}":\n\n{definition}'
 
 
 def execute_save(chat_id: int, topic: str, guard_model, session: dict) -> str:
@@ -266,6 +328,26 @@ def execute_drop(chat_id: int, topic: str, session: dict) -> str:
     if not remaining:
         return f"Removed {topic}. They now follow nothing."
     return f"Removed {topic}. They now follow: " + ", ".join(remaining)
+
+
+def execute_redefine(chat_id: int, topic: str, definition: str, session: dict) -> str:
+    """The save_definition counterpart to execute_save/execute_drop above
+    -- same single-code-path rule, both the tool below and bot.py's
+    deterministic confirmation gate call this and only this.
+
+    Writes to the SUBSCRIBER's own override tier
+    (interest_cache_ops.set_subscriber_interest_definition), never the
+    shared/global one -- a personal refinement must never change what
+    OTHER subscribers following the same topic word receive. See
+    docs/plans/interest-definition-plan.md."""
+    interest_cache_ops.set_subscriber_interest_definition(chat_id, topic, definition)
+    session.setdefault("redefined", []).append(topic)
+    # Mirrors interest_saved_from_exploration -- the outcome event that
+    # says this half of the feature did something real.
+    _events.log("interest_definition_redefined",
+                 {"message": f"exploration redefined {topic}'s retrieval definition",
+                  "chat_id": chat_id, "topic": topic, "turns": session.get("turns", 0)})
+    return f'Updated how "{topic}" is defined for you -- future pushes for it use this.'
 
 
 @tool
@@ -310,6 +392,44 @@ def drop_interest(topic: str, runtime: ToolRuntime) -> str:
 
 
 @tool
+def propose_definition(topic: str, definition: str, runtime: ToolRuntime) -> str:
+    """Call this to propose a NEW retrieval definition for one of the
+    subscriber's existing interests -- in the SAME turn you tell them
+    what direction you're proposing and ask them to confirm, mirroring
+    propose_interest (same mechanism, same reason: see this module's own
+    docstring on the 2026-09-08 incident).
+
+    Unlike propose_interest, this ALSO runs the preview immediately and
+    returns which real cached articles `definition` would surface right
+    now -- definition effects are measured to be strongly counter-
+    intuitive (docs/analysis/retrieval-quality-measurements.md finding
+    5), so the preview is baked into this call rather than left to a
+    separate step you could skip. Read the preview before describing the
+    change to the subscriber; if it surfaces nothing relevant, do not
+    propose this definition -- try a different direction instead."""
+    preview = _relevant_cached_articles(runtime.context.get("embedder"), definition)[:MAX_EXAMPLES]
+    _session(runtime)["pending_proposal"] = {"topic": topic, "action": "redefine", "definition": definition}
+    if not preview:
+        return (f'This definition would currently surface NOTHING relevant for "{topic}". '
+                "Proposal recorded, but do not present this to the subscriber as a good option -- "
+                "try a different direction instead.")
+    lines = [f'This definition would currently surface, for "{topic}":']
+    lines.extend(_format_article_lines(preview))
+    return "\n".join(lines)
+
+
+@tool
+def save_definition(topic: str, definition: str, runtime: ToolRuntime) -> str:
+    """Save a new retrieval definition for one of the subscriber's
+    existing interests. Only call this AFTER they have confirmed the
+    specific definition you previewed via propose_definition -- normally
+    bot.py's own confirmation gate completes this for you, so you should
+    rarely need to call this directly; same caveat as save_interest."""
+    return execute_redefine(
+        runtime.context["chat_id"], topic, definition, _session(runtime))
+
+
+@tool
 def end_exploration(reason: str, runtime: ToolRuntime) -> str:
     """Call when this conversation is finished -- the subscriber is
     satisfied, has said they are done, or is going in circles without
@@ -330,7 +450,11 @@ def end_exploration(reason: str, runtime: ToolRuntime) -> str:
     return "Exploration marked finished. Give the subscriber a short closing reply."
 
 
-TOOLS = [find_example_articles, list_current_interests, propose_interest, save_interest, drop_interest, end_exploration]
+TOOLS = [
+    find_example_articles, list_current_interests, show_definition,
+    propose_interest, save_interest, drop_interest,
+    propose_definition, save_definition, end_exploration,
+]
 
 
 class _ConfirmationCheck(BaseModel):
@@ -408,14 +532,18 @@ def _compose_prompt(request) -> str:
             # runs -- see propose_interest's docstring). Surfacing it here
             # is defense in depth: if their reply really was a clear yes
             # that the classifier missed, the model still has a chance to
-            # notice and call save_interest/drop_interest itself.
+            # notice and call the matching save tool itself.
+            action = pending["action"]
+            tool_name = {"add": "save_interest", "remove": "drop_interest", "redefine": "save_definition"}[action]
+            what = (f"redefine \"{pending['topic']}\"" if action == "redefine"
+                    else f"{action} \"{pending['topic']}\"")
+            call = (f"{tool_name}(\"{pending['topic']}\", \"{pending['definition']}\")"
+                    if action == "redefine" else f"{tool_name} yourself")
             parts.append(
-                f"You previously proposed to {pending['action']} "
-                f"\"{pending['topic']}\" and are waiting on their answer. "
-                "If their latest message actually confirms it, call "
-                f"{'save_interest' if pending['action'] == 'add' else 'drop_interest'} "
-                "yourself now. If they declined or want something else, "
-                "drop this proposal and continue from what they said."
+                f"You previously proposed to {what} and are waiting on "
+                f"their answer. If their latest message actually confirms "
+                f"it, call {call} now. If they declined or want something "
+                "else, drop this proposal and continue from what they said."
             )
     return "\n\n".join(parts)
 

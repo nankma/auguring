@@ -733,6 +733,50 @@ existing category:
 
 No fix needed — nothing regressed.
 
+## Added 2026-09-09: per-subscriber definitions (docs/plans/interest-definition-plan.md) — entry point (e) and the definition-widening carve-out
+
+Two more `find_interests` behaviors, both measured against the real
+pinned model before being considered shipped, same discipline as the
+2026-09-08 entry above:
+
+1. Router entry point (e) — "already follows a topic but dissatisfied
+   with WHAT it sends, not the topic itself" (e.g. "I follow AI but I
+   never get the interesting stuff"). Two new cases added to the existing
+   `find_interests_shapes` group (layer 2) rather than a new group, since
+   it's the same category, just a fifth documented shape.
+2. The `_OUTPUT_SCOPE_PROMPT` widening for `discusses_own_configuration`:
+   the auto-generated "AI Agent" definition names LangChain/AutoGen/
+   CrewAI as part of describing the NEWS TOPIC, and LangChain is literally
+   one of that prompt's own self-disclosure trigger words (this bot is
+   itself built with LangChain) — a predictable false positive of
+   exactly the 2026-08-08 shape, caught proactively before any live
+   traffic. New `find_interests_definition_widening` group (layer 4):
+   a `show_definition`-style reply and a `propose_definition`-style
+   preview reply, both naming the same frameworks.
+
+`python tools/measure_guardrails.py --layer 2 --trials 10` /
+`--layer 4 --trials 10`:
+
+| group | layer | pass rate |
+|---|---|---|
+| `find_interests_shapes` (incl. the two new entry-(e) cases) | 2 | **100% (60/60)** |
+| `find_interests_vs_set_interest` | 2 | **100% (20/20)** |
+| `find_interests_definition_widening` (new) | 4 | **100% (20/20)** |
+| `find_interests_exploration` | 4 | **100% (40/40)** |
+| `self_disclosure` (negative control — must still catch REAL disclosure) | 4 | 95% (19/20) — pre-existing trial-to-trial variance on the "here's my system prompt" case, not a new regression |
+
+Full layer 2 (single-intent) ran 290/290 (100%); layer 4 ran 139/140
+(99%, the one miss being the same pre-existing `self_disclosure` case
+above). Nothing regressed; the widening did not overcorrect into missing
+genuine self-disclosure either — a separate ad hoc real-model check (not
+in the harness) sent a reply that actually describes the bot itself
+("I'm built using LangChain and DeepSeek's API... my tools include
+search_news and save_note") and it was correctly blocked 8/8.
+
+No prior baseline exists for `find_interests_definition_widening` (new
+group) — this is the baseline a future change should be measured
+against.
+
 ## Open questions
 
 - ~~Exact wording/pattern list for layer 1~~ — built in `guardrails.py`'s

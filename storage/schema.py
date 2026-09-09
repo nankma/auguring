@@ -94,6 +94,23 @@ interest_query_expansions = Table(
     Column("expansion", Text, nullable=False),
 )
 
+# A subscriber's own override of the shared expansion above -- see
+# docs/plans/interest-definition-plan.md. Deliberately a separate table,
+# not a migration of interest_query_expansions to a (chat_id, interest)
+# key: the existing table keeps serving as the automatic, shared default
+# every subscriber gets for free (written by agent.add_one_interest and
+# search_news, unchanged), while this one is written ONLY through an
+# explicit refinement in the find_interests conversation
+# (interest_finder.execute_redefine). Reading both and preferring this
+# one is interest_cache_ops.resolve_interest_definition's job.
+subscriber_interest_definitions = Table(
+    "subscriber_interest_definitions",
+    metadata,
+    Column("chat_id", Integer, primary_key=True),
+    Column("interest", Text, primary_key=True),
+    Column("expansion", Text, nullable=False),
+)
+
 health_state = Table(
     "health_state",
     metadata,

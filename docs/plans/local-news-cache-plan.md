@@ -1,8 +1,9 @@
 # Local News Cache Plan
 
 This doc captures the design, same pattern as the other `docs/*-plan.md`
-files. **All open questions are resolved and every item below is built —
-see the Status table.**
+files. **Every item in the Status table below is built.** One later
+addition is not: see "Source sections are policy hardcoded as vocabulary"
+at the end, added 2026-09-09 and still proposed.
 
 **The ask:** stop calling news sources live on every query. Instead, pull
 from all enabled sources on a schedule, cache what's fetched locally with
@@ -605,3 +606,118 @@ stop the cycle) are all unchanged from the live-fetch version — only
   project's persistence.
 - No retroactive backfill of historical articles — the cache starts
   empty and fills from the first ingestion cycle forward.
+
+---
+
+## Source sections are policy hardcoded as vocabulary (added 2026-09-09)
+
+Status: **proposed, nothing built.** Evidence:
+`docs/analysis/retrieval-quality-measurements.md` findings 1–3.
+
+### What's wrong
+
+`news_sources.SOURCE_SECTIONS` decides which slice of each source we pull:
+
+```python
+"newsapi":    ["technology", "business", "science", "health"],
+"gnews":      ["technology", "business", "science", "world"],
+"arxiv":      ["cs.AI", "cs.LG", "cs.RO", "cs.CR", "quant-ph", "physics.optics"],  # 6
+"hackernews": ["front_page"],                                                       # 1
+```
+
+Its own comment justifies living in code because *"the values are dictated
+by each API."* That is **half true, and the half that isn't is the
+problem.** The vendor dictates the *accepted set*; this dict stores a
+*chosen subset* of it. arXiv accepts ~150 subject classes and we list 6.
+Algolia accepts `front_page` / `story` / `show_hn` / `ask_hn` / `poll` and
+we list 1.
+
+So the dict conflates two different things:
+
+| | What it is | Where it belongs |
+|---|---|---|
+| **Capability** | which values the API accepts; an invalid one is a broken request | code, next to the adapter — a fact about the vendor |
+| **Policy** | which of those we choose to pull | settings — an editorial decision |
+
+The file's own comment already concedes the split — *"the reasoning for
+pulling by section at all is ingestion policy and lives with it, in
+`news_ingest._sections_for_source`"* — the reasoning moved out, the values
+didn't.
+
+**The measured consequence.** Changing our editorial mix costs a code
+change, a PR and a deploy, while adding an entire new publication costs
+one settings line. That inversion produced a corpus weighted **6:1 toward
+preprints over community discovery** (arXiv 272 articles vs. Hacker News
+72), and a fifth of the corpus spent on general-interest wire content we
+explicitly requested (`science`, `world`, `health`).
+
+### Proposed
+
+**1. Split capability from policy.** Each adapter declares its own valid
+sections (`VALID_SECTIONS`), so the vendor fact sits next to the vendor
+code — which is precisely what the current central dict drifted away from.
+The chosen subset moves into `news_source.*` in settings, with the full
+accepted vocabulary listed **commented out** alongside it, so it is
+discoverable without reading code. That comment-as-documentation shape is
+already this repo's convention (`postgres:`, `sqlite_vec:`, `api:` blocks
+all do it).
+
+**2. Invalid section → log and alert, don't crash.** Skip the bad value,
+emit an ERROR event carrying the source key and the rejected value.
+`_events.log(..., level=Level.ERROR)` is already what Logfire alerts read,
+so this needs no new plumbing. Rationale for not failing startup: a typo
+should not take the bot down — but it must never be silent, which is the
+failure shape this repo has been bitten by repeatedly (unset
+`NEWS_CACHE_DIR` silently resetting the cache; `PHOENIX_ENABLED` dead for
+weeks).
+
+**3. Pull order becomes a setting too.** The same conflation exists one
+line deeper, inside the HN adapter:
+
+```python
+endpoint = "search" if section == "front_page" else "search_by_date"
+```
+
+"Rank by popularity or by recency" is policy, hardcoded. Make it a
+per-source setting (`by_date` | `by_score`), declared as supported or not
+by each adapter — it is meaningless for arXiv, GNews and every RSS feed,
+so those must not accept it.
+
+**4. Retain Hacker News `points`.** `news_adapters/hackernews.py` maps
+title/link/source/summary/published and **drops `points` and
+`num_comments` on the floor.** HN is the only source we have that carries
+a real human popularity vote (finding 3), and it is the natural signal for
+"is this worth a slot" — a question similarity ranking cannot answer.
+
+Two cautions, both measured:
+
+- **Points are captured at their coldest.** A Show HN two hours old has 3
+  points; the same story has 300 the next day. Lightpanda's 319 was
+  *after the fact*. Pulling by date stores the number at its least
+  informative moment and nothing refreshes it. If points are to be used
+  for ranking, recent items need a refresh pass — otherwise the signal is
+  worse than none.
+- **HN items have `summary: None`**, so they embed from the title alone.
+  That makes them systematically weaker in the Stage-2 relevance filter
+  than any RSS article with a summary — worth knowing before concluding
+  that HN content "doesn't rank well".
+
+**5. Adding `show_hn` depends on 3 and 4, and is not a one-liner.**
+`show_hn` by date has 557k historical hits and most Show HNs get single-
+digit points. Adding it without a score floor or score-ordering would
+flood the corpus with noise — and classification is **batched**, with a
+measured collapse in accuracy as batch size grows (`news_classify.py`'s
+own comment: *batch 113 → 0%*). Noise here would degrade classification
+for everything sharing the batch, not just cost tokens.
+
+### Deliberately not decided here
+
+Whether to **stop** pulling `science`/`world`/`health` from the
+aggregators. It is tempting — those sections produced *"your daily coffee
+habit could be taking a toll on your bones"* — but one live subscriber
+follows 光通訊/AAOI/AOI, and `science` may be carrying the optics and
+quantum coverage they depend on. Cutting at the request is strictly
+cheaper than filtering after ingestion (no API quota, no classification
+cost), but it must be **measured per section** before anything is removed:
+what fraction of each section's articles ever matched an interest or
+reached a digest.

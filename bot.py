@@ -492,10 +492,11 @@ async def _execute_pending_proposal(
     chat_id: int, user_text: str, pending: dict, session: dict, guard_model,
     history: list, history_timestamps: list[datetime],
 ) -> dict:
-    """Deterministically completes a propose_interest that the subscriber
-    just confirmed -- see interest_finder.propose_interest's docstring for
-    why this exists (a real 2026-09-08 incident: a model claimed it saved
-    an interest without ever calling the tool). No agent loop runs here;
+    """Deterministically completes a propose_interest or
+    propose_definition that the subscriber just confirmed -- see
+    interest_finder.propose_interest's docstring for why this exists (a
+    real 2026-09-08 incident: a model claimed it saved an interest
+    without ever calling the tool). No agent loop runs here;
     the write happens directly, in code, the moment classify_confirmation
     says "affirm" -- it cannot depend on the model remembering to act.
 
@@ -503,16 +504,21 @@ async def _execute_pending_proposal(
     layer 4) since this is functionally the same kind of deterministic
     settings write, just triggered from inside an exploration instead of
     the router -- except layer 4 always runs here, even without
-    translation, unlike _route_b_reply's plain fixed-template case:
-    execute_save's reply embeds a model-normalized topic name, not a
+    translation, unlike _route_b_reply's plain fixed-template case: every
+    branch below (execute_save/execute_drop/execute_redefine) embeds a
+    model-normalized topic name or subscriber-chosen definition, not a
     fixed string, so it's real model-adjacent output every time, not
     just when translated."""
     topic, action = pending["topic"], pending["action"]
     try:
-        reply = (
-            interest_finder.execute_save(chat_id, topic, guard_model, session) if action == "add"
-            else interest_finder.execute_drop(chat_id, topic, session)
-        )
+        if action == "add":
+            reply = interest_finder.execute_save(chat_id, topic, guard_model, session)
+        elif action == "remove":
+            reply = interest_finder.execute_drop(chat_id, topic, session)
+        elif action == "redefine":
+            reply = interest_finder.execute_redefine(chat_id, topic, pending["definition"], session)
+        else:
+            raise ValueError(f"unknown pending_proposal action: {action!r}")
     except Exception as exc:
         # Same invariant as every other exit from _process_find_interests:
         # an error clears the session rather than leaving it stuck in a

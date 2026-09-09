@@ -527,10 +527,14 @@ def expand_interest_for_retrieval(model, interest: str) -> str | None:
     interest_query_expansions table, the same shape and same reasoning
     as resolve_interest_categories's cache: the interest text is stable
     vocabulary, so this should be a cache hit for any interest that's
-    been added by any subscriber before). Never called on the hot push
-    path -- see news_push.py's _resolve_query_text, which reads the
-    cache and falls back to the bare topic string when nothing is
-    cached, e.g. an interest added before this feature existed.
+    been added by any subscriber before). Not called on the per-article
+    read path -- see news_push.py's _resolve_query_text, which only ever
+    reads the cache -- but IS called once per push cycle, per interest
+    still missing a cached definition, by news_push.
+    backfill_missing_interest_definitions: an interest added before this
+    feature existed (or whose one-shot generation at add time failed) has
+    no row and nothing else would ever retry it. That backfill call is
+    the one place besides add_one_interest that writes here.
 
     English regardless of the interest's own language or the
     subscriber's reply-language preference -- same reasoning as

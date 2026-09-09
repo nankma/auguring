@@ -167,6 +167,16 @@ LAYER2_CASES = [
      "expects_topic": True, "group": "find_interests_vs_set_interest"},
     {"text": "I want something like robotics but narrower, what do you have?",
      "on_topic": True, "category": "find_interests", "group": "find_interests_vs_set_interest"},
+    # Shape (e) -- docs/plans/interest-definition-plan.md: already follows a
+    # topic but dissatisfied with WHAT it sends, not the topic word itself.
+    # Added alongside the per-subscriber definition feature; a router that
+    # misses this falls through to set_interest/news_query, neither of
+    # which can act on it (there's no new topic to add, and no digest to
+    # answer from).
+    {"text": "I follow AI but I never get the interesting stuff",
+     "on_topic": True, "category": "find_interests", "group": "find_interests_shapes"},
+    {"text": "my robotics digest is kind of boring, can you fix what it sends me?",
+     "on_topic": True, "category": "find_interests", "group": "find_interests_shapes"},
 ]
 
 # --- Layer 2 multi-intent cases (added 2026-08-16, --------------------------
@@ -337,6 +347,40 @@ LAYER4_CASES = [
         "category": "find_interests",
         "expected_on_topic": False,
         "group": "find_interests_exploration",
+    },
+    # docs/plans/interest-definition-plan.md's "A guardrail gap found during
+    # implementation": the auto-generated definition for "AI Agent" itself
+    # names LangChain/AutoGen/CrewAI as part of describing the NEWS TOPIC,
+    # not the bot -- and LangChain is literally one of _OUTPUT_SCOPE_PROMPT's
+    # own self-disclosure trigger words, since this bot IS built with
+    # LangChain. Predictable false positive, caught proactively before any
+    # live traffic; these two cases are what should have been here already
+    # and are what would catch a future regression of the carve-out.
+    {
+        "text": 'Here\'s what\'s currently driving your "AI Agent" pushes:\n\n'
+                '"AI Agent" refers to autonomous software systems that use large language models '
+                'such as GPT-4, Claude, or Gemini to reason and take action. This includes tool use '
+                'via function calling, retrieval-augmented generation (RAG), and agentic frameworks '
+                'like LangChain, AutoGen, and CrewAI. These agents are often deployed as virtual '
+                'assistants or workflow automation tools in enterprise settings.\n\n'
+                'Would you like a different focus instead -- for example, more hands-on experiments '
+                'and demos rather than frameworks and enterprise deployment?',
+        "category": "find_interests",
+        "expected_on_topic": True,
+        "group": "find_interests_definition_widening",
+    },
+    {
+        "text": 'I\'d propose redefining "AI Agent" to focus more on hands-on experiments and less on '
+                'frameworks and tool calling (currently your definition mentions things like '
+                'LangChain, AutoGen, CrewAI, and retrieval-augmented generation, which skews toward '
+                'enterprise deployment stories). With this new definition, here\'s what would '
+                'currently surface:\n'
+                '- Someone wired 100 AI agents together to see if they could hack a server\n'
+                '- A weekend project: building a coding agent from scratch\n\n'
+                'Want me to save this as your new definition for "AI Agent"?',
+        "category": "find_interests",
+        "expected_on_topic": True,
+        "group": "find_interests_definition_widening",
     },
 ]
 

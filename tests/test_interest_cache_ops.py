@@ -49,6 +49,63 @@ def test_set_interest_query_expansion_upserts(isolated_subscribers_db):
     assert interest_cache_ops.get_interest_query_expansion("AI coding") == "second version"
 
 
+def test_get_subscriber_interest_definition_none_when_never_set(isolated_subscribers_db):
+    assert interest_cache_ops.get_subscriber_interest_definition(7, "AI") is None
+
+
+def test_set_subscriber_interest_definition_round_trips(isolated_subscribers_db):
+    interest_cache_ops.set_subscriber_interest_definition(7, "AI", "this subscriber's own definition")
+    assert interest_cache_ops.get_subscriber_interest_definition(7, "AI") == "this subscriber's own definition"
+
+
+def test_set_subscriber_interest_definition_upserts(isolated_subscribers_db):
+    interest_cache_ops.set_subscriber_interest_definition(7, "AI", "first version")
+    interest_cache_ops.set_subscriber_interest_definition(7, "AI", "second version")
+    assert interest_cache_ops.get_subscriber_interest_definition(7, "AI") == "second version"
+
+
+def test_subscriber_interest_definition_is_scoped_per_chat_id(isolated_subscribers_db):
+    """The whole point of the split from the shared table: one
+    subscriber's refinement must not leak into another's."""
+    interest_cache_ops.set_subscriber_interest_definition(7, "AI", "chat 7's definition")
+    interest_cache_ops.set_subscriber_interest_definition(8, "AI", "chat 8's definition")
+    assert interest_cache_ops.get_subscriber_interest_definition(7, "AI") == "chat 7's definition"
+    assert interest_cache_ops.get_subscriber_interest_definition(8, "AI") == "chat 8's definition"
+
+
+def test_subscriber_interest_definition_is_scoped_per_interest(isolated_subscribers_db):
+    interest_cache_ops.set_subscriber_interest_definition(7, "AI", "AI definition")
+    interest_cache_ops.set_subscriber_interest_definition(7, "robotics", "robotics definition")
+    assert interest_cache_ops.get_subscriber_interest_definition(7, "AI") == "AI definition"
+    assert interest_cache_ops.get_subscriber_interest_definition(7, "robotics") == "robotics definition"
+
+
+def test_resolve_interest_definition_none_when_neither_tier_has_it(isolated_subscribers_db):
+    assert interest_cache_ops.resolve_interest_definition(7, "AI") is None
+
+
+def test_resolve_interest_definition_falls_back_to_the_shared_default(isolated_subscribers_db):
+    interest_cache_ops.set_interest_query_expansion("AI", "the shared default")
+    assert interest_cache_ops.resolve_interest_definition(7, "AI") == "the shared default"
+
+
+def test_resolve_interest_definition_prefers_the_subscribers_own_override(isolated_subscribers_db):
+    """The core guarantee of docs/plans/interest-definition-plan.md: a
+    personal refinement must win over the shared default, not be
+    shadowed by it."""
+    interest_cache_ops.set_interest_query_expansion("AI", "the shared default")
+    interest_cache_ops.set_subscriber_interest_definition(7, "AI", "chat 7's own refinement")
+    assert interest_cache_ops.resolve_interest_definition(7, "AI") == "chat 7's own refinement"
+
+
+def test_resolve_interest_definition_does_not_affect_other_subscribers(isolated_subscribers_db):
+    """One subscriber refining a definition must not change what a
+    DIFFERENT subscriber following the same interest word receives."""
+    interest_cache_ops.set_interest_query_expansion("AI", "the shared default")
+    interest_cache_ops.set_subscriber_interest_definition(7, "AI", "chat 7's own refinement")
+    assert interest_cache_ops.resolve_interest_definition(8, "AI") == "the shared default"
+
+
 def test_get_category_keyness_empty_when_never_computed(isolated_subscribers_db):
     assert interest_cache_ops.get_category_keyness("AI") == {}
 
