@@ -45,6 +45,7 @@ instead of waiting to be asked.
 | | |
 |---|---|
 | **Trend reports on demand** | Ask about a company, product, or topic; get a synthesized report citing real sources |
+| **Guided interest discovery** | Don't know what to follow yet? A conversation shows you real recent headlines and narrows down from there, instead of asking you to already know a topic name |
 | **Personalized interests** | Multi-user — each subscriber sets their own topics, which steer every query |
 | **Reply language** | Set once, applies to everything after, including script variants (Traditional vs. Simplified Chinese) |
 | **Scheduled push digests** | Per-user interval, deduplicated so the same article is never sent twice |
@@ -63,7 +64,10 @@ direction, and voice has no slash commands.
 | `/interests` | Show, set, or clear your topics |
 | `/language` | Show, set, or clear your preferred reply language |
 
-Anything else is treated as a request and routed by the agent.
+Anything else is treated as a request and routed by the agent — including
+open-ended ones like *"help me figure out what to follow"*, which starts
+the guided-discovery conversation above rather than requiring you to name
+a topic up front.
 
 ## How it works
 
@@ -201,6 +205,26 @@ technical write-up.
 | [multi-channel-plan](docs/plans/multi-channel-plan.md) | LINE support — on hold; its free tier caps push at 200/month account-wide |
 | [data-layer-plan](docs/plans/data-layer-plan.md) | Moving off SQLite — deferred until a second host actually needs the data |
 | [model-portability-plan](docs/plans/model-portability-plan.md) | Dynamic model switching — no gateway service needed; the injection seam already exists |
+
+## Changelog
+
+User-visible changes, newest first. Everything else — refactors,
+telemetry, deploy tooling — is tracked in commit history and `docs/plans/`
+instead of here.
+
+- **2026-09-08** — **Find my interests**: a new guided conversation for
+  subscribers who don't already know what to follow. Shows real recent
+  headlines and narrows down from there — say *"help me figure out what
+  to follow"* to start it. ([#90](https://github.com/nankma/auguring/pull/90),
+  fix: [#91](https://github.com/nankma/auguring/pull/91))
+- **2026-09-05** — Search got much faster: on-demand queries now read
+  from a locally indexed vector cache instead of scanning every article,
+  cutting typical response time from tens of seconds to under one.
+  ([#85](https://github.com/nankma/auguring/pull/85),
+  [#86](https://github.com/nankma/auguring/pull/86))
+- **2026-08-25** — Fixed a bug where adding several interests in one
+  message ("add AI agent, AI coding, and robotics") could silently drop
+  or merge some of them.
 
 ## Status
 
