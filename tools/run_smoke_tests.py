@@ -106,23 +106,44 @@ def run_cases(chat_id: int, timeout: int) -> list[dict]:
         )
     )
 
-    # Case 2 -- add a new interest
-    r = send(chat_id, "Add quantum sensing to my interests", timeout)
+    # Case 2 -- add a new interest. 2026-09-10: naming a topic outright no
+    # longer adds it in one shot -- set_interest now opens the SAME
+    # interest_finder agent as find_interests (docs/plans/interest-finder-plan.md's
+    # front-door redesign), which must show a grounded definition and
+    # real examples before proposing, then wait for confirmation. So this
+    # is now a real (if usually short) multi-turn conversation, not a
+    # single deterministic dispatch -- category is "find_interests" from
+    # the first message on, never "set_interest". Own chat_id, not the
+    # shared one: an open exploration now lingers across messages (see
+    # docs/plans/interest-finder-plan.md's "no need to check end"
+    # direction), and cases 2/3/8/9 all opening on the shared id would
+    # stack turns toward MAX_TURNS and mix unrelated topics into one
+    # conversation.
+    add_interest_chat_id = chat_id + 10
+    r = send(add_interest_chat_id, "Add quantum sensing to my interests", timeout)
+    opened_ok = r["blocked_at"] is None and r["category"] == "find_interests"
+    r = send(add_interest_chat_id, "yes, that's right, go ahead", timeout)
+    confirmed_ok = r["blocked_at"] is None and r["category"] == "find_interests"
     results.append(
         _check(
-            "2  add interest (new topic)",
-            r["blocked_at"] is None and r["category"] == "set_interest",
-            f"blocked_at={r['blocked_at']} category={r['category']}",
+            "2  add interest (new topic, now a propose-then-confirm conversation)",
+            opened_ok and confirmed_ok,
+            f"opened_ok={opened_ok} confirmed_ok={confirmed_ok} final_reply={r['reply'][:120]!r}",
         )
     )
 
-    # Case 3 -- non-English interest phrasing
-    r = send(chat_id, "我對機器人科技很感興趣", timeout)
+    # Case 3 -- non-English interest phrasing, same shape as case 2. Own
+    # chat_id, same isolation reasoning as case 2 above.
+    non_english_chat_id = chat_id + 11
+    r = send(non_english_chat_id, "我對機器人科技很感興趣", timeout)
+    opened_ok = r["blocked_at"] is None and r["category"] == "find_interests"
+    r = send(non_english_chat_id, "對，就是這個", timeout)
+    confirmed_ok = r["blocked_at"] is None and r["category"] == "find_interests"
     results.append(
         _check(
             "3  non-English interest phrasing",
-            r["blocked_at"] is None and r["category"] == "set_interest",
-            f"blocked_at={r['blocked_at']} category={r['category']}",
+            opened_ok and confirmed_ok,
+            f"opened_ok={opened_ok} confirmed_ok={confirmed_ok} final_reply={r['reply'][:120]!r}",
         )
     )
 
@@ -161,21 +182,37 @@ def run_cases(chat_id: int, timeout: int) -> list[dict]:
         )
     )
 
-    # Case 8 -- topic already covered
-    send(chat_id, "Add robotics to my interests", timeout)
-    r = send(chat_id, "Interested in robotics", timeout)
+    # Case 8 -- topic already covered. Own chat_id, same isolation
+    # reasoning as case 2. Add robotics, propose+confirm, then ask again
+    # and expect a same-turn "already following" reply with no new
+    # confirmation needed (set_interest still wins the whole turn, but
+    # the agent can answer this one without calling propose_interest
+    # again at all).
+    already_covered_chat_id = chat_id + 12
+    send(already_covered_chat_id, "Add robotics to my interests", timeout)
+    send(already_covered_chat_id, "yes please", timeout)
+    r = send(already_covered_chat_id, "Interested in robotics", timeout)
     results.append(
         _check(
             "8  already-covered interest",
-            r["blocked_at"] is None and r["category"] == "set_interest",
-            f"blocked_at={r['blocked_at']} category={r['category']}",
+            r["blocked_at"] is None and r["category"] == "find_interests",
+            f"blocked_at={r['blocked_at']} category={r['category']} reply={r['reply'][:120]!r}",
         )
     )
 
-    # Case 9 -- set language, then a follow-up query in that language
-    r = send(chat_id, "Always reply to me in Spanish from now on", timeout)
-    lang_ok = r["blocked_at"] is None and r["category"] == "set_language"
-    r = send(chat_id, "What is new with OpenAI?", timeout)
+    # Case 9 -- set language, then a follow-up query in that language.
+    # set_language is a direct-effect tool inside the interest_finder
+    # agent (no confirmation needed, unlike add/remove -- see
+    # docs/plans/interest-finder-plan.md), so this stays a one-shot
+    # message even after the front-door redesign; only the category
+    # changed, from "set_language" to "find_interests". Own chat_id, same
+    # isolation reasoning as case 2 -- also keeps this Spanish preference
+    # from leaking into any other case's assertions the way it used to
+    # warn about for case 14 below.
+    language_chat_id = chat_id + 13
+    r = send(language_chat_id, "Always reply to me in Spanish from now on", timeout)
+    lang_ok = r["blocked_at"] is None and r["category"] == "find_interests"
+    r = send(language_chat_id, "What is new with OpenAI?", timeout)
     followup_ok = r["blocked_at"] is None and ("ñ" in r["reply"] or "ó" in r["reply"] or "de" in r["reply"].lower())
     results.append(
         _check(
@@ -204,87 +241,77 @@ def run_cases(chat_id: int, timeout: int) -> list[dict]:
         )
     )
 
-    # Case 14 -- multi-category: one message, two distinct asks (a settings
-    # change and a news question) -- see
+    # Case 14 -- multi-category: one message, two distinct asks -- see
     # docs/plans/context-management-plan.md's multi-category routing.
-    # `category` in the response is only the first of the (possibly
-    # several) categories the router found (see bot.process_message's
-    # docstring), so this checks the reply text for evidence both segments
-    # actually ran rather than relying on `category` alone.
+    # start_push + news_query, NOT set_interest + news_query as this case
+    # used before 2026-09-10: any category in agent.INTEREST_AGENT_
+    # CATEGORIES now wins a multi-category turn outright (the whole
+    # message goes to the interest_finder agent instead of being joined --
+    # see docs/plans/interest-finder-plan.md), so "add X and tell me
+    # what's new" no longer exercises the join this case is meant to
+    # check. start_push is still genuinely Route B, so it still joins with
+    # a Route A news_query segment the way this case's own name promises.
     #
     # Uses a fresh chat_id, not the shared one every other case in this
     # function uses -- case 9 above sets a persistent "always reply in
-    # Spanish" preference on the shared chat_id, and that preference
-    # correctly carries forward into every later turn on that same chat_id
-    # (that's case 9's whole point). Checking for the literal English
-    # phrase "quantum computing" against a chat_id that's had Spanish set
-    # is a false failure (the correct reply would say "computación
-    # cuántica"), not a real bug -- isolate this case instead of trying to
-    # assert something language-agnostic.
+    # Spanish" preference on ITS OWN chat_id now, but this stays isolated
+    # regardless, same discipline as every other multi-turn-sensitive case
+    # added 2026-09-10.
     multi_category_chat_id = chat_id + 1
-    r = send(multi_category_chat_id, "Add quantum computing to my interests and tell me what's new with it", timeout)
+    r = send(multi_category_chat_id, "Start pushing me news and tell me what's new with quantum computing", timeout)
     reply = r["reply"]
     has_report_marker = "\U0001f4f0" in reply
     results.append(
         _check(
             "14 multi-category (settings + news_query in one message)",
-            r["blocked_at"] is None and "quantum computing" in reply.lower() and has_report_marker,
+            r["blocked_at"] is None and "push" in reply.lower() and has_report_marker,
             f"blocked_at={r['blocked_at']} category={r['category']} has_report_marker={has_report_marker}",
         )
     )
 
-    # Case 17 -- multi-topic set_interest: several distinct topics named in
-    # one message (the 2026-08-25 bug -- see this checklist's own table).
-    # A single `topic: str` router field made this undefined: sometimes
-    # joined into one garbled label, sometimes silently dropped all but one
-    # item, sometimes compressed down to an umbrella term ("AI") that
-    # fuzzy-duplicate-matched an already-stored interest and reported
-    # nothing added. Checks for three separate "Added ..." confirmations,
-    # not just that the category routed correctly -- the bug produced a
-    # valid set_interest category with the wrong number of things stored.
+    # Case 17 -- multi-topic add: several distinct topics named in one
+    # message (the 2026-08-25 bug -- see this checklist's own table).
+    # Fundamentally reshaped 2026-09-10: adding is now a propose-then-
+    # confirm CONVERSATION (docs/plans/interest-finder-plan.md), not a
+    # single deterministic dispatch that either got three topics right or
+    # didn't in one reply -- the agent may propose and confirm the three
+    # topics across several turns, in whatever order and grouping it
+    # chooses. So this no longer checks one reply for three "Added ..."
+    # confirmations; it drives the conversation for a bounded number of
+    # turns with generic affirmations, then asks a real "what am I
+    # following" question and checks all three names appear somewhere in
+    # the answer -- weaker determinism than before, but it reflects what
+    # the architecture actually guarantees now, and would still catch a
+    # regression that silently drops one of three named topics.
     #
-    # Dedicated chat_id, same reasoning as case 14 -- keeps this independent
-    # of whatever interests earlier cases left on the shared id. NOT
-    # actually fresh across separate runs, though: this id is a fixed
-    # constant (SMOKE_TEST_CHAT_ID + 2), so once a run's "Add ..." message
-    # below succeeds, all three topics stay stored on it forever, and every
-    # later deploy's run starts from "already covered" instead of "new" --
-    # a real false-failure caught live on the first deploy after PR #36
-    # shipped multi-topic set_interest (added_count=0, reply confirmed all
-    # three as already-present, not a routing/storage regression). Explicit
-    # teardown first, rather than trusting the id to still be empty, so
-    # this case is actually idempotent across repeated deploys.
+    # Dedicated chat_id, same reasoning as case 14. NOT fresh across
+    # separate runs, though: removing at the start (also now a confirm
+    # flow) is the idempotency mechanism, same intent as before 2026-09-10
+    # even though the mechanics changed.
     #
-    # Uses "cloud infrastructure" as the third topic, not the acronym
-    # "LLM" this case used before 2026-08-27. Found live on that day's
-    # deploy: "LLM" gets expanded by news_classify's normalization on the
-    # Add path (add_one_interest calls the model to turn ambiguous
-    # abbreviations into an unambiguous English phrase), but that
-    # expansion is itself an LLM call and NOT deterministic call to call
-    # -- two different smoke runs normalized it to "Large Language Model"
-    # and "LLM Large Language Models" respectively. subscriber_ops.remove_
-    # interest only does an exact (case-insensitive) match with no fuzzy
-    # word-overlap check (unlike add_interest) and dispatch_settings never
-    # runs a remove target through normalization the way an add target
-    # does -- so a teardown saying "LLM" can never reliably match whatever
-    # the PRIOR run's Add call happened to expand it to, and hardcoding
-    # one specific expansion (tried first) broke on the very next run for
-    # the same reason. "cloud infrastructure" isn't an abbreviation, so it
-    # round-trips through Add unchanged and Remove's exact match works
-    # every time -- sidesteps the non-determinism rather than fixing it.
-    # remove_interest's exact-match-only behavior is a real, separate
-    # limitation (a subscriber who adds "LLM" and later asks to remove
-    # "LLM" would hit the same non-removal today) worth its own fix.
+    # Uses "cloud infrastructure" as the third topic, not an abbreviation
+    # like "LLM" -- see this case's own git history (2026-08-27) for why
+    # an abbreviation round-trips unpredictably through normalization.
     multi_topic_chat_id = chat_id + 2
-    send(multi_topic_chat_id, "Remove AI agent, AI coding, and cloud infrastructure from my interests", timeout)
-    r = send(multi_topic_chat_id, "Add AI agent, AI coding, and cloud infrastructure to my interests", timeout)
-    reply = r["reply"]
-    added_count = reply.lower().count("added ")
+    topics = ["AI agent", "AI coding", "cloud infrastructure"]
+    send(multi_topic_chat_id, f"Remove {', '.join(topics)} from my interests", timeout)
+    send(multi_topic_chat_id, "yes, remove all of them", timeout)
+    send(multi_topic_chat_id, f"Add {', '.join(topics)} to my interests", timeout)
+    # Up to 4 rounds of confirmation: enough for the agent to propose and
+    # confirm three topics one at a time (the most turns this should ever
+    # take), not so many that a genuinely stuck conversation runs long.
+    for _ in range(4):
+        r = send(multi_topic_chat_id, "yes, add it", timeout)
+        if r["blocked_at"] is not None:
+            break
+    r = send(multi_topic_chat_id, "What am I following right now?", timeout)
+    reply_lower = r["reply"].lower()
+    present = [t for t in topics if t.lower() in reply_lower]
     results.append(
         _check(
-            "17 multi-topic set_interest (three topics, one message)",
-            r["blocked_at"] is None and r["category"] == "set_interest" and added_count == 3,
-            f"blocked_at={r['blocked_at']} category={r['category']} added_count={added_count} reply={reply!r}",
+            "17 multi-topic add (three topics, now a multi-turn conversation)",
+            r["blocked_at"] is None and len(present) == len(topics),
+            f"blocked_at={r['blocked_at']} category={r['category']} present={present} reply={r['reply'][:200]!r}",
         )
     )
 

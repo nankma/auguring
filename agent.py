@@ -523,20 +523,47 @@ def search_news(chat_id: int, query: str, history: list, model, guard_model, emb
 # set_language change takes effect on its own confirmation too).
 
 # Public -- bot.py's process_message checks membership in this to decide
-# Route A vs. Route B for a given category.
-ROUTE_B_CATEGORIES = {"set_interest", "remove_interest", "start_push", "stop_push", "set_language"}
+# Route A vs. Route B for a given category. Shrunk 2026-09-10: adding,
+# removing, and reading back an interest, plus setting the reply
+# language, all moved to the SAME conversational agent as find_interests
+# (see agent.INTEREST_AGENT_CATEGORIES below and
+# docs/plans/interest-finder-plan.md's "front door" redesign) -- pushing
+# is a scheduling setting, not an interest, and is the only thing left
+# that's genuinely a one-shot, model-free settings change.
+ROUTE_B_CATEGORIES = {"start_push", "stop_push"}
+
+# Categories that open (or continue) the interest_finder conversational
+# agent instead of being dispatched by Route B or Route A. Split out from
+# ROUTE_B_CATEGORIES above rather than merged into it: these categories
+# are model-free in their EXTRACTION (the router still pulls out
+# topics/language as a conversation-opening hint) but not in their
+# EXECUTION -- see bot.py's process_message for where this is consulted.
+INTEREST_AGENT_CATEGORIES = {"find_interests", "set_interest", "remove_interest", "set_language"}
 
 
-def add_one_interest(chat_id: int, topic: str, model, known: list[str]) -> str:
-    """Normalizes and stores ONE interest, returning its confirmation
-    sentence. `known` is the subscriber's interests resolved so far --
-    prior interests plus any earlier topic from the SAME "add X, Y, Z"
-    message -- and is mutated in place so the next call sees this one too.
+def add_one_interest(chat_id: int, topic: str, model, known: list[str], definition: str) -> str:
+    """Normalizes and stores ONE interest together with the retrieval
+    `definition` the subscriber has ALREADY seen and confirmed, returning
+    a confirmation sentence. `known` is the subscriber's interests
+    resolved so far -- prior interests plus any earlier topic from the
+    SAME "add X, Y, Z" message -- and is mutated in place so the next
+    call sees this one too.
 
-    Split out of dispatch_settings's set_interest branch so a multi-topic
-    request ("add AI agent, AI coding, LLM") can call this once per topic
-    instead of forcing all of them through one label -- see that branch's
-    docstring for the failure this replaced."""
+    `definition` is required, not generated here: this project measured
+    (docs/analysis/retrieval-quality-measurements.md finding 4) that the
+    definition, not the interest word, is what actually decides what a
+    subscriber receives, and generating one blindly and never showing it
+    to the subscriber is exactly the gap docs/plans/interest-finder-plan.md's
+    front-door redesign closed. The caller (interest_finder.execute_save)
+    is the only one left that can call this, and it always has a
+    definition on hand -- one the subscriber saw a real preview of and
+    explicitly confirmed, via propose_interest's baked-in preview.
+
+    Stored in the SUBSCRIBER's own tier (interest_cache_ops.
+    set_subscriber_interest_definition), never the shared/global one --
+    interests are not shared: two different subscribers adding the same
+    word get two independently confirmed definitions, not one default
+    generated for whichever of them typed it first."""
     narrower: list[str] = []
     if model is not None:
         # Translated at WRITE time, while the subscriber is here. The
@@ -565,20 +592,6 @@ def add_one_interest(chat_id: int, topic: str, model, known: list[str]) -> str:
             # phrasings for an already-specific interest.
             if detail.is_umbrella:
                 narrower = detail.narrower_examples[:3]
-        # Generated once per NEWLY-SEEN interest string and cached
-        # globally (interest_cache_ops), not per
-        # subscriber -- checked here regardless of whether THIS
-        # subscriber's own add below succeeds, since the cache exists to
-        # serve every future subscriber who adds the same topic, not just
-        # this call. news_push.py's relevance filter and offbeat gate
-        # read it at push time and fall back to the bare topic string
-        # when nothing is cached; see expand_interest_for_retrieval's own
-        # docstring for why the bare string is a measurably worse
-        # retrieval query.
-        if interest_cache_ops.get_interest_query_expansion(topic) is None:
-            expansion = news_classify.expand_interest_for_retrieval(model, topic)
-            if expansion is not None:
-                interest_cache_ops.set_interest_query_expansion(topic, expansion)
     before = list(known)
     try:
         after = subscriber_ops.add_interest(chat_id, topic)
@@ -596,7 +609,14 @@ def add_one_interest(chat_id: int, topic: str, model, known: list[str]) -> str:
     # able to see how the system understood them, and this is the first
     # place they would see it.
     if len(after) == len(before):
+        # Deliberately does NOT touch the definition on this path -- an
+        # "already have it" reply means nothing was actually added, and
+        # updating an EXISTING interest's definition is
+        # interest_finder.execute_redefine's job (entry point (e)), not
+        # this one's. Silently overwriting it here would let a stray
+        # re-add clobber a deliberate prior refinement.
         return f"You already have {topic} in your interests, so nothing new was added."
+    interest_cache_ops.set_subscriber_interest_definition(chat_id, topic, definition)
     reply = f"Added {topic} to your interests."
     if narrower:
         # A hint, deliberately not a question. Asking would need state
@@ -617,60 +637,22 @@ def add_one_interest(chat_id: int, topic: str, model, known: list[str]) -> str:
     return reply
 
 
-def dispatch_settings(category: str, chat_id: int, classification, model=None) -> str:
+def dispatch_settings(category: str, chat_id: int, classification) -> str:
     """Performs the state change for one Route B category and returns an
     English confirmation string. `classification` is the
     guardrails.MessageClassification the router produced -- its
-    topics/push_interval_hours/language fields carry whatever argument this
-    category needs, already extracted by the router. `topics` is a list
-    (set_interest/remove_interest may each name more than one item in a
-    single message, e.g. "add AI agent, AI coding, LLM") and is processed
-    one item at a time, returning one confirmation sentence per item.
+    push_interval_hours field carries the one argument either remaining
+    category needs.
 
-    `model` is used only to translate a new interest into English (see
-    news_classify.normalize_interest for why every consumer of interest
-    text is English-facing). Optional so the settings path stays testable
-    without one and so a missing model degrades to storing the original
-    text rather than refusing the change."""
-    if category == "set_interest":
-        # A list, not a single string, mirroring MessageClassification's
-        # own categories field -- same shape, same reason: "Add AI agent,
-        # AI coding, LLM" is three intents inside one category, and a
-        # single string cannot represent that. Measured live, 2026-08-25:
-        # forcing the whole phrase through one 2-4-word label sometimes
-        # compressed it down to "AI" (a fuzzy duplicate of an interest
-        # already stored), other times dropped everything but one item,
-        # other times produced "AI agents/LLM coding" -- undefined
-        # behavior on the model's part because the schema gave it no way
-        # to say "these are three separate things."
-        topics = classification.topics or []
-        if not topics:
-            return "Didn't catch what you wanted to add -- try naming a topic."
-        # Grows as topics are resolved, so the SECOND item in "add AAOI,
-        # semiconductors" can disambiguate against the first even though
-        # neither was in the database yet when the message arrived -- the
-        # same reason `before` was passed at all, extended to cover
-        # same-message context, not just prior interests.
-        known = subscriber_ops.get_interests(chat_id)
-        replies = []
-        for topic in topics:
-            replies.append(add_one_interest(chat_id, topic, model, known))
-        return "\n\n".join(replies)
-
-    if category == "remove_interest":
-        topics = classification.topics or []
-        if not topics:
-            return "Didn't catch what you wanted to remove -- try naming a topic."
-        replies = []
-        for topic in topics:
-            before = subscriber_ops.get_interests(chat_id)
-            after = subscriber_ops.remove_interest(chat_id, topic)
-            if len(after) == len(before):
-                replies.append(f"{topic} wasn't in your interests, so there was nothing to remove.")
-            else:
-                replies.append(f"Removed {topic} from your interests.")
-        return "\n\n".join(replies)
-
+    Shrunk 2026-09-10 to push scheduling only: adding/removing an
+    interest and setting the reply language moved to the interest_finder
+    conversational agent (see ROUTE_B_CATEGORIES/INTEREST_AGENT_CATEGORIES
+    above) -- interests always show a grounded definition and preview
+    before saving now, which a one-shot dispatch here can't do, and
+    reply-language switching needed to work mid-exploration, which a
+    separate Route B category can't either. No model parameter any more:
+    nothing left in this function makes an LLM call -- that was only ever
+    set_interest's own normalization step."""
     if category == "start_push":
         subscriber_ops.set_push_enabled(chat_id, True)
         if classification.push_interval_hours is not None:
@@ -691,15 +673,6 @@ def dispatch_settings(category: str, chat_id: int, classification, model=None) -
         # tried, possibly months stale.
         subscriber_ops.reset_push_consecutive_failures(chat_id)
         return "Turned off periodic news push."
-
-    if category == "set_language":
-        if classification.language is None:
-            current = subscriber_ops.get_language(chat_id)
-            if current:
-                return f"Your reply language is currently set to {current}."
-            return "No reply language is set -- I match whichever language you write in."
-        subscriber_ops.set_language(chat_id, classification.language)
-        return f"Done -- I'll reply to you in {classification.language} from now on."
 
     raise ValueError(f"dispatch_settings called with a non-Route-B category: {category!r}")
 

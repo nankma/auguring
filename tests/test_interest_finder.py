@@ -147,10 +147,12 @@ def test_save_interest_goes_through_the_normal_add_path(isolated_subscribers_db,
     monkeypatch.setattr(agent, "add_one_interest", add)
     session = {}
 
-    reply = interest_finder.save_interest.func("semiconductors", _runtime(chat_id=7, session=session))
+    reply = interest_finder.save_interest.func(
+        "semiconductors", "chip manufacturing and supply chain", _runtime(chat_id=7, session=session))
 
     assert reply == "Added semiconductors."
     assert add.call_args[0][:2] == (7, "semiconductors")
+    assert add.call_args[0][4] == "chip manufacturing and supply chain"
     assert session["saved"] == ["semiconductors"]
 
 
@@ -166,12 +168,42 @@ def test_drop_interest_removes_it_and_records_it(isolated_subscribers_db):
     assert "robotics" in reply
 
 
-def test_propose_interest_records_the_proposal_without_changing_anything(isolated_subscribers_db):
+def test_propose_interest_previews_real_cached_articles(cached_articles):
+    """propose_interest is the ONLY way to add now (interest_finder.py's
+    docstring finding 6), and it must ground every proposal the same way
+    propose_definition already does -- the preview is baked in, not a
+    separate step that could be skipped."""
+    result = interest_finder.propose_interest.func(
+        "chips", "GPUs and data center chip hardware", _runtime(chat_id=7, embedder=FakeEmbedder()))
+    assert "Nvidia unveils a new GPU for data centers" in result
+
+
+def test_propose_interest_records_the_proposal_without_changing_anything(
+        cached_articles, isolated_subscribers_db):
     session = {}
-    result = interest_finder.propose_interest.func("semiconductors", "add", _runtime(chat_id=7, session=session))
-    assert session["pending_proposal"] == {"topic": "semiconductors", "action": "add"}
+    interest_finder.propose_interest.func(
+        "chips", "GPUs and data center chip hardware",
+        _runtime(chat_id=7, session=session, embedder=FakeEmbedder()))
+    assert session["pending_proposal"] == {
+        "topic": "chips", "action": "add", "definition": "GPUs and data center chip hardware",
+    }
     assert subscriber_ops.get_interests(7) == []
-    assert "semiconductors" in result
+
+
+def test_propose_interest_warns_when_nothing_would_surface(isolated_news_cache):
+    """The AAOI-avoidance rule, now enforced at the ONLY add path: an
+    ungrounded proposal must say so plainly rather than reading like a
+    good option."""
+    result = interest_finder.propose_interest.func(
+        "chips", "something with zero cache coverage", _runtime(chat_id=7))
+    assert "NOTHING relevant" in result
+
+
+def test_propose_remove_records_the_proposal(isolated_subscribers_db):
+    session = {}
+    result = interest_finder.propose_remove.func("crypto", _runtime(chat_id=7, session=session))
+    assert session["pending_proposal"] == {"topic": "crypto", "action": "remove"}
+    assert "crypto" in result
 
 
 def test_classify_confirmation_affirm():
@@ -202,6 +234,26 @@ def test_classify_confirmation_with_no_guard_model_is_unclear():
     assert interest_finder.classify_confirmation(None, "yes") == "unclear"
 
 
+def test_classify_confirmation_passes_the_assistants_last_reply_for_context():
+    """Found live 2026-09-10: a model can propose_definition, decide from
+    its own preview that it's a no-op, and tell the subscriber in prose it
+    won't save it -- without anything clearing pending_proposal. A later,
+    unrelated "yes" would otherwise still bind to that disowned proposal.
+    The classifier needs the assistant's actual last message, not just the
+    raw reply, to tell a live confirmation question from a stale one."""
+    structured = MagicMock()
+    structured.invoke.return_value = interest_finder._ConfirmationCheck(reasoning="t", verdict="affirm")
+    model = MagicMock()
+    model.with_structured_output.return_value = structured
+
+    interest_finder.classify_confirmation(model, "yes", "I won't save that -- it wouldn't change anything.")
+
+    sent = structured.invoke.call_args[0][0]
+    user_message = sent[1]["content"]
+    assert "I won't save that" in user_message
+    assert "yes" in user_message
+
+
 def test_execute_save_and_save_interest_tool_go_through_the_same_path(isolated_subscribers_db, monkeypatch):
     """The whole point of the refactor: one function, one telemetry
     event, regardless of whether the agent's own tool call or bot.py's
@@ -210,8 +262,9 @@ def test_execute_save_and_save_interest_tool_go_through_the_same_path(isolated_s
     monkeypatch.setattr(agent, "add_one_interest", add)
     session_a, session_b = {}, {}
 
-    reply_a = interest_finder.execute_save(7, "chips", "guard", session_a)
-    reply_b = interest_finder.save_interest.func("chips", _runtime(chat_id=7, session=session_b))
+    reply_a = interest_finder.execute_save(7, "chips", "chip manufacturing", "guard", session_a)
+    reply_b = interest_finder.save_interest.func(
+        "chips", "chip manufacturing", _runtime(chat_id=7, session=session_b))
 
     assert reply_a == reply_b == "Added chips."
     assert session_a["saved"] == session_b["saved"] == ["chips"]
@@ -239,6 +292,15 @@ def test_show_definition_prefers_the_subscribers_own_override(isolated_subscribe
     result = interest_finder.show_definition.func("AI", _runtime(chat_id=7))
     assert "chat 7's own definition" in result
     assert "the shared definition" not in result
+
+
+def test_set_language_sets_it_directly_with_no_confirmation_gate(isolated_subscribers_db):
+    """Deliberately no propose/confirm step -- low-stakes and instantly
+    reversible, unlike an interest (docs/plans/interest-finder-plan.md's
+    front-door redesign)."""
+    result = interest_finder.set_language.func("Spanish", _runtime(chat_id=7))
+    assert subscriber_ops.get_language(7) == "Spanish"
+    assert "Spanish" in result
 
 
 def test_show_definition_says_so_when_none_exists(isolated_subscribers_db):
@@ -321,7 +383,7 @@ def test_saving_and_ending_are_both_logged(isolated_subscribers_db, monkeypatch)
                         lambda name: spans.append(FakeSpan()) or spans[-1])
     session = {"turns": 3}
 
-    interest_finder.save_interest.func("chips", _runtime(chat_id=7, session=session))
+    interest_finder.save_interest.func("chips", "chip manufacturing", _runtime(chat_id=7, session=session))
     interest_finder.end_exploration.func("confirmed", _runtime(chat_id=7, session=session))
 
     assert spans[0].attrs["topic"] == "chips"
@@ -358,7 +420,7 @@ def test_the_prompt_surfaces_a_pending_proposal(isolated_subscribers_db):
     classify_confirmation call returns "unclear" for what was actually a
     clear yes, the model still gets a chance to notice and act, because
     it can see what it's waiting on."""
-    session = {"pending_proposal": {"topic": "robotics", "action": "add"}}
+    session = {"pending_proposal": {"topic": "robotics", "action": "add", "definition": "hands-on robotics"}}
     request = SimpleNamespace(runtime=SimpleNamespace(context={"chat_id": 7, "session": session}))
     prompt = interest_finder._compose_prompt(request)
     assert "robotics" in prompt
@@ -396,7 +458,8 @@ def test_run_turn_reports_done_once_the_model_ends_the_exploration(
     monkeypatch.setattr(agent, "add_one_interest", MagicMock(return_value="Added semiconductors."))
     model = FakeToolCallingModel(responses=[
         AIMessage(content="", tool_calls=[
-            {"name": "save_interest", "args": {"topic": "semiconductors"}, "id": "1"}]),
+            {"name": "save_interest",
+             "args": {"topic": "semiconductors", "definition": "chip supply chain"}, "id": "1"}]),
         AIMessage(content="", tool_calls=[
             {"name": "end_exploration", "args": {"reason": "confirmed"}, "id": "2"}]),
         AIMessage(content="Done -- you'll start seeing those."),
@@ -481,7 +544,7 @@ def test_an_affirmed_proposal_is_saved_without_the_agent_loop_running(monkeypatc
     monkeypatch.setattr(bot.guardrails, "is_output_on_topic", MagicMock(return_value=True))
     monkeypatch.setattr(bot.interest_finder, "classify_confirmation", MagicMock(return_value="affirm"))
     monkeypatch.setattr(agent, "add_one_interest", MagicMock(return_value="Added semiconductors."))
-    bot.interest_sessions[7] = {"turns": 1, "pending_proposal": {"topic": "semiconductors", "action": "add"}}
+    bot.interest_sessions[7] = {"turns": 1, "pending_proposal": {"topic": "semiconductors", "action": "add", "definition": "chip supply chain"}}
 
     result = asyncio.run(bot.process_message(7, "yes", "m", "g"))
 
@@ -533,7 +596,7 @@ def test_a_declined_proposal_clears_and_falls_through_to_the_agent_turn(monkeypa
     monkeypatch.setattr(bot.interest_finder, "classify_confirmation", MagicMock(return_value="decline"))
     save = MagicMock()
     monkeypatch.setattr(agent, "add_one_interest", save)
-    bot.interest_sessions[7] = {"turns": 1, "pending_proposal": {"topic": "semiconductors", "action": "add"}}
+    bot.interest_sessions[7] = {"turns": 1, "pending_proposal": {"topic": "semiconductors", "action": "add", "definition": "chip supply chain"}}
 
     result = asyncio.run(bot.process_message(7, "no, something else", "m", "g"))
 
@@ -553,14 +616,32 @@ def test_an_unclear_reply_leaves_the_proposal_pending_and_falls_through(monkeypa
     monkeypatch.setattr(bot.interest_finder, "classify_confirmation", MagicMock(return_value="unclear"))
     save = MagicMock()
     monkeypatch.setattr(agent, "add_one_interest", save)
-    bot.interest_sessions[7] = {"turns": 1, "pending_proposal": {"topic": "semiconductors", "action": "add"}}
+    bot.interest_sessions[7] = {"turns": 1, "pending_proposal": {"topic": "semiconductors", "action": "add", "definition": "chip supply chain"}}
 
     result = asyncio.run(bot.process_message(7, "hmm what else is there", "m", "g"))
 
     save.assert_not_called()
     run_turn.assert_called_once()
-    assert bot.interest_sessions[7]["pending_proposal"] == {"topic": "semiconductors", "action": "add"}
+    assert bot.interest_sessions[7]["pending_proposal"] == {"topic": "semiconductors", "action": "add", "definition": "chip supply chain"}
     assert result["reply"] == "Can you say more?"
+
+
+def test_confirmation_classifier_receives_the_assistants_last_reply(monkeypatch):
+    """bot.py must anchor classify_confirmation to what the assistant
+    actually said last (history[-1]), not just the pending_proposal dict
+    -- see classify_confirmation's own docstring for the 2026-09-10
+    incident this closes."""
+    monkeypatch.setattr(bot.guardrails, "is_output_on_topic", MagicMock(return_value=True))
+    classify = MagicMock(return_value="unclear")
+    monkeypatch.setattr(bot.interest_finder, "classify_confirmation", classify)
+    monkeypatch.setattr(bot.interest_finder, "run_turn", MagicMock(return_value=("ok", False)))
+    bot.interest_sessions[7] = {"turns": 1, "pending_proposal": {"topic": "AI", "action": "redefine", "definition": "x"}}
+    bot.chat_histories[7] = ([AIMessage(content="I won't save that -- it wouldn't change anything.")],
+                              [datetime.now(timezone.utc)])
+
+    asyncio.run(bot.process_message(7, "yes", "m", "g"))
+
+    classify.assert_called_once_with("g", "yes", "I won't save that -- it wouldn't change anything.")
 
 
 def test_no_pending_proposal_never_calls_the_confirmation_classifier(monkeypatch):
@@ -583,7 +664,7 @@ def test_a_layer_4_block_on_an_affirmed_proposal_clears_the_session(monkeypatch,
     monkeypatch.setattr(bot.interest_finder, "classify_confirmation", MagicMock(return_value="affirm"))
     monkeypatch.setattr(bot.guardrails, "is_output_on_topic", MagicMock(return_value=False))
     monkeypatch.setattr(agent, "add_one_interest", MagicMock(return_value="Added semiconductors."))
-    bot.interest_sessions[7] = {"turns": 1, "pending_proposal": {"topic": "semiconductors", "action": "add"}}
+    bot.interest_sessions[7] = {"turns": 1, "pending_proposal": {"topic": "semiconductors", "action": "add", "definition": "chip supply chain"}}
 
     result = asyncio.run(bot.process_message(7, "yes", "m", "g"))
 
@@ -594,7 +675,7 @@ def test_a_layer_4_block_on_an_affirmed_proposal_clears_the_session(monkeypatch,
 def test_a_failing_execution_clears_the_session(monkeypatch, isolated_subscribers_db):
     monkeypatch.setattr(bot.interest_finder, "classify_confirmation", MagicMock(return_value="affirm"))
     monkeypatch.setattr(agent, "add_one_interest", MagicMock(side_effect=RuntimeError("db down")))
-    bot.interest_sessions[7] = {"turns": 1, "pending_proposal": {"topic": "semiconductors", "action": "add"}}
+    bot.interest_sessions[7] = {"turns": 1, "pending_proposal": {"topic": "semiconductors", "action": "add", "definition": "chip supply chain"}}
 
     result = asyncio.run(bot.process_message(7, "yes", "m", "g"))
 
@@ -632,7 +713,7 @@ def test_an_affirmed_proposal_translates_the_confirmation(monkeypatch, isolated_
     monkeypatch.setattr(agent, "add_one_interest", MagicMock(return_value="Added semiconductors."))
     translate = MagicMock(return_value="Se agregó semiconductores.")
     monkeypatch.setattr(bot, "_translate_confirmation", translate)
-    bot.interest_sessions[7] = {"turns": 1, "pending_proposal": {"topic": "semiconductors", "action": "add"}}
+    bot.interest_sessions[7] = {"turns": 1, "pending_proposal": {"topic": "semiconductors", "action": "add", "definition": "chip supply chain"}}
 
     result = asyncio.run(bot.process_message(7, "si", "m", "g"))
 
@@ -729,6 +810,26 @@ def test_a_layer_4_block_clears_the_session(monkeypatch):
     assert result["blocked_at"] == "layer4_output_check"
     assert result["reply"] == guardrails.REDIRECT_MESSAGE
     assert 7 not in bot.interest_sessions
+
+
+@pytest.mark.parametrize("category", ["set_interest", "remove_interest", "set_language"])
+def test_each_interest_agent_category_routes_here_alone(monkeypatch, category):
+    """Regression guard for the pre-2026-09-10 check (`"find_interests"
+    in classification.categories`), which would have sent set_interest/
+    remove_interest/set_language straight to the old one-shot Route B
+    dispatch instead of this agent -- the one thing the front-door
+    redesign was supposed to stop. Each of these three needs its OWN test
+    with no find_interests alongside it, since a category list that
+    happens to include find_interests would have passed under the old
+    check too."""
+    run_turn = _start_session(monkeypatch)
+    monkeypatch.setattr(bot.guardrails, "classify_message", MagicMock(
+        return_value=guardrails.MessageClassification(on_topic=True, categories=[category])))
+
+    result = asyncio.run(bot.process_message(7, "some request", "m", "g"))
+
+    assert result["category"] == "find_interests"
+    run_turn.assert_called_once()
 
 
 def test_find_interests_wins_a_multi_category_turn(monkeypatch):

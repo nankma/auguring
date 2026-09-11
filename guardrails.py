@@ -182,21 +182,22 @@ _ROUTER_PROMPT = (
     "named. The distinction from set_interest is whether they have "
     "ALREADY decided the topic: \"add robotics\" is set_interest, \"I "
     "want something like robotics but narrower, what do you have?\" is "
-    "find_interests. When genuinely ambiguous, prefer set_interest -- it "
-    "is the cheaper, single-turn path, and the user can always ask for "
-    "help afterward.\n"
-    "- set_interest: wants to add one or more topics to their stated "
-    "interests. Also set `topics` to a LIST, one short 2-4 word label per "
-    "topic they named, not a full descriptive phrase (e.g. \"robotics\", "
-    "not \"news about robots and automation in general\") -- a short, "
-    "consistent label makes future matches and removal more reliable "
-    "than a long one. If they named several separate topics in one "
-    "message (\"add AI agent, AI coding, and LLMs\"), `topics` must have "
-    "one entry PER topic, e.g. [\"AI agent\", \"AI coding\", \"LLMs\"] -- "
-    "never combine them into a single entry, and never summarize several "
-    "named topics down to a broader umbrella term that covers them "
-    "(\"AI agent\" and \"AI coding\" is two entries, not one \"AI\" "
-    "entry). A single-topic message still produces a one-element list.\n"
+    "find_interests -- both open the SAME guided conversation now (2026-09-10: "
+    "adding an interest always shows real examples and a definition before "
+    "saving, never a blind one-shot add), so this distinction is about "
+    "extracting the right starting point for that conversation, not about "
+    "picking a cheaper path. When genuinely ambiguous, prefer set_interest.\n"
+    "- set_interest: names one or more SPECIFIC topics to add to their "
+    "stated interests (\"add robotics\", \"add AI agent, AI coding, and "
+    "LLMs\") -- this still opens the guided conversation above, seeded "
+    "with the topic(s) named, so it can go straight to showing real "
+    "examples for them instead of asking what to follow. Also set "
+    "`topics` to a LIST, one short 2-4 word label per topic they named, "
+    "not a full descriptive phrase (e.g. \"robotics\", not \"news about "
+    "robots and automation in general\") -- one entry PER topic if "
+    "several were named in one message, never combined into a single "
+    "entry or summarized down to a broader umbrella term. A single-topic "
+    "message still produces a one-element list.\n"
     "- remove_interest: wants to remove one or more topics from their "
     "stated interests. Also set `topics` to a list, one entry per topic "
     "named, matching the phrasing they used to name each one -- same "
@@ -342,9 +343,15 @@ _OUTPUT_SCOPE_PROMPT = (
 # not the broader "is this appropriate content" judgment. See
 # docs/plans/guardrails-plan.md's 2026-08-08 finding for why: news_query replies
 # are free-form (the model decides what to write about), so both checks
-# matter there, but a set_interest/push confirmation's shape is already
-# pinned down by the prompt that generated it.
-_NARROW_CHECK_CATEGORIES = {"set_interest", "remove_interest", "start_push", "stop_push", "set_language"}
+# matter there, but a push confirmation's shape is already pinned down by
+# the fixed template that generated it.
+#
+# set_interest/remove_interest/set_language deliberately are NOT here
+# (moved out 2026-09-10): they now open the same interest_finder agent as
+# find_interests, whose replies are free-form model prose (examples,
+# definitions, questions) exactly like a news_query report -- the full
+# check applies to all of them for the same reason, not just news_query.
+_NARROW_CHECK_CATEGORIES = {"start_push", "stop_push"}
 
 
 def is_output_on_topic(model, response_text: str, category: str | None = None) -> bool:

@@ -56,12 +56,15 @@ def resolve_interest_definition(chat_id: int, interest: str) -> str | None:
 
     Deliberately two separate tables, not one merged lookup with a
     subscriber_id column that's NULL for the shared row: the shared
-    table is written automatically and constantly (every add_one_interest
-    call, every search_news cache miss) by code that has no idea
-    per-subscriber overrides exist, and mixing the two would risk an
-    automatic write silently clobbering a subscriber's deliberate
-    refinement if the two ever collided on write order. Keeping them
-    apart makes that impossible by construction."""
+    table is written automatically (every search_news cache miss, and
+    news_push's retroactive fill) by code that has no idea per-subscriber
+    overrides exist, and mixing the two would risk an automatic write
+    silently clobbering a subscriber's deliberate refinement if the two
+    ever collided on write order. Keeping them apart makes that
+    impossible by construction. (add_one_interest stopped writing here
+    2026-09-10 -- see docs/plans/interest-finder-plan.md's front-door
+    redesign section: a confirmed personal definition now goes only to
+    the subscriber's own tier below, never this shared one.)"""
     own = get_subscriber_interest_definition(chat_id, interest)
     if own is not None:
         return own
