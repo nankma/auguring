@@ -279,6 +279,43 @@ stopping it — e.g. `docker exec <old-container> cp -r /app/news_cache
 zero. Confirmed working this way 2026-08-20: 2271 articles carried
 forward instead of resetting.
 
+## Before trusting any local SSH tunnel: check who actually owns the port
+
+If smoke-testing goes through a manually-opened local tunnel (e.g. `plink
+-L 8765:127.0.0.1:8765 -N` for a password-auth host like local-int-machine,
+where `tools/run_smoke_tests.py`'s own SSH-key tunnel code doesn't apply),
+don't assume a freshly-launched tunnel command actually bound the port
+just because the command didn't visibly error. Real incident, 2026-09-10:
+a stale `ssh.exe` process from a session the *previous day* was still
+listening on `127.0.0.1:8765`; the newly-launched `plink` for this
+session silently failed to bind (its own background-task result later
+came back "failed, exit 127") and every `/test_message` POST in that
+window was answered by whatever the stale tunnel/backend was still
+pointed at instead — ~40 minutes of smoke-test results were checked
+against the wrong process before this was caught, and they looked exactly
+like a real regression (the pre-PR-#94 one-shot interest-add behavior,
+reproduced with perfect consistency across ten separate calls).
+
+Before sending the first real test message through a new tunnel, check
+who actually owns the port, not just whether your own command errored:
+
+```powershell
+Get-NetTCPConnection -LocalPort 8765 -State Listen |
+  ForEach-Object { Get-Process -Id $_.OwningProcess }
+```
+
+If the owning PID's `StartTime` predates this session, or its
+`ProcessName` isn't the tunnel tool you just launched (a stale `ssh.exe`
+counts exactly the same as a stale `plink.exe` — this isn't
+plink-specific), kill it, confirm the port is free
+(`Get-NetTCPConnection -LocalPort 8765` returns nothing), and only then
+open a fresh tunnel and re-verify it with one throwaway request before
+trusting any real test through it. This generalizes the tunnel-port
+gotcha already noted elsewhere in this project's deploy history (orphaned
+`plink` from a *nested-background* mistake) — the common thread both
+times is "something else already had the port," not any one specific
+tool.
+
 ## After every deploy: run the smoke test
 
 **Step 4, always, no exceptions:** after the container is restarted on the
