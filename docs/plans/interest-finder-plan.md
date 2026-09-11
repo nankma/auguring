@@ -1,19 +1,20 @@
-# "Help me find my interests" — an elicitation conversation
+# "Help me find my interests" — an elicitation conversation, and the front door it became
 
-Written 2026-09-08. Status: **deployed to INT, one incident found and fixed
-on first live use.**
+Written 2026-09-08, substantially revised 2026-09-10. Status: **built,
+not yet deployed.**
 
 | Piece | Status |
 |---|---|
 | Cross-domain research survey | Done — `docs/analysis/interest-elicitation-survey.md` |
 | `find_interests` router category + output-scope widening | Built (`guardrails.py`) |
-| `interest_finder.py` — prompt, six tools, `run_turn` | Built |
+| `interest_finder.py` — prompt, tools, `run_turn` | Built |
 | Per-chat session state + turn ceiling in `bot.py` | Built |
 | `build_agent`/`run_agent` parameterization | Built (`agent.py`) |
 | Settings entries (all three environments) | Built |
-| Tests | Built — `tests/test_interest_finder.py`, additions to `tests/test_guardrails.py` |
-| Live verification on INT | Done — 2026-09-08, found the false-confirmation incident below on first real use |
-| False-confirmation fix (`propose_interest` + deterministic confirmation gate) | Built and verified live against the real pinned model, incl. cross-language (zh-Hant/zh-Hans/es/en) and direct DB persistence checks — not yet redeployed |
+| Tests | Built — `tests/test_interest_finder.py`, `tests/test_agent.py`, `tests/test_bot.py`, `tests/test_guardrails.py` |
+| Live verification on INT (2026-09-08 round) | Done — found the false-confirmation incident below on first real use |
+| False-confirmation fix (`propose_interest` + deterministic confirmation gate) | Built and verified live against the real pinned model, incl. cross-language (zh-Hant/zh-Hans/es/en) and direct DB persistence checks |
+| **Front-door redesign** (`set_interest`/`remove_interest`/`set_language` moved into this agent; every add now grounded) | Built and verified live against the real pinned model 2026-09-10 (entry point (f), a multi-topic add, `set_language` mid-exploration) — see its own section below. Not yet redeployed. |
 
 ## The problem
 
@@ -78,10 +79,13 @@ up to a durable topic: "that earnings report" is not an interest,
 choices is the manageable range, which is where `max_examples: 5` comes
 from.
 
-## The four ways in
+## The ways in
 
-All four are the same flow; only the opening differs, and the router
-sends all of them to the same place:
+All of these are the same flow; only the opening differs, and the router
+sends all of them to the same place. (e) and (f) were added by the
+2026-09-10 front-door redesign below; the disambiguation note at the
+bottom is now about which one to seed the conversation with, not about
+picking a cheaper path — there isn't one any more.
 
 | | Shape |
 |---|---|
@@ -89,15 +93,18 @@ sends all of them to the same place:
 | (b) | "I liked that story, send me more like it" — narrowing from a pushed article |
 | (c) | "too much X, not enough Y" — rebalancing by feel |
 | (d) | "what could I follow?" — wants suggestions before committing |
+| (e) | already follows a topic, dissatisfied with what it sends — the topic's *definition* needs adjusting, not the topic itself |
+| (f) | names a specific topic directly ("add robotics to my interests") — still grounded first, just usually in fewer turns |
 
 (c) adjusts the **interest list only**. Push frequency and volume are
 `start_push`/`stop_push`'s job and stay there.
 
-Disambiguation against `set_interest` is in the router prompt: "add
-robotics" is `set_interest`; "something like robotics but narrower, what
-do you have?" is `find_interests`. When genuinely ambiguous, prefer
-`set_interest` — the cheaper path, and a wrong guess there costs one
-message rather than opening a mode.
+The router still distinguishes `set_interest` from `find_interests` for
+argument-extraction purposes ("add robotics" names a topic outright,
+"something like robotics but narrower, what do you have?" doesn't), but
+both dispatch to the same agent now (`agent.INTEREST_AGENT_CATEGORIES`)
+— the distinction seeds where the conversation starts, not which path is
+cheaper.
 
 ## Session state, and why it had to exist
 
@@ -269,8 +276,169 @@ worse than before this mechanism existed, only ever an improvement on it.
 The one thing that changed forever is that "affirm" no longer needs the
 model at all.
 
+## The front door redesign (2026-09-10)
+
+### What triggered it
+
+A real INT conversation stalled: a subscriber asked to find something
+"hot in the open source community" (their own example: a project like
+"openclaw" that later got acquired). The agent searched, honestly found
+no coverage of that shape, and closed with a plain "let's leave it there"
+— but `end_exploration` was never called. Investigated by directly
+reproducing the same conversation via `agent.run_agent` (not through
+`bot.py`, so every raw tool call could be inspected) against **four
+different models/providers**: DeepSeek direct on its brand-new
+V4.1-Flash (released the same day — `deepseek-v4-flash` is now
+transparently routed to it, confirmed via `response_metadata`), the same
+model family hosted by Together.ai on an older fixed checkpoint
+(`DeepSeek-V4-Flash-0731`), GLM-5.3-Flash, and gpt-oss-120b.
+
+Findings, in order of how they changed the plan:
+
+1. **The tool-skipping problem is worse than one incident.** On
+   DeepSeek's newest hosted version, the model didn't just skip
+   `end_exploration` — turns 3 and 4 of the SAME reproduction show it
+   narrating "I searched again" and "I've now searched three different
+   ways" with **zero actual tool calls** in either turn. It composed a
+   false claim of work done, not just a missing goodbye.
+2. **Retailer matters, independent of model version.** The exact same
+   prompt, same tools, same conversation, run against Together.ai's
+   older checkpoint of "the same" model: every turn genuinely called
+   `find_example_articles`, and the narration matched the real call
+   count. DeepSeek's own newest release measured LESS reliable at this
+   specific behavior than a fixed checkpoint from a different host.
+   gpt-oss-120b was disqualified outright on a separate axis: raw
+   internal "harmony" reasoning tokens leaked into user-facing content
+   (`analysisWe attempted to find example articles...`), plus a live 500
+   from the host. GLM-5.3-Flash called tools honestly on every turn and,
+   notably, didn't just fail to find coverage — it pivoted to a genuinely
+   covered adjacent topic and proposed that instead.
+3. **`end_exploration` asks the model to do the ONE thing this project
+   already learned not to trust it with.** `MAX_TURNS`'s own comment
+   (above) already says self-assessment of "are we going in circles" is
+   unreliable — `end_exploration`'s trigger conditions ("as soon as
+   they're satisfied", "if they've changed direction repeatedly") are
+   exactly that judgment, contrasted with `propose_interest`'s trigger
+   ("the SAME turn you name a specific topic"), which is concrete and
+   immediate, not a multi-turn synthesis.
+
+### The decision: stop patching, remove the need to trust it
+
+Patching `end_exploration` with a `classify_confirmation`-style backstop
+(what the two ceilings section above did for saves) was the obvious next
+move and was explicitly **rejected**. The user's framing: this is a user-
+experience problem, not a hole to patch — fix why the model doesn't call
+tools reliably at the source, not the symptom of one specific tool call
+going missing.
+
+The actual fix removes the stakes instead of the unreliability: **every
+interest add now goes through the same grounded show-examples-then-
+confirm flow already proven for exploration**, funneled through
+`propose_interest`, which bakes in a real cache preview exactly like
+`propose_definition` already did. Once no unconfirmed, ungrounded add can
+ever reach `subscriber_ops.add_interest`, it stops mattering whether
+`end_exploration` gets called — nothing unsafe happens while a session
+lingers, and `MAX_TURNS` (already built) is an adequate bound on how long
+it's allowed to. `end_exploration` stays in the tool set as a courtesy
+(a cleaner exit when the model does remember), explicitly reframed in its
+own prompt text as non-critical.
+
+### What changed
+
+- **`set_interest`/`remove_interest`/`set_language` moved out of Route B**
+  (`agent.ROUTE_B_CATEGORIES` shrank to `{start_push, stop_push}`) into
+  the SAME agent as `find_interests`
+  (`agent.INTEREST_AGENT_CATEGORIES`). The router still classifies and
+  extracts arguments the same way; only the DISPATCH target changed —
+  `bot.process_message` now sends any of these four categories to
+  `_process_find_interests` instead of `dispatch_settings`.
+- **`propose_interest(topic, definition)` is now the only way to add an
+  interest.** It runs a real preview (shared helper with
+  `propose_definition`) and refuses to look like a good option when
+  nothing relevant surfaces — the AAOI-avoidance rule, now enforced at
+  the single choke point every add passes through, including a
+  subscriber naming a topic outright ("add robotics" — entry (f) below).
+  `propose_remove(topic)` is the (unchanged) removal counterpart, split
+  into its own tool now that `propose_interest` no longer takes an
+  `action` flag.
+- **`agent.add_one_interest` no longer generates a definition blindly.**
+  It still normalizes/translates the topic (unchanged), but the
+  definition is now a required argument — the one the subscriber already
+  saw and confirmed — and it's written to the **subscriber's own tier**
+  (`interest_cache_ops.set_subscriber_interest_definition`), never the
+  shared/global one. Direction from the user: "interests are not
+  shared" — two subscribers adding the same word now get two
+  independently confirmed definitions, not one global default whoever
+  types it first establishes for everyone else.
+- **A sixth entry point.** (f) a subscriber names a topic directly — still
+  routes through the same grounding, just usually in fewer turns (one
+  search instead of several, since the topic is already known).
+- **New `set_language` tool**, direct-effect, no confirmation gate —
+  language switching is low-stakes and instantly reversible, unlike
+  interests, so it doesn't need the same safety net, and it now works
+  mid-exploration instead of requiring the subscriber to escape one
+  first.
+- **`guardrails._NARROW_CHECK_CATEGORIES` shrank to `{start_push,
+  stop_push}`.** set_interest/remove_interest/set_language replies are
+  now free-form agent prose (examples, definitions, questions), the same
+  shape as `find_interests`/`news_query`, so they need the full layer-4
+  check, not the narrow self-disclosure-only one.
+- **`dispatch_settings` shrank to push scheduling only** and dropped its
+  `model` parameter (nothing left in it makes an LLM call).
+- **`tools/run_smoke_tests.py` cases 2/3/8/9/14/17 rewritten** for the new
+  shape: adding/removing/already-covered checks became real multi-turn
+  conversations (each on its own chat_id, to avoid stacking turns toward
+  `MAX_TURNS` or mixing unrelated topics into one session); the
+  multi-category join case (14) moved to `start_push` + `news_query`
+  since any `INTEREST_AGENT_CATEGORIES` member now wins a multi-category
+  turn outright instead of joining.
+
+### The cost, stated plainly
+
+Adding an interest by name ("add robotics") used to be one message. It is
+now always at least two: propose (with a real preview), then confirm.
+This is the direction's whole point, not a side effect — but it is a real
+added round trip on what used to be the cheapest path in the bot, and is
+worth remembering as the tradeoff being spent.
+
 ## Open
 
+- **A real-model qa-engineer pass (2026-09-10) found one more instance of
+  finding 6's own failure class, closed the same day.** Reproducing entry
+  point (f) and a multi-topic add against the real pinned model surfaced
+  this: the model can call `propose_definition`, read its own preview,
+  correctly decide out loud that the change would be a no-op, and tell
+  the subscriber it won't save it — all in prose, with nothing to clear
+  the `pending_proposal` it had already recorded. A later, unrelated
+  affirmative reply (a "yes" answering a different question entirely)
+  would then still bind to that disowned proposal, because
+  `classify_confirmation` only ever read the subscriber's raw reply in
+  isolation. Fixed by anchoring the classification to the assistant's
+  actual last message (`history[-1]`, threaded through from `bot.py`)
+  instead of the bare pending-proposal dict — the classifier can now see
+  when the "confirmation question" it's judging a reply against isn't
+  live any more, and returns `decline` instead of letting a stray
+  affirmative through. See `classify_confirmation`'s own docstring.
+  Aside from this, entry point (f) (grounds before saving even when the
+  topic is named outright), a multi-topic add (non-deterministic in
+  shape, but correctly AAOI-avoidant), and `set_language` mid-exploration
+  all matched the design exactly against the real model, with saves
+  verified by direct DB read rather than trusting the reply text.
+- **What model should actually drive this agent is now a genuinely open
+  question, not a settled default.** The cross-model investigation found
+  DeepSeek's own newest hosted release less reliable at honest tool-
+  calling than an older checkpoint of the same model hosted by a
+  different retailer, and found GLM-5.3-Flash reliable AND better at
+  recovering from a dead end (proposing a real adjacent topic instead of
+  just giving up) in the one reproduction run this session. That is one
+  conversation, not a benchmark — `agent.models.main` has not been
+  changed, and shouldn't be without comparing report-writing quality and
+  cost too, not just this one tool-honesty behavior.
+- **Adding an interest now costs a round trip it didn't before**, by
+  direction, not by accident (see "The cost, stated plainly" above) — but
+  it hasn't been measured whether real subscribers tolerate that, versus
+  it becoming a fall-off point real users abandon at that this project's
+  telemetry doesn't yet distinguish from a normal decline/unclear turn.
 - The prompt's method instructions are otherwise the part most likely to
   need adjustment against real behavior — particularly "only propose
   topics you have seen", which is a rule a model can drift from without

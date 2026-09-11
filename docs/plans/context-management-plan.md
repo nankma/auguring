@@ -1,5 +1,17 @@
 # Context Management Plan
 
+> **2026-09-10 update:** Route B's membership changed after this doc was
+> written. `set_interest`/`remove_interest`/`set_language` moved OUT of
+> Route B into the interest_finder conversational agent (the same one
+> `find_interests` already used) -- an interest can no longer be added in
+> one deterministic dispatch; it always shows a grounded definition and
+> real examples first, then waits for confirmation. Only `start_push`/
+> `stop_push` remain genuinely Route B. The reasoning and measurements
+> below are historical record of why Route B was built THIS way
+> originally -- still accurate as history, just no longer describing the
+> current category membership. See `docs/plans/interest-finder-plan.md`
+> for the redesign and why it happened.
+
 Goal: replace the current monolithic `SYSTEM_PROMPT` (one long string, sent
 in full on every single LLM call regardless of relevance) with a layered,
 conditionally-assembled prompt — tighter core identity, situational

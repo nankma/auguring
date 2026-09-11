@@ -35,7 +35,10 @@ from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
-from agent import ROUTE_B_CATEGORIES, build_model_from_settings, dispatch_settings, search_news, setup_telemetry
+from agent import (
+    INTEREST_AGENT_CATEGORIES, ROUTE_B_CATEGORIES, build_model_from_settings, dispatch_settings,
+    search_news, setup_telemetry,
+)
 from app_settings import get_settings
 import admin_bot
 import guardrails
@@ -426,14 +429,14 @@ def _translate_confirmation(model, text: str, language: str) -> str:
 
 
 async def _route_b_reply(chat_id: int, classification, guard_model, category: str) -> tuple[str | None, str]:
-    """Runs one Route B category (interests/push/language) and returns
+    """Runs one Route B category (push scheduling only, since 2026-09-10
+    -- see agent.dispatch_settings's own docstring) and returns
     (blocked_at, reply) -- no history side effects, since a multi-category
     turn (see _process_multi_category) needs to combine several of these
     into one history entry, not one each. See
-    docs/plans/context-management-plan.md's settings-dispatch refactor and
-    agent.dispatch_settings's own docstring for why this is model-free
-    except for the one translation call below."""
-    reply = dispatch_settings(category, chat_id, classification, model=guard_model)
+    docs/plans/context-management-plan.md's settings-dispatch refactor for
+    why this is model-free except for the one translation call below."""
+    reply = dispatch_settings(category, chat_id, classification)
 
     # A language preference governs every reply, not just news_query --
     # checked *after* dispatch_settings, so a set_language turn's own
@@ -512,7 +515,7 @@ async def _execute_pending_proposal(
     topic, action = pending["topic"], pending["action"]
     try:
         if action == "add":
-            reply = interest_finder.execute_save(chat_id, topic, guard_model, session)
+            reply = interest_finder.execute_save(chat_id, topic, pending["definition"], guard_model, session)
         elif action == "remove":
             reply = interest_finder.execute_drop(chat_id, topic, session)
         elif action == "redefine":
@@ -586,7 +589,14 @@ async def _process_find_interests(chat_id: int, user_text: str, model, guard_mod
     # this mechanism existed, only ever an improvement over it.
     pending = session.get("pending_proposal")
     if pending is not None:
-        verdict = await asyncio.to_thread(interest_finder.classify_confirmation, guard_model, user_text)
+        # The subscriber's reply answers whatever the assistant said LAST
+        # (history[-1], persisted at the end of the turn that set/refreshed
+        # this proposal) -- not the proposal in isolation. See
+        # classify_confirmation's own docstring for the incident this
+        # anchoring fixes.
+        last_assistant_reply = history[-1].content if history else ""
+        verdict = await asyncio.to_thread(
+            interest_finder.classify_confirmation, guard_model, user_text, last_assistant_reply)
         if verdict == "affirm":
             session.pop("pending_proposal", None)
             return await _execute_pending_proposal(
@@ -763,13 +773,20 @@ async def process_message(chat_id: int, user_text: str, model, guard_model, embe
         if not classification.on_topic:
             return {"blocked_at": "layer2_router", "category": classification.categories[0], "reply": guardrails.REDIRECT_MESSAGE}
 
-        # find_interests opens a conversational MODE, so it can't be one
-        # segment of a multi-category reply the way the settings
-        # categories can -- it owns the turns that follow. If the router
-        # sees it at all, the whole message goes to the exploration; the
-        # agent there can act on the rest of what they said itself (it
-        # can save/drop interests), which a joined reply could not.
-        if "find_interests" in classification.categories:
+        # find_interests, and (since 2026-09-10) set_interest/
+        # remove_interest/set_language all open the SAME conversational
+        # MODE now -- adding an interest always shows a grounded
+        # definition and real examples before saving, never a blind
+        # one-shot add (docs/plans/interest-finder-plan.md's front-door
+        # redesign), and removing/language-switching moved alongside it
+        # so they keep working mid-exploration instead of needing to
+        # escape it. This can't be one segment of a multi-category reply
+        # the way the settings categories used to be -- it owns the turns
+        # that follow. If the router sees ANY of these categories, the
+        # whole message goes to the agent; it can act on the rest of what
+        # they said itself (it has tools for all four), which a joined
+        # reply could not.
+        if INTEREST_AGENT_CATEGORIES.intersection(classification.categories):
             return await _process_find_interests(chat_id, user_text, model, guard_model, embedder)
 
         history, history_timestamps = _get_trimmed_history(chat_id)

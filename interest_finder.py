@@ -50,6 +50,36 @@ the code:
    lever works through topical vocabulary, so refinement stays topical:
    concrete directions drawn from the cache ("more hands-on/experimental",
    "more enterprise/deployment"), never an abstract genre label.
+6. **The single-turn "add X to my interests" fast path is retired.**
+   Found live 2026-09-10, root-caused by direct reproduction against the
+   real model (not assumed): a subscriber's exploration ended with the
+   model narrating "let me search again" and "let's stop here" without
+   ever calling find_example_articles or end_exploration on those turns.
+   Reproducing the SAME conversation against four different models/
+   providers (DeepSeek direct on its latest V4.1-Flash, the same model
+   family hosted by Together.ai on an older fixed checkpoint, GLM-5.3-
+   Flash, and gpt-oss-120b) showed this is a property of long-tool-
+   calling-loop reliability in general, not one provider's bug -- and
+   that end_exploration specifically asks the model to do the ONE thing
+   this project already learned not to trust it with (see MAX_TURNS's
+   own comment: "self-assessment models are unreliable at"). Patching
+   end_exploration with yet another classifier would only be treating a
+   symptom.
+   The actual fix removes the need to trust it at all: EVERY interest add
+   now goes through the same grounded show-examples-then-confirm flow
+   that already existed for the guided exploration, funneled through
+   propose_interest, which bakes in a preview exactly like
+   propose_definition already does. Once no unconfirmed, ungrounded add
+   can ever reach subscriber_ops.add_interest, it no longer matters
+   whether a session lingers because end_exploration was never called --
+   nothing unsafe can happen while it's open, and MAX_TURNS remains an
+   adequate, already-existing bound on how long it lingers. This is also
+   why set_interest/remove_interest/set_language moved into this same
+   agent (agent.INTEREST_AGENT_CATEGORIES) instead of Route B's one-shot
+   dispatch: a subscriber naming a topic outright ("add robotics") still
+   needs to see it grounded before it's saved, and switching languages or
+   removing an interest needs to keep working without forcing them out of
+   an in-progress exploration first.
 
 **This is the one feature in this codebase that genuinely justifies an
 agent loop** (agent.build_agent/run_agent, dormant since PR #85). The
@@ -150,9 +180,17 @@ _SYSTEM_PROMPT = (
     "- Do not search more than twice before replying. If two searches "
     "come back with nothing, say so plainly and ask them for a different "
     "direction -- rephrasing the same idea a third and fourth time does "
-    "not find coverage that isn't there, and it makes them wait.\n\n"
+    "not find coverage that isn't there, and it makes them wait.\n"
+    "- NEVER propose adding a topic without grounding it first, even "
+    "when they name it directly and specifically (\"add robotics to my "
+    "interests\"). Naming something outright is not permission to skip "
+    "find_example_articles -- call it for that exact topic, write a "
+    "definition from what you actually found, and only then propose_"
+    "interest. A specific request still gets the same grounding, just "
+    "with less back-and-forth to reach it (usually one search, not "
+    "several).\n\n"
 
-    "THE FIVE WAYS THEY MIGHT ARRIVE, all handled here:\n"
+    "THE SIX WAYS THEY MIGHT ARRIVE, all handled here:\n"
     "(a) They want help finding interests from scratch -- start with a "
     "broad sense of what the corpus covers, then narrow.\n"
     "(b) They liked a story they were sent and want more like it -- "
@@ -179,14 +217,23 @@ _SYSTEM_PROMPT = (
     "saved. Definition effects are measured to be counter-intuitive, so "
     "always look at the preview yourself before describing it to them, "
     "and never call save_definition on a definition you haven't "
-    "previewed via propose_definition.\n\n"
+    "previewed via propose_definition.\n"
+    "(f) They name a specific topic directly (\"add robotics to my "
+    "interests\") -- do not save it on the spot. Call find_example_"
+    "articles for that exact topic, write a definition grounded in what "
+    "you found, then propose_interest with it. If it has no coverage, "
+    "say so plainly instead of adding it anyway -- same AAOI-avoidance "
+    "rule as everywhere else here.\n\n"
 
     "BEFORE SAVING, REMOVING, OR REDEFINING: call propose_interest(topic, "
-    "action) or propose_definition(topic, definition) in the SAME turn "
-    "you say plainly what you are about to change, then ask them to "
-    "confirm -- do not save on a guess. Neither propose call changes "
-    "anything by itself, so calling either is always safe, and the "
-    "system uses it to complete the change reliably once they agree even "
+    "definition), propose_remove(topic), or propose_definition(topic, "
+    "definition) in the SAME turn you say plainly what you are about to "
+    "change, then ask them to confirm -- do not save on a guess. "
+    "propose_interest and propose_definition both run a real preview and "
+    "return it to you immediately; read it before describing the change. "
+    "None of the three propose calls change anything by themselves, so "
+    "calling any of them is always safe, and the system uses whichever "
+    "one you called to complete the change reliably once they agree even "
     "in a turn where you don't get the chance to call "
     "save_interest/drop_interest/save_definition yourself. If you are "
     "ever unsure whether a proposal you made earlier actually went "
@@ -194,12 +241,21 @@ _SYSTEM_PROMPT = (
     "saying it worked -- only say something is saved after a tool call "
     "has actually told you so.\n\n"
 
+    "LANGUAGE: if they want replies in a different language from now on, "
+    "call set_language directly -- no need to propose or confirm first, "
+    "it's a low-stakes, instantly reversible setting, not data that could "
+    "leave them following something with no coverage. This works at any "
+    "point in this conversation, not just at the start.\n\n"
+
     "WHEN TO STOP: call end_exploration as soon as they are satisfied, "
     "or if they say they are done, or if they have changed direction "
     "repeatedly without converging -- in that last case tell them "
     "honestly that this is not getting anywhere and suggest they just "
     "name a company or topic directly, then end. Do not keep looping "
-    "hoping it resolves.\n\n"
+    "hoping it resolves. This one is a courtesy, not a safety mechanism -- "
+    "nothing risky can happen just because a conversation stays open, so "
+    "say a natural goodbye even in a turn where you don't call the tool "
+    "for it.\n\n"
 
     + agent.HTML_FORMATTING_RULES
 )
@@ -293,22 +349,24 @@ def show_definition(topic: str, runtime: ToolRuntime) -> str:
     return f'Current definition for "{topic}":\n\n{definition}'
 
 
-def execute_save(chat_id: int, topic: str, guard_model, session: dict) -> str:
-    """Actually persists one interest -- the single place both the
-    save_interest tool below AND bot.py's deterministic confirmation gate
-    (see propose_interest's docstring) call, so there is exactly ONE code
-    path that can make "this subscriber follows X" true, and exactly one
-    place the interest_saved_from_exploration event fires from, regardless
-    of which path triggered it.
+def execute_save(chat_id: int, topic: str, definition: str, guard_model, session: dict) -> str:
+    """Actually persists one interest, together with the `definition` the
+    subscriber has already seen previewed and confirmed -- the single
+    place both the save_interest tool below AND bot.py's deterministic
+    confirmation gate (see propose_interest's docstring) call, so there is
+    exactly ONE code path that can make "this subscriber follows X" true,
+    and exactly one place the interest_saved_from_exploration event fires
+    from, regardless of which path triggered it.
 
     agent.add_one_interest, not subscriber_ops.add_interest directly: it
-    also normalizes the phrasing and generates/caches the retrieval
-    definition, which is what makes the saved interest actually work at
-    push time. Same path the single-turn "add X" route uses, so an
-    interest arrived at here is indistinguishable from one typed directly
-    -- no second class of interest."""
+    also normalizes the phrasing (translation/disambiguation), which is
+    orthogonal to this module's own grounding work and stays there rather
+    than being duplicated here. `definition` is required now -- see this
+    module's own docstring, finding 6: a blind, subscriber-unseen
+    definition is exactly what the front-door redesign eliminated, and
+    there is no add path left that doesn't go through a real preview."""
     known = subscriber_ops.get_interests(chat_id)
-    reply = agent.add_one_interest(chat_id, topic, guard_model, known)
+    reply = agent.add_one_interest(chat_id, topic, guard_model, known, definition)
     session.setdefault("saved", []).append(topic)
     # The one outcome that says this feature worked. bot.py already logs
     # the failure shapes (out-of-turns, an exception); without this there
@@ -351,36 +409,67 @@ def execute_redefine(chat_id: int, topic: str, definition: str, session: dict) -
 
 
 @tool
-def propose_interest(topic: str, action: Literal["add", "remove"], runtime: ToolRuntime) -> str:
-    """Call this in the SAME turn you tell the subscriber which specific
-    topic you are about to add or remove and ask them to confirm --
-    BEFORE they have answered. Records the proposal so the system can act
-    on it reliably once they agree, even in a turn where you don't get
-    the chance to call save_interest/drop_interest yourself. Does not
-    change anything by itself, so calling it is always safe.
+def propose_interest(topic: str, definition: str, runtime: ToolRuntime) -> str:
+    """Call this to propose ADDING a new interest -- in the SAME turn you
+    tell the subscriber which specific topic you are about to add and ask
+    them to confirm, BEFORE they have answered. This is the only way to
+    add an interest; there is no shortcut that skips grounding, even when
+    they named the topic outright.
 
-    Exists because of a real 2026-09-08 incident: a model once told a
-    subscriber an interest was added, in its own confident prose, without
-    ever calling save_interest -- see this module's own docstring. The
-    fix moved the actual write out of the model's hands: once this
-    proposal is recorded, bot.py classifies the subscriber's NEXT reply
-    as affirm/decline/unclear itself (classify_confirmation below) and,
-    on affirm, calls execute_save/execute_drop directly -- the write no
-    longer depends on you remembering to call a tool at the right
-    moment."""
-    _session(runtime)["pending_proposal"] = {"topic": topic, "action": action}
-    return f"Proposal recorded ({action}: {topic}). Now ask the subscriber to confirm in your reply."
+    ALSO runs the preview immediately and returns which real cached
+    articles `definition` would surface right now, exactly like
+    propose_definition -- read the preview before describing the change;
+    if it surfaces nothing relevant, do not propose adding this topic,
+    say so and ask for a different one instead (same AAOI-avoidance rule
+    everywhere else here). Records the proposal so the system can
+    complete it reliably even in a turn where you don't get the chance to
+    call save_interest yourself -- it does not change anything by itself,
+    so calling it is always safe.
+
+    Exists in this shape because of a real 2026-09-08 incident: a model
+    once told a subscriber an interest was added, in its own confident
+    prose, without ever calling a save tool -- see this module's own
+    docstring, findings 4 and 6. The fix moved the actual write out of
+    the model's hands: once this proposal is recorded, bot.py classifies
+    the subscriber's NEXT reply as affirm/decline/unclear itself
+    (classify_confirmation below) and, on affirm, calls execute_save
+    directly -- the write no longer depends on you remembering to call a
+    tool at the right moment."""
+    preview = _relevant_cached_articles(runtime.context.get("embedder"), definition)[:MAX_EXAMPLES]
+    _session(runtime)["pending_proposal"] = {"topic": topic, "action": "add", "definition": definition}
+    if not preview:
+        return (f'This definition would currently surface NOTHING relevant for "{topic}". '
+                "Proposal recorded, but do not present adding this topic as a good option -- "
+                "tell the subscriber it has no coverage and ask for a different direction.")
+    lines = [f'This definition would currently surface, for "{topic}":']
+    lines.extend(_format_article_lines(preview))
+    return "\n".join(lines)
 
 
 @tool
-def save_interest(topic: str, runtime: ToolRuntime) -> str:
-    """Add a topic to this subscriber's interests. Only call this AFTER
-    they have confirmed the specific topic -- normally bot.py's own
-    confirmation gate (see propose_interest) completes this for you, so
+def propose_remove(topic: str, runtime: ToolRuntime) -> str:
+    """Call this in the SAME turn you tell the subscriber which topic you
+    are about to remove and ask them to confirm -- BEFORE they have
+    answered. No definition or preview needed for a removal. Records the
+    proposal so the system can complete it reliably even in a turn where
+    you don't get the chance to call drop_interest yourself -- it does
+    not change anything by itself, so calling it is always safe. Same
+    mechanism as propose_interest, see its docstring for why this exists."""
+    _session(runtime)["pending_proposal"] = {"topic": topic, "action": "remove"}
+    return f"Removal proposal recorded ({topic}). Now ask the subscriber to confirm in your reply."
+
+
+@tool
+def save_interest(topic: str, definition: str, runtime: ToolRuntime) -> str:
+    """Add a topic to this subscriber's interests, together with the
+    definition they confirmed. Only call this AFTER they have confirmed
+    the specific topic AND definition you previewed via propose_interest
+    -- normally bot.py's own confirmation gate completes this for you, so
     you should rarely need to call this directly; it remains available
     for the case where a message already contains unambiguous
     confirmation in one go."""
-    return execute_save(runtime.context["chat_id"], topic, runtime.context.get("guard_model"), _session(runtime))
+    return execute_save(
+        runtime.context["chat_id"], topic, definition, runtime.context.get("guard_model"), _session(runtime))
 
 
 @tool
@@ -392,16 +481,29 @@ def drop_interest(topic: str, runtime: ToolRuntime) -> str:
 
 
 @tool
+def set_language(language: str, runtime: ToolRuntime) -> str:
+    """Set this subscriber's reply language from now on. Call this
+    directly, immediately, with no proposal or confirmation step -- it is
+    low-stakes and instantly reversible, unlike adding or removing an
+    interest, so it does not need the same safety net. Works at any point
+    in this conversation."""
+    subscriber_ops.set_language(runtime.context["chat_id"], language)
+    return f"Done -- replying in {language} from now on."
+
+
+@tool
 def propose_definition(topic: str, definition: str, runtime: ToolRuntime) -> str:
     """Call this to propose a NEW retrieval definition for one of the
     subscriber's existing interests -- in the SAME turn you tell them
-    what direction you're proposing and ask them to confirm, mirroring
-    propose_interest (same mechanism, same reason: see this module's own
-    docstring on the 2026-09-08 incident).
+    what direction you're proposing and ask them to confirm. Same
+    mechanism as propose_interest, same reason (see this module's own
+    docstring on the 2026-09-08 incident): the write is deterministic
+    once this is recorded, so it doesn't depend on you remembering to
+    call save_definition yourself.
 
-    Unlike propose_interest, this ALSO runs the preview immediately and
-    returns which real cached articles `definition` would surface right
-    now -- definition effects are measured to be strongly counter-
+    ALSO runs the preview immediately, exactly like propose_interest does
+    -- returns which real cached articles `definition` would surface
+    right now. Definition effects are measured to be strongly counter-
     intuitive (docs/analysis/retrieval-quality-measurements.md finding
     5), so the preview is baked into this call rather than left to a
     separate step you could skip. Read the preview before describing the
@@ -452,8 +554,8 @@ def end_exploration(reason: str, runtime: ToolRuntime) -> str:
 
 TOOLS = [
     find_example_articles, list_current_interests, show_definition,
-    propose_interest, save_interest, drop_interest,
-    propose_definition, save_definition, end_exploration,
+    propose_interest, save_interest, propose_remove, drop_interest,
+    propose_definition, save_definition, set_language, end_exploration,
 ]
 
 
@@ -463,19 +565,30 @@ class _ConfirmationCheck(BaseModel):
 
 
 _CONFIRMATION_PROMPT = (
-    "A conversational assistant just proposed adding or removing ONE "
-    "specific topic and asked the subscriber to confirm. Classify the "
-    "subscriber's reply that follows, in whatever language it's written:\n"
-    "- affirm: they agree (e.g. \"yes\", \"sure\", \"go ahead\", \"是的\", "
-    "\"好\", \"sí\", \"confirm\") -- including a short reply that ONLY "
-    "confirms.\n"
-    "- decline: they say no, or clearly want something different instead.\n"
+    "A conversational assistant proposed adding, removing, or redefining "
+    "ONE specific interest, and its LATEST message to the subscriber "
+    "(shown below, verbatim) is what the subscriber's reply actually "
+    "answers -- not the original proposal in isolation. Classify the "
+    "subscriber's reply, in whatever language it's written, AS AN ANSWER "
+    "TO THAT LATEST MESSAGE:\n"
+    "- affirm: the latest message IS still actively asking the subscriber "
+    "to confirm the change, AND they agree (e.g. \"yes\", \"sure\", \"go "
+    "ahead\", \"是的\", \"好\", \"sí\", \"confirm\") -- including a short "
+    "reply that ONLY confirms.\n"
+    "- decline: they say no, clearly want something different instead, OR "
+    "the latest message no longer reads as a live request for "
+    "confirmation at all -- for example it already says the change won't "
+    "be made, or it moved on to something else entirely. In that second "
+    "case, classify decline regardless of how affirmative the reply "
+    "sounds: there is no live question left for it to confirm.\n"
     "- unclear: anything else -- a new question, a change of direction, "
     "ambiguous phrasing, or a reply that doesn't clearly do either."
 )
 
 
-def classify_confirmation(guard_model, user_text: str) -> Literal["affirm", "decline", "unclear"]:
+def classify_confirmation(
+    guard_model, user_text: str, last_assistant_reply: str = "",
+) -> Literal["affirm", "decline", "unclear"]:
     """Whether a reply to a propose_interest confirmation question
     agrees, declines, or is unclear. Deliberately NOT a reading of the
     model's own subsequent prose -- a model composing text that CLAIMS a
@@ -485,14 +598,29 @@ def classify_confirmation(guard_model, user_text: str) -> Literal["affirm", "dec
     and reliability class as guardrails.classify_message's router, not a
     new open-ended loop. Fails open to "unclear", which is always safe:
     the caller simply falls through to the normal agent turn, exactly as
-    if no proposal were pending."""
+    if no proposal were pending.
+
+    `last_assistant_reply` anchors the classification to what the
+    subscriber is ACTUALLY replying to, rather than blindly re-reading a
+    stale pending_proposal. Found live 2026-09-10: a model can run
+    propose_definition (recording a proposal), look at its own preview,
+    decide out loud that it's a no-op, and tell the subscriber it won't
+    save it -- all in prose, with nothing to clear the proposal it just
+    recorded. A later, unrelated affirmative reply ("yes" answering a
+    completely different question) would otherwise still bind to that
+    disowned proposal and get saved anyway. Passing the assistant's own
+    latest message lets the classifier see whether it's still a live
+    question at all, not just whether the reply sounds affirmative."""
     if guard_model is None:
         return "unclear"
     try:
         structured = guard_model.with_structured_output(_ConfirmationCheck, method="function_calling")
         result = structured.invoke([
             {"role": "system", "content": _CONFIRMATION_PROMPT},
-            {"role": "user", "content": user_text},
+            {"role": "user", "content": (
+                f"Assistant's latest message:\n{last_assistant_reply}\n\n"
+                f"Subscriber's reply:\n{user_text}"
+            )},
         ])
         if result is None:
             return "unclear"
@@ -537,8 +665,10 @@ def _compose_prompt(request) -> str:
             tool_name = {"add": "save_interest", "remove": "drop_interest", "redefine": "save_definition"}[action]
             what = (f"redefine \"{pending['topic']}\"" if action == "redefine"
                     else f"{action} \"{pending['topic']}\"")
+            # "add" and "redefine" both carry a definition now (propose_interest
+            # bakes one in exactly like propose_definition does); "remove" never has one.
             call = (f"{tool_name}(\"{pending['topic']}\", \"{pending['definition']}\")"
-                    if action == "redefine" else f"{tool_name} yourself")
+                    if action in ("add", "redefine") else f"{tool_name} yourself")
             parts.append(
                 f"You previously proposed to {what} and are waiting on "
                 f"their answer. If their latest message actually confirms "
