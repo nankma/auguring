@@ -107,6 +107,16 @@ def _make_rss_fetcher(url: str, display_name: str) -> callable:
     return fetch
 
 
+def _raw_rss_entries() -> list[dict]:
+    """Raw news_source.rss entries. No credential to resolve here (RSS
+    never carries one), so unlike _raw_api_entries this is just the plain
+    resolved list -- exposed as its own function so news_ingest.py can
+    look up one entry's optional interval_hours override (e.g.
+    venturebeat_ai's, see settings.yml) the same way it already does for
+    news_source.api entries, without needing its own copy of this read."""
+    return get_settings().resolved("news_source.rss", default=[])
+
+
 def _rss_sources_from_settings() -> list[tuple[str, callable, None, str]]:
     """Builds the RSS portion of SOURCE_REGISTRY from news_source.rss --
     default=[] rather than required=True, since a deployer running with
@@ -115,7 +125,7 @@ def _rss_sources_from_settings() -> list[tuple[str, callable, None, str]]:
     other optional subsystem in this project (e.g. news_embed's embedder).
     Each entry becomes a 4-tuple matching every other SOURCE_REGISTRY row:
     (key, fetch_fn, required_env=None -- RSS never needs a key, source_class="rss")."""
-    entries = get_settings().resolved("news_source.rss", default=[])
+    entries = _raw_rss_entries()
     return [
         (entry["key"], _make_rss_fetcher(entry["url"], entry["display_name"]), None, "rss")
         for entry in entries
