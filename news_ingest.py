@@ -114,11 +114,17 @@ MAX_RESULTS_PER_SOURCE_SINCE_LAST_PULL = 50
 # The fallback used by _interval_hours() when a source has no
 # news_source.<name>.interval_hours override in Settings.
 DEFAULT_INTERVAL_HOURS = get_settings().resolved("news_source.default_interval_hours", default=4)
-# 1 req/sec is GNews's own documented free-tier limit (docs/current/ai-news-sources.md);
-# used as the general delay between consecutive same-source calls since
-# other sources' limits aren't always documented, and this is cheap
-# regardless (cycles run every 4h+).
-REQUEST_DELAY_SECONDS = get_settings().resolved("news_source.request_delay_seconds", default=1.1)
+# The general delay between consecutive same-section calls to the SAME
+# source, used as one shared value rather than a per-source table since
+# other sources' limits aren't always documented, and slack here is cheap
+# regardless (cycles run every 4h+). Raised from 1.1 to 3.0 on 2026-09-15:
+# arXiv's own Terms of Use (info.arxiv.org/help/api/tou.html) says "make
+# no more than one request every three seconds" for export.arxiv.org, and
+# 1.1s across arxiv's 6 sequential per-cycle section calls was almost
+# certainly what started producing 429s/timeouts around 2026-09-11 (see
+# docs/current/ai-news-sources.md) -- 3.0s comfortably covers GNews's
+# 1 req/sec free-tier limit too, so nothing else needed to change.
+REQUEST_DELAY_SECONDS = get_settings().resolved("news_source.request_delay_seconds", default=3.0)
 
 # Above this share of non-Latin letters, an article is dropped at ingestion
 # and never cached. Measured on the 2026-08-21 snapshot: 66 of 2,706 titles
@@ -188,33 +194,57 @@ _TIME_FILTERABLE_CLASSES = {"forum", "api"}
 _SERVER_SIDE_SINCE_SOURCES = {"hackernews", "arxiv", "gnews"}
 
 
-def _api_entry(source_key: str) -> dict | None:
-    """This source's own news_source.api entry (raw, not credential-
-    resolved -- interval_hours/daily_cap are never trailsign-resolve
-    nodes in practice, so there's nothing to resolve for them), or None
-    if it doesn't have one -- covers RSS sources and the two always-on
-    free sources (hackernews, arxiv), neither of which are settings-
-    driven via news_source.api at all (see
-    news_sources._always_on_sources's own docstring). Reads
-    news_sources._raw_api_entries fresh on every call, same "live, not
-    cached at import" reasoning _interval_hours/_daily_cap have always
-    had -- a deployer can change an override in settings.yml and see it
-    reflected without a restart, even though which SOURCES exist at all
-    is fixed at import time (see news_sources.SOURCE_REGISTRY)."""
+def _source_settings_entry(source_key: str) -> dict | None:
+    """This source's own news_source.api OR news_source.rss entry (raw,
+    not credential-resolved -- interval_hours/daily_cap are never
+    trailsign-resolve nodes in practice, so there's nothing to resolve
+    for them), or None if it has neither -- covers only the two always-on
+    free sources (hackernews, arxiv), which aren't settings-driven at all
+    (see news_sources._always_on_sources's own docstring).
+
+    Named for both lists (not just "_api_entry", its 2026-09 name) since
+    an RSS source can carry the same interval_hours override an api
+    source always could -- added so venturebeat_ai could be throttled to
+    a daily check-in without a code change once its feed started
+    returning a site-wide Vercel bot-challenge 429, found 2026-09-14/15
+    (see docs/current/ai-news-sources.md). daily_cap only means anything
+    for api-class sources (RSS has no query budget to spend), but nothing
+    stops setting it on an rss entry too -- it would just never be read.
+
+    Reads news_sources._raw_api_entries/_raw_rss_entries fresh on every
+    call, same "live, not cached at import" reasoning _interval_hours/
+    _daily_cap have always had -- a deployer can change an override in
+    settings.yml and see it reflected without a restart, even though
+    which SOURCES exist at all is fixed at import time (see
+    news_sources.SOURCE_REGISTRY).
+
+    Checks the api list first, then rss -- first match wins. Nothing
+    today enforces that a key can't appear in both lists (no real source
+    does, and nothing would stop a deployer from misconfiguring one that
+    did); if it ever happened, the api entry would win silently and the
+    rss entry's own overrides would be ignored without any error. Same
+    "first match in a list, no dedup" shape _raw_api_entries() already
+    has within its own list -- flagged here rather than guarded against,
+    since a real collision has never happened and guarding against a
+    config mistake that can't currently occur would be speculative."""
     for entry in news_sources._raw_api_entries():
+        if entry.get("key") == source_key:
+            return entry
+    for entry in news_sources._raw_rss_entries():
         if entry.get("key") == source_key:
             return entry
     return None
 
 
 def _interval_hours(source_key: str) -> int:
-    """news_source.api[].interval_hours for this source --
-    docs/plans/local-news-cache-plan.md's resolved "pull interval"
-    question. Sources with no override (no news_source.api entry at all,
-    or an entry with no interval_hours field) use DEFAULT_INTERVAL_HOURS
-    (unrestricted sources, and GNews -- its 100/day budget comfortably
-    covers 6 pulls/day at the default interval)."""
-    entry = _api_entry(source_key)
+    """news_source.api[].interval_hours or news_source.rss[].interval_hours
+    for this source -- docs/plans/local-news-cache-plan.md's resolved
+    "pull interval" question. Sources with no override (no matching
+    entry at all, or an entry with no interval_hours field) use
+    DEFAULT_INTERVAL_HOURS (unrestricted sources, and GNews -- its
+    100/day budget comfortably covers 6 pulls/day at the default
+    interval)."""
+    entry = _source_settings_entry(source_key)
     return (entry or {}).get("interval_hours", DEFAULT_INTERVAL_HOURS)
 
 
@@ -222,7 +252,7 @@ def _daily_cap(source_key: str) -> int | None:
     """news_source.api[].daily_cap for this source --
     docs/plans/local-news-cache-plan.md's Perigon/NewsAPI worked
     examples. None (the default) means no cap."""
-    entry = _api_entry(source_key)
+    entry = _source_settings_entry(source_key)
     return (entry or {}).get("daily_cap", None)
 
 

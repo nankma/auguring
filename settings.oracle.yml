@@ -120,6 +120,14 @@ news_source:
     - key: venturebeat_ai
       display_name: VentureBeat AI
       url: https://venturebeat.com/category/ai/feed/
+      # Found 2026-09-14/15: the whole venturebeat.com domain (now on
+      # Vercel) returns a site-wide bot-challenge 429 to every automated
+      # request, feed included -- not a frequency problem (confirmed live:
+      # even a single fresh request from an unrelated IP gets challenged).
+      # Throttled to once/day rather than removed, purely to monitor for
+      # when their WAF config gets fixed -- raise back to the default
+      # once a pull actually succeeds again.
+      interval_hours: 24
     - key: mit_tech_review
       display_name: MIT Technology Review
       url: https://www.technologyreview.com/feed/

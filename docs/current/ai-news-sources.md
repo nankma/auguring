@@ -205,11 +205,11 @@ posture, recurring cost) than anything on this page.
 | Source | Class | Endpoint | Notes |
 |---|---|---|---|
 | **Hacker News** | forum | `https://hn.algolia.com/api/v1/search_by_date` (Algolia HN Search) | Use `search_by_date`, not the default `/search` — the latter ranks by relevance/points and surfaces old high-upvote posts instead of recent ones. Community-submitted, so quality/relevance is mixed (raw signal, not editorial). |
-| **arXiv (cs.AI)** | api | `http://export.arxiv.org/api/query` | `search_query=cat:cs.AI`, `sortBy=submittedDate`, `sortOrder=descending`. Atom XML response, parsed with `feedparser`. Their API rate-limits under repeated calls in a short window (`429`) — transient, not a code issue. |
+| **arXiv (cs.AI)** | api | `http://export.arxiv.org/api/query` | `search_query=cat:cs.AI`, `sortBy=submittedDate`, `sortOrder=descending`. Atom XML response, parsed with `feedparser`. Found 2026-09-14/15: 429s/timeouts on most of its 6 sequential per-cycle section calls — root cause was our own `REQUEST_DELAY_SECONDS` (1.1s) being under arXiv's own documented Terms of Use ("no more than one request every three seconds" — info.arxiv.org/help/api/tou.html), not a code bug or an arXiv-side problem. Fixed by raising the shared delay to 3.0s; sections stay separate (see "Consequences worth knowing" below for why combining them into one OR'd query was considered and rejected). |
 | **OpenAI Blog** | rss | `https://openai.com/news/rss.xml` | Standard RSS 2.0. |
 | **Hugging Face Blog** | rss | `https://huggingface.co/blog/feed.xml` | Standard RSS 2.0. |
 | **TechCrunch AI** | rss | `https://techcrunch.com/category/artificial-intelligence/feed/` | Standard RSS 2.0. |
-| **VentureBeat AI** | rss | `https://venturebeat.com/category/ai/feed/` | Standard RSS 2.0. |
+| **VentureBeat AI** | rss | `https://venturebeat.com/category/ai/feed/` | Standard RSS 2.0. **Broken 2026-09-14/15 on, not a frequency problem**: the whole `venturebeat.com` domain (now on Vercel) returns a site-wide bot-challenge `429` to every automated request — confirmed live from two unrelated IPs, with both a custom and a real-Chrome User-Agent, on `/`, `/sitemap.xml`, and the feed itself alike. VentureBeat has no public API to apply for, and their old FeedBurner-based `feeds.venturebeat.com` alternative is dead (DNS still points at `feeds.feedburner.com`, which 404s — Google decommissioned that service). Throttled to `interval_hours: 24` (was the 4h default) purely to monitor for when their WAF config gets fixed, not to work around a real rate limit. |
 | **MIT Technology Review** | rss | `https://www.technologyreview.com/feed/` | Main feed, not AI-filtered — but heavily AI-weighted anyway. |
 
 ### Mainstream press — Business/Finance (added 2026-08-13)
@@ -325,6 +325,19 @@ free text was throwing away its index.
 **arXiv is uncapped, so all six subject classes are pulled every cycle** —
 six calls per 4-hour tick rather than one, a deliberate breadth increase.
 Its own multi-day indexing lag prunes most of that before classification.
+
+**Combining the six calls into one OR'd `search_query` was considered
+(2026-09-15) and rejected.** arXiv's query syntax does support boolean OR
+across `cat:` clauses in a single request, which would cut this to one
+call per cycle — but it would reintroduce the exact bug the per-section
+cutoff below was built to fix: a single combined request needs a single
+shared `since` cutoff and a single shared `max_results`, so cs.AI/cs.LG's
+much higher publication volume would both race the cutoff past
+quant-ph/physics.optics's rare papers AND crowd them out of the top-N
+results entirely — the same "answers to questions nobody asked" kind of
+sampling bias this whole section-based design replaced. Fixed the actual
+measured problem (429s from a too-short inter-request delay, see the
+table above) instead, without touching the six-separate-calls shape.
 
 **The since-cutoff is tracked per `(source, section)`**, not per source.
 Sections advance at very different rates — cs.AI produces dozens of papers

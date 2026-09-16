@@ -39,8 +39,8 @@ def _fake_classifying_model(categories_by_index=None):
 def _set_source_overrides(monkeypatch, **overrides):
     """news_ingest._interval_hours/_daily_cap now read the matching entry
     out of news_source.api (a LIST of {key, type, ...} dicts, not a
-    per-source dotted-path lookup) via news_ingest._api_entry, which
-    delegates to news_sources._raw_api_entries -- so this patches
+    per-source dotted-path lookup) via news_ingest._source_settings_entry,
+    which delegates to news_sources._raw_api_entries -- so this patches
     news_sources.get_settings (not news_ingest's own), e.g.
     _set_source_overrides(monkeypatch, perigon={"interval_hours": 8}).
     perigon/newsapi are still real sources with real code elsewhere
@@ -48,6 +48,17 @@ def _set_source_overrides(monkeypatch, **overrides):
     their interval/cap values are settings data."""
     entries = [{"key": name, "type": name, **fields} for name, fields in overrides.items()]
     fake_settings = Settings({"news_source": {"api": entries}})
+    monkeypatch.setattr(news_sources, "get_settings", lambda: fake_settings)
+
+
+def _set_rss_source_overrides(monkeypatch, **overrides):
+    """Same idea as _set_source_overrides, but for news_source.rss --
+    added so an RSS entry (venturebeat_ai) could get an interval_hours
+    override the same way an api entry always could, see
+    news_ingest._source_settings_entry's own docstring for why."""
+    entries = [{"key": name, "url": f"https://example.com/{name}",
+                "display_name": name, **fields} for name, fields in overrides.items()]
+    fake_settings = Settings({"news_source": {"rss": entries}})
     monkeypatch.setattr(news_sources, "get_settings", lambda: fake_settings)
 
 
@@ -74,6 +85,19 @@ def test_is_source_due_respects_newsapi_24h_interval(monkeypatch):
     now = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
     assert news_ingest._is_source_due("newsapi", now - timedelta(hours=23), now) is False
     assert news_ingest._is_source_due("newsapi", now - timedelta(hours=24), now) is True
+
+
+def test_interval_hours_respects_an_rss_source_override(monkeypatch):
+    """venturebeat_ai's real 2026-09-15 use case: an RSS entry can now
+    carry the same interval_hours override an api entry always could,
+    since news_ingest._source_settings_entry checks both lists."""
+    _set_rss_source_overrides(monkeypatch, venturebeat_ai={"interval_hours": 24})
+    assert news_ingest._interval_hours("venturebeat_ai") == 24
+
+
+def test_interval_hours_falls_back_to_default_for_an_unlisted_rss_source(monkeypatch):
+    _set_rss_source_overrides(monkeypatch, venturebeat_ai={"interval_hours": 24})
+    assert news_ingest._interval_hours("bbc_business") == news_ingest.DEFAULT_INTERVAL_HOURS
 
 
 def test_sections_for_source_rss_class_takes_one_call_with_no_section():
