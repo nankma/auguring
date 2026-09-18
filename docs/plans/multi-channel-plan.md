@@ -1,5 +1,13 @@
 # Multi-Channel Plan: Adding LINE Alongside Telegram
 
+> A much smaller, outbound-only sibling to this plan exists:
+> `docs/plans/email-digest-plan.md` (2026-09-17) adds email as a digest
+> delivery option without any of this doc's webhook/identity/quota
+> problems. The two plans share one open question worth deciding
+> together if either is ever picked up — whether to buy the ~$11/year
+> domain this doc already priced out, which would unblock LINE's TLS
+> certificate AND the email plan's deliverability question at once.
+
 **On hold as of 2026-08-09 — see "Why this is on hold" below.** Nothing
 here is built. This doc still exists to capture the goal, technical
 approach, and open questions for whenever this gets picked back up, same
