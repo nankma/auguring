@@ -143,3 +143,46 @@ pass first, per that rule.
   `docs/plans/observability-platform-plan.md`'s 2026-08-29 section and
   `docs/current/telemetry-catalog.md`'s alert table, which both still mark
   them `*(planned)*`.
+
+- [ ] **Deploy the arxiv/venturebeat_ai ingest fix (PR #96, merged
+  2026-09-17) to INT and PROD.** Raises `REQUEST_DELAY_SECONDS` from 1.1
+  to 3.0s so arxiv's 6 sequential per-cycle section calls respect arXiv's
+  own documented "no more than one request every three seconds" rule
+  (was causing most pulls to fail with 429/timeout), and throttles
+  `venturebeat_ai` to a once-daily pull purely to monitor for when
+  VentureBeat's own site-wide Vercel bot-challenge 429 gets fixed on
+  their end (confirmed live: not a rate-limit issue, nothing to fix on
+  our side). code-reviewer and qa-engineer both passed it, CI green on
+  `main` -- just never deployed anywhere yet.
+
+- [ ] **Investigate a possible layer 4 (`is_output_on_topic`) false
+  positive, found 2026-09-10 during the front-door redesign's real-model
+  QA pass.** While reproducing the stale-proposal-classification fix
+  live, a qa-engineer run saw layer 4 block a legitimate mid-exploration
+  reply about redefining an interest toward "quantum computing" inside
+  an already-open `find_interests` session. Flagged only as a side
+  observation at the time (explicitly out of scope for that fix) and
+  never chased further -- worth a dedicated repro to determine whether
+  it's a real guardrail-prompt gap (e.g. the output-scope prompt reading
+  "quantum computing" as an off-topic/self-disclosure signal) or a one-off.
+
+- [ ] **Decide whether `agent.models.main`/`models.guardrail` should move
+  off `deepseek-v4-flash`.** The cross-model investigation behind the
+  interest-finder front-door redesign (2026-09-10, see
+  `docs/plans/interest-finder-plan.md`'s "front door redesign" section)
+  found DeepSeek's own newest hosted release less reliable at honest
+  tool-calling than an older checkpoint of the same model family hosted
+  by Together.ai, and found GLM-5.3-Flash both reliable and better at
+  recovering from a dead end in that one reproduction run -- one
+  conversation, not a benchmark, so nothing has been changed. Also
+  surfaced 2026-09-17: a purpose-built typed-decision model, Jev AI
+  (jevai.org), pitches itself directly at the "LLM guardrail scoring"
+  use case at a lower quoted per-token rate than DeepSeek's cache-miss
+  price (though DeepSeek's cache-hit price, which our repeated-system-
+  prompt guardrail calls likely benefit from, may already undercut it --
+  never measured). Not started either way: blocked on applying for Jev
+  AI's early access and writing a custom adapter (its API isn't
+  OpenAI-wire-compatible, so `agent.build_model_from_config`'s
+  `ChatOpenAI` path can't reach it as-is), then a real `tools/
+  measure_guardrails.py` comparison before trusting either option over
+  the current default.
