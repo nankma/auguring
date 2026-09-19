@@ -186,3 +186,34 @@ pass first, per that rule.
   `ChatOpenAI` path can't reach it as-is), then a real `tools/
   measure_guardrails.py` comparison before trusting either option over
   the current default.
+
+- [ ] **Resolve whether OCI's "Always Free" Email Delivery service is
+  actually usable on this tenancy before building
+  `docs/plans/email-digest-plan.md`.** Oracle's own docs disagree with
+  each other: the Always Free resources page advertises "3,000 emails/month
+  free," but the official service-limits page puts a true Always-Free
+  account's Email Delivery cap at 0 emails/24h -- 200/day is the Trial
+  tier, 50,000/day is Pay-As-You-Go/Universal-Credits. Having a card on
+  file (confirmed 2026-09-17: OCI's signup verification charge went
+  through) doesn't by itself prove which of those three tiers this
+  tenancy is actually in. Cheapest next step is checking directly in the
+  OCI Console (Account Management shows the tenancy's real billing
+  category) rather than reasoning from the docs further. Also note,
+  regardless of tier: OCI Email Delivery still needs a verified Email
+  Domain + Approved Sender configured first (same domain-ownership
+  prerequisite `email-digest-plan.md` already flags for Resend) -- it
+  isn't a zero-setup test either way. No OCI CLI is configured anywhere
+  in this project (`local-infra/infrastructure.yaml`'s own `oci:` note)
+  to check or configure this programmatically today. Put aside for now,
+  2026-09-18 -- revisit if/when the email-digest plan is picked up.
+
+- [ ] **Decide whether push has a total-volume cap, not just a
+  frequency one.** `push_interval_hours` bounds how OFTEN a subscriber is
+  pushed and `UNREACHABLE_STRIKES` (default 3) auto-disables push after
+  repeated delivery FAILURES, but nothing bounds how many pushes a
+  subscriber can receive in total -- a subscriber with push enabled and
+  reachable keeps getting digests (each one a real `search_news`+
+  DeepSeek cost) indefinitely. Related to, but distinct from, this file's
+  existing "Add rate limiting for approved users" item above (that one's
+  about inbound message rate, this is about outbound push volume) --
+  raised 2026-09-18, not designed yet.
