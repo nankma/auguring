@@ -62,6 +62,14 @@ subscribers = Table(
     # to 0 whenever the stored date != today rather than a scheduled job.
     Column("search_count_date", Text),
     Column("search_count_today", Integer),
+    # Free-trial usage caps, set once at approval time (subscriber_ops.decide)
+    # from trial.agent_interaction_limit/trial.push_limit, then decremented
+    # per use. NULL (every row that predates this column, via ADDITIVE_COLUMNS
+    # below) or -1 means "no limit" -- existing subscribers are grandfathered
+    # for free by the migration itself, no special-casing needed. See
+    # subscriber_ops.try_consume_agent_interaction/try_consume_push.
+    Column("agent_interactions_remaining", Integer),
+    Column("pushes_remaining", Integer),
 )
 
 api_budget = Table(
@@ -180,6 +188,8 @@ ADDITIVE_COLUMNS: list[tuple[str, str, str]] = [
     ("subscribers", "push_consecutive_failures", "INTEGER"),
     ("subscribers", "search_count_date", "TEXT"),
     ("subscribers", "search_count_today", "INTEGER"),
+    ("subscribers", "agent_interactions_remaining", "INTEGER"),
+    ("subscribers", "pushes_remaining", "INTEGER"),
     ("source_pull_state", "last_article_dt", "TEXT"),
     ("categories", "sort_order", "INTEGER NOT NULL DEFAULT 0"),
     ("categories", "alerted_at", "TEXT"),

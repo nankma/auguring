@@ -65,6 +65,62 @@ def test_handle_decision_rejects_non_admin(isolated_subscribers_db, monkeypatch)
     sent.assert_not_called()
 
 
+def _make_trial_reset_update(from_id, chat_id, kind):
+    query = MagicMock()
+    query.from_user = SimpleNamespace(id=from_id)
+    query.data = f"trial:{kind}:{chat_id}"
+    query.answer = AsyncMock()
+    query.edit_message_text = AsyncMock()
+    query.message = SimpleNamespace(text="Subscriber 50 reached their AI interaction trial limit.")
+    update = MagicMock()
+    update.callback_query = query
+    return update
+
+
+def test_handle_trial_reset_resets_agent_limit(isolated_subscribers_db, monkeypatch):
+    sent = _patch_bot(monkeypatch)
+    subscriber_ops.request_access(50, "oscar", "Oscar")
+    subscriber_ops.decide(50, approved=True)
+    subscriber_ops.set_agent_interactions_remaining(50, 0)
+    update = _make_trial_reset_update(from_id=999, chat_id=50, kind="reset_agent")
+
+    asyncio.run(admin_bot.handle_trial_reset(update, _make_context()))
+
+    assert subscriber_ops.get_agent_interactions_remaining(50) == subscriber_ops.TRIAL_AGENT_INTERACTION_LIMIT
+    update.callback_query.edit_message_text.assert_called_once()
+    sent.assert_called_once()
+    assert "reset" in sent.call_args.kwargs["text"].lower()
+
+
+def test_handle_trial_reset_resets_push_limit_and_re_enables(isolated_subscribers_db, monkeypatch):
+    sent = _patch_bot(monkeypatch)
+    subscriber_ops.request_access(51, "peggy", "Peggy")
+    subscriber_ops.decide(51, approved=True)
+    subscriber_ops.set_pushes_remaining(51, 0)
+    subscriber_ops.set_push_enabled(51, False)
+    update = _make_trial_reset_update(from_id=999, chat_id=51, kind="reset_push")
+
+    asyncio.run(admin_bot.handle_trial_reset(update, _make_context()))
+
+    assert subscriber_ops.get_pushes_remaining(51) == subscriber_ops.TRIAL_PUSH_LIMIT
+    assert subscriber_ops.get_push_enabled(51) is True
+    sent.assert_called_once()
+
+
+def test_handle_trial_reset_rejects_non_admin(isolated_subscribers_db, monkeypatch):
+    sent = _patch_bot(monkeypatch)
+    subscriber_ops.request_access(52, "quentin", "Quentin")
+    subscriber_ops.decide(52, approved=True)
+    subscriber_ops.set_agent_interactions_remaining(52, 0)
+    update = _make_trial_reset_update(from_id=111, chat_id=52, kind="reset_agent")
+
+    asyncio.run(admin_bot.handle_trial_reset(update, _make_context(admin_chat_id=999)))
+
+    assert subscriber_ops.get_agent_interactions_remaining(52) == 0
+    update.callback_query.answer.assert_called_once_with("Not authorized.", show_alert=True)
+    sent.assert_not_called()
+
+
 # --- A4 message building --------------------------------------------------
 
 

@@ -14,6 +14,7 @@ questions before implementation starts, same pattern as
 | 3 | Multi-user subscribers + DB-backed sessions | Partially done — approval status (#1), per-user `interests`, and now `language` (#2) are all live; sources/conversation-history persistence still missing | Normal — extend for #4 |
 | 4 | Per-user search-source configuration | Not started | Normal — depends on #3 |
 | 5 | Proactive news push (per-user configurable interval digest) | **Done — see below** | Was deferred, now built at the user's request (2026-08-08) |
+| 6 | Free-trial usage caps (per-subscriber AI-interaction and push limits) | **Done — see below** | Built 2026-09-19 at the user's request |
 
 ## 1. Bot access control — done
 
@@ -331,6 +332,52 @@ and can fail the same way.
 (e.g. many users watching "OpenAI") is still not implemented — each
 subscriber's cycle fetches independently. Noted as a future optimization,
 not needed at current scale (owner + a friend or two).
+
+## 6. Free-trial usage caps — done
+
+Two independent, per-subscriber allowances, assigned once at approval
+time (`subscriber_ops.decide`) from `trial.agent_interaction_limit`
+(default 50) / `trial.push_limit` (default 20): an AI-agent interaction
+count and a news-push count. Each decrements on use; hitting zero cuts
+that ONE mechanism off for that ONE subscriber (not the whole bot), and
+pings the admin with a "Reset" button.
+
+**Stored as remaining-count columns, not used-count** (`subscribers.
+agent_interactions_remaining`/`pushes_remaining`) — `NULL` or `-1` means
+unlimited. This was a deliberate schema choice: since the two new columns
+are additive (`storage/schema.py`'s `ADDITIVE_COLUMNS`), every subscriber
+approved before this shipped gets `NULL` for free the moment the
+migration runs, with no backfill/grandfathering code needed at all. Only
+a subscriber who goes through `decide(chat_id, approved=True)` AFTER this
+shipped gets a real, finite allowance.
+
+**Where each is checked** — both deliberately as early as possible, before
+any paid work happens for that request/cycle:
+- AI interactions: `bot.process_message`, right after the `interest_sessions`
+  continuation bypass and right before layer 2's paid router call. An
+  exploration already in progress is NOT re-checked turn by turn — it
+  runs to its own natural end (`interest_finder.MAX_TURNS` already bounds
+  that to at most a couple more turns), rather than cutting a subscriber
+  off mid-conversation. A brand-new request past the limit gets
+  `TRIAL_AGENT_LIMIT_MESSAGE` and never reaches the router.
+- Pushes: `news_push.run_push_cycle`, right after the due-check, before
+  any candidate-article/digest work for that subscriber's cycle. One
+  "push" = one cycle, not one per-interest message — consuming happens
+  once regardless of how many interests get sent that cycle. A limited
+  subscriber sees their remaining count appended to each digest they
+  still receive (omitted entirely for an unlimited one).
+
+**Admin notification is a deliberate, narrow exception to the 2026-08-28
+Logfire-alerts split** (`news_push._push_job` dropped direct admin-Telegram
+access that day because the retry loop no longer decided anything alert-
+worthy). A subscriber hitting a trial limit needs a human DECISION (reset
+or leave it), the same shape as `notify_admin`'s existing new-access-request
+ping — not an ops-health signal, so it doesn't belong on the ops-alerts
+side of that split. `admin_bot.py`'s "Reset" button
+(`trial:reset_agent:{chat_id}` / `trial:reset_push:{chat_id}`) restores
+the subscriber's CURRENT `trial.*_limit` setting (not whatever it was
+when they were first approved), and a push reset also re-enables
+`push_enabled` (hitting the limit turned it off).
 
 ## Other messaging platforms (evaluated, not pursued)
 

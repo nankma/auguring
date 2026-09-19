@@ -463,6 +463,60 @@ def test_handle_message_blocked_by_router_off_topic(isolated_subscribers_db, mon
     )
 
 
+def test_handle_message_blocked_by_trial_limit(isolated_subscribers_db, monkeypatch):
+    """The cost-avoidance guarantee this whole check exists for: a
+    subscriber with no interactions left never reaches the router, let
+    alone the agent loop."""
+    subscriber_ops.request_access(50, "oscar", "Oscar")
+    subscriber_ops.decide(50, approved=True)
+    subscriber_ops.set_agent_interactions_remaining(50, 0)
+    monkeypatch.setattr(bot.guardrails, "fails_local_prefilter", MagicMock(return_value=False))
+    classify_mock = MagicMock()
+    monkeypatch.setattr(bot.guardrails, "classify_message", classify_mock)
+    notify = AsyncMock()
+    monkeypatch.setattr(bot, "_notify_admin_of_trial_limit", notify)
+    update = _make_update(chat_id=50, text="What's new with OpenAI?")
+    context = _make_context(admin_chat_id=999)
+    context.bot_data["model"] = "fake-model"
+
+    asyncio.run(bot.handle_message(update, context))
+
+    classify_mock.assert_not_called()
+    update.message.reply_text.assert_called_once_with(
+        bot.TRIAL_AGENT_LIMIT_MESSAGE, parse_mode=bot.ParseMode.HTML
+    )
+    notify.assert_called_once_with("fake-admin-token", 999, 50, "AI interaction", "reset_agent")
+
+
+def test_handle_message_not_blocked_with_interactions_remaining(isolated_subscribers_db, monkeypatch):
+    subscriber_ops.request_access(51, "peggy", "Peggy")
+    subscriber_ops.decide(51, approved=True)
+    subscriber_ops.set_agent_interactions_remaining(51, 3)
+    _bypass_guardrails(monkeypatch)
+    monkeypatch.setattr(bot, "search_news", MagicMock(return_value="<b>Hi</b>"))
+    update = _make_update(chat_id=51)
+    context = _make_context(admin_chat_id=999)
+    context.bot_data["model"] = "fake-model"
+
+    asyncio.run(bot.handle_message(update, context))
+
+    assert subscriber_ops.get_agent_interactions_remaining(51) == 2
+    update.message.reply_text.assert_called_once_with("<b>Hi</b>", parse_mode=bot.ParseMode.HTML)
+
+
+def test_notify_admin_of_trial_limit_sends_a_reset_button(monkeypatch):
+    sent = AsyncMock()
+    monkeypatch.setattr(bot, "Bot", lambda token: MagicMock(send_message=sent))
+
+    asyncio.run(bot._notify_admin_of_trial_limit("tok", 42, 50, "AI interaction", "reset_agent"))
+
+    kwargs = sent.call_args.kwargs
+    assert kwargs["chat_id"] == 42
+    assert "50" in kwargs["text"] and "AI interaction" in kwargs["text"]
+    button = kwargs["reply_markup"].inline_keyboard[0][0]
+    assert button.callback_data == "trial:reset_agent:50"
+
+
 def test_handle_message_passes_chat_id_and_history_to_search_news(isolated_subscribers_db, monkeypatch):
     # news_query is the only category dispatched to search_news (Route A)
     # -- see docs/plans/context-management-plan.md's settings-dispatch
@@ -933,6 +987,28 @@ def test_push_job_with_no_embedder_in_bot_data_passes_none(monkeypatch):
     asyncio.run(bot._push_job(context))
 
     assert run_push_cycle.call_args.kwargs["embedder"] is None
+
+
+def test_push_job_wires_the_push_limit_notification_correctly(monkeypatch):
+    """`run_push_cycle`'s `notify_admin` kwarg is a closure built inside
+    `_push_job` -- mocking `run_push_cycle` (as the two tests above do)
+    means that closure is captured but never actually called, so it never
+    gets exercised. Call it directly here to prove it threads the real
+    `admin_bot_token`/`admin_chat_id` and the right label/reset_kind
+    through to `_notify_admin_of_trial_limit`, not just that SOME
+    callable gets passed."""
+    context = _make_context(admin_chat_id=999)
+    context.bot = MagicMock()
+    run_push_cycle = AsyncMock()
+    monkeypatch.setattr(bot.news_push, "run_push_cycle", run_push_cycle)
+    notify = AsyncMock()
+    monkeypatch.setattr(bot, "_notify_admin_of_trial_limit", notify)
+
+    asyncio.run(bot._push_job(context))
+    notify_admin_of_push_limit = run_push_cycle.call_args.kwargs["notify_admin"]
+    asyncio.run(notify_admin_of_push_limit(60))
+
+    notify.assert_called_once_with("fake-admin-token", 999, 60, "news push", "reset_push")
 
 
 def test_ingest_job_threads_the_bot_datas_embedder_through(monkeypatch):

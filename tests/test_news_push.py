@@ -1999,6 +1999,67 @@ def test_a_quiet_cycle_between_failures_does_not_clear_the_strikes(monkeypatch, 
     assert subscriber_ops.get_push_enabled(25) is False
 
 
+# --- Free-trial push allowance (requested 2026-09-18) ---------------------
+# Unlike the unreachable-strike tests above, this is a deliberate,
+# business-policy cutoff, not a delivery-failure signal -- see
+# news_push._stop_push_at_trial_limit's own docstring.
+
+
+def test_push_stops_and_notifies_admin_when_trial_limit_reached(monkeypatch, isolated_subscribers_db, recorded_outcomes):
+    subscriber_ops.request_access(60, "sybil", "Sybil")
+    subscriber_ops.decide(60, approved=True)
+    subscriber_ops.set_pushes_remaining(60, 0)
+    subscriber_ops.set_push_enabled(60, True)
+    monkeypatch.setattr(subscriber_ops, "list_push_enabled_subscribers", lambda: [_subscriber(60)])
+    _stub_cache_and_categories(monkeypatch)
+    send = AsyncMock()
+    notify_admin = AsyncMock()
+
+    asyncio.run(news_push.run_push_cycle(model="fake-model", send=send,
+                                         now=datetime(2026, 8, 8, 13, 0, tzinfo=timezone.utc),
+                                         notify_admin=notify_admin))
+
+    send.assert_not_called()
+    assert subscriber_ops.get_push_enabled(60) is False
+    assert push_outcome_ops.PUSH_TRIAL_LIMIT_REACHED in recorded_outcomes(60)
+    notify_admin.assert_called_once_with(60)
+
+
+def test_push_is_not_stopped_or_charged_twice_in_one_cycle_check(monkeypatch, isolated_subscribers_db):
+    """A subscriber with allowance left is charged exactly once per
+    cycle, regardless of how many of their interests get sent."""
+    subscriber_ops.request_access(61, "trent", "Trent")
+    subscriber_ops.decide(61, approved=True)
+    subscriber_ops.set_pushes_remaining(61, 5)
+
+    _cycle_with(monkeypatch, chat_id=61, mark_links_shown=MagicMock())
+
+    assert subscriber_ops.get_pushes_remaining(61) == 4
+
+
+def test_push_digest_includes_remaining_count_when_limited(monkeypatch, isolated_subscribers_db):
+    subscriber_ops.request_access(62, "uma", "Uma")
+    subscriber_ops.decide(62, approved=True)
+    subscriber_ops.set_pushes_remaining(62, 3)
+    send = AsyncMock()
+
+    _cycle_with(monkeypatch, chat_id=62, send=send, mark_links_shown=MagicMock())
+
+    sent_text = send.call_args[0][1]
+    assert "2 push(es) remaining" in sent_text
+
+
+def test_push_digest_omits_remaining_note_when_unlimited(monkeypatch, isolated_subscribers_db):
+    """No decide() call for this chat_id at all -- the same state every
+    subscriber approved before this feature existed is in."""
+    send = AsyncMock()
+
+    _cycle_with(monkeypatch, chat_id=63, send=send, mark_links_shown=MagicMock())
+
+    sent_text = send.call_args[0][1]
+    assert "remaining" not in sent_text
+
+
 def test_model_error_before_generation_does_not_advance_last_push_at(monkeypatch, isolated_subscribers_db, recorded_outcomes):
     """Nothing was generated, so nothing was billed -- there is no reason to
     make the subscriber wait a full interval for a transient provider blip."""

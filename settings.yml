@@ -276,6 +276,18 @@ interest_finder:
   max_turns: 8
   max_steps_per_turn: 20
 
+# Free-trial usage caps, assigned once per subscriber at approval time
+# (subscriber_ops.decide) -- see docs/plans/bot-features-plan.md section
+# 6. agent_interaction_limit: how many messages reach the router/agent
+# pipeline before that subscriber is cut off (admin-resettable).
+# push_limit: how many push cycles they receive before push turns off
+# (also admin-resettable, and re-enables push on reset). A subscriber
+# approved before this existed has no limit at all (NULL in the DB, not
+# this default) -- these numbers only ever apply to a NEW approval.
+trial:
+  agent_interaction_limit: 50
+  push_limit: 20
+
 # Per-subscriber account settings. default_interval_hours/
 # min_interval_hours: push-frequency default and floor a subscriber can
 # set. pushed_link_retention_hours: how long the "already sent this
