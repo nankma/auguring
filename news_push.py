@@ -930,9 +930,9 @@ def _strike_unreachable_subscriber(chat_id: int, now: datetime) -> None:
 
 
 async def _stop_push_at_trial_limit(chat_id: int, now: datetime, notify_admin) -> None:
-    """Turns push off once subscriber_ops.try_consume_push reports this
-    subscriber's free-trial allowance is exhausted -- same "only
-    push_enabled, everything else survives" reversibility as
+    """Turns push off once this subscriber's free-trial allowance
+    (subscriber_ops.get_pushes_remaining) is already at exactly 0 -- same
+    "only push_enabled, everything else survives" reversibility as
     _strike_unreachable_subscriber above, except an admin reset
     (subscriber_ops.reset_push_limit) is what turns it back on here, not
     the subscriber themselves.
@@ -1113,17 +1113,26 @@ async def run_push_cycle(model, send: "callable", now: datetime | None = None, e
             continue
         print(f"[news_push] chat_id={chat_id}: due -- checking for new articles")
 
-        # Free-trial push allowance (requested 2026-09-18), checked and
-        # consumed HERE -- before any real (paid) work for this cycle
-        # starts, same placement reasoning as the due-check just above.
-        # Consuming counts this cycle as one push regardless of how many
-        # of this subscriber's interests actually end up sent below (a
-        # "push" is one cycle, not one message -- see
-        # subscriber_ops.try_consume_push's own docstring).
-        if not subscriber_ops.try_consume_push(chat_id):
+        # Free-trial push allowance (requested 2026-09-18, refined
+        # 2026-09-19 after live testing on INT surfaced a real problem:
+        # consuming HERE, unconditionally, meant a cycle that found
+        # nothing worth sending could still spend a subscriber's only
+        # remaining push and leave them with nothing to show for it).
+        #
+        # This is now a PEEK, not a consume -- it only blocks a
+        # subscriber already sitting at exactly 0; it does not decrement.
+        # The actual decrement happens later, once and only once this
+        # cycle, at the moment a message is genuinely delivered (see the
+        # PUSH_DELIVERED branch below) -- the remaining count now means
+        # "pushes you will actually receive", not "cycles the scheduler
+        # is willing to attempt on your behalf". A subscriber sitting on
+        # their last unit can still cost a generation call on a cycle
+        # that ends up sending nothing; that is the accepted tradeoff for
+        # never silently spending the one thing this number promises them.
+        pushes_remaining = subscriber_ops.get_pushes_remaining(chat_id)
+        if pushes_remaining == 0:
             await _stop_push_at_trial_limit(chat_id, now, notify_admin)
             continue
-        pushes_remaining = subscriber_ops.get_pushes_remaining(chat_id)
 
         # What record_push must be told, and whether it must be told at
         # all. None until an LLM has been paid to write a digest; a list
@@ -1263,8 +1272,15 @@ async def run_push_cycle(model, send: "callable", now: datetime | None = None, e
                 # it earlier risks the output-topic check misreading a
                 # "you have N left" sentence as off-topic self-disclosure.
                 # Omitted entirely for an unlimited subscriber (None/-1).
+                #
+                # `pushes_remaining` above is the PRE-charge peek (the
+                # actual decrement happens once, after this loop, in the
+                # PUSH_DELIVERED branch) -- shown here minus 1 since a
+                # send is genuinely about to happen, so the number a
+                # subscriber sees always matches what it will be right
+                # after this message lands, not a stale pre-charge value.
                 if pushes_remaining is not None and pushes_remaining != -1:
-                    digest = f"{digest}\n\nYou have {pushes_remaining} push(es) remaining in your trial."
+                    digest = f"{digest}\n\nYou have {pushes_remaining - 1} push(es) remaining in your trial."
 
                 try:
                     await send(chat_id, digest, topic=topic)
@@ -1315,6 +1331,14 @@ async def run_push_cycle(model, send: "callable", now: datetime | None = None, e
                 detail = f"{sent} interest(s)" + (f", {blocked} blocked" if blocked else "")
                 _record(chat_id, push_outcome_ops.PUSH_DELIVERED,
                         f"sent {sent} message(s), one per interest", now, detail=detail)
+                # The actual free-trial charge, deferred to here (see the
+                # peek-check earlier in this function): exactly one unit
+                # per cycle, regardless of how many interests got sent,
+                # and only now that PUSH_DELIVERED is the confirmed
+                # outcome. Guaranteed to still succeed (peeked >0 or
+                # unlimited before any work in this cycle started, and
+                # this process is single-threaded per cycle).
+                subscriber_ops.try_consume_push(chat_id)
             elif blocked:
                 _record(chat_id, push_outcome_ops.PUSH_BLOCKED,
                         f"{blocked} digest(s) blocked by output guardrail, none sent", now)
@@ -1353,6 +1377,16 @@ async def run_push_cycle(model, send: "callable", now: datetime | None = None, e
                 _record(chat_id, push_outcome_ops.PUSH_DELIVERED,
                         f"sent {sent} message(s), then model call failed with {detail}",
                         now, detail=outcome_detail)
+                # Same free-trial charge as the normal "sent wins" branch
+                # above -- found missing here by qa-engineer, 2026-09-19:
+                # a real digest DID reach this subscriber (that's exactly
+                # what "sent wins" means), so PUSH_DELIVERED here is just
+                # as chargeable as the un-interrupted case. This is now
+                # the SECOND exception handler with the same "sent wins"
+                # pattern below it, both mirroring this one exactly --
+                # any fourth "sent wins, record PUSH_DELIVERED" site
+                # added later must charge here too, not just record.
+                subscriber_ops.try_consume_push(chat_id)
             else:
                 _record(chat_id, push_outcome_ops.PUSH_MODEL_ERROR,
                         f"model call failed with {detail}", now, detail=detail)
@@ -1369,6 +1403,9 @@ async def run_push_cycle(model, send: "callable", now: datetime | None = None, e
                 _record(chat_id, push_outcome_ops.PUSH_DELIVERED,
                         f"sent {sent} message(s), then cycle failed with {detail}",
                         now, detail=outcome_detail)
+                # Same charge, same reasoning as the _ModelStageError
+                # branch above -- see its own comment.
+                subscriber_ops.try_consume_push(chat_id)
             else:
                 _record(chat_id, push_outcome_ops.PUSH_CYCLE_FAILED,
                         f"cycle failed with {detail}", now, detail=detail)

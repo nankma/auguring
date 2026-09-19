@@ -626,7 +626,7 @@ def test_an_unclear_reply_leaves_the_proposal_pending_and_falls_through(monkeypa
     assert result["reply"] == "Can you say more?"
 
 
-def test_confirmation_classifier_receives_the_assistants_last_reply(monkeypatch):
+def test_confirmation_classifier_receives_the_assistants_last_reply(monkeypatch, isolated_subscribers_db):
     """bot.py must anchor classify_confirmation to what the assistant
     actually said last (history[-1]), not just the pending_proposal dict
     -- see classify_confirmation's own docstring for the 2026-09-10
@@ -644,7 +644,7 @@ def test_confirmation_classifier_receives_the_assistants_last_reply(monkeypatch)
     classify.assert_called_once_with("g", "yes", "I won't save that -- it wouldn't change anything.")
 
 
-def test_no_pending_proposal_never_calls_the_confirmation_classifier(monkeypatch):
+def test_no_pending_proposal_never_calls_the_confirmation_classifier(monkeypatch, isolated_subscribers_db):
     """The classifier is a real extra model call -- it must only fire
     when there's actually something to confirm, not on every turn."""
     run_turn = MagicMock(return_value=("ok", False))
@@ -721,7 +721,7 @@ def test_an_affirmed_proposal_translates_the_confirmation(monkeypatch, isolated_
     assert result["reply"] == "Se agregó semiconductores."
 
 
-def test_a_bare_yes_mid_exploration_skips_the_router_entirely(monkeypatch):
+def test_a_bare_yes_mid_exploration_skips_the_router_entirely(monkeypatch, isolated_subscribers_db):
     """The reason interest_sessions exists. "yes" carries no topical
     signal, so classifying it would route it somewhere unrelated and the
     conversation would fall apart -- the session check has to come first."""
@@ -749,7 +749,7 @@ def test_layer_1_still_runs_during_an_exploration(monkeypatch):
     assert result["blocked_at"] == "layer1_prefilter"
 
 
-def test_the_model_ending_the_exploration_clears_the_session(monkeypatch):
+def test_the_model_ending_the_exploration_clears_the_session(monkeypatch, isolated_subscribers_db):
     _start_session(monkeypatch, reply="All set.", done=True)
     bot.interest_sessions[7] = {"turns": 1}
 
@@ -758,7 +758,7 @@ def test_the_model_ending_the_exploration_clears_the_session(monkeypatch):
     assert 7 not in bot.interest_sessions
 
 
-def test_the_turn_ceiling_ends_an_exploration_that_never_converges(monkeypatch):
+def test_the_turn_ceiling_ends_an_exploration_that_never_converges(monkeypatch, isolated_subscribers_db):
     """The oscillation case the user asked for by name: someone who keeps
     switching direction gets told honestly it isn't working, rather than
     being looped forever. Enforced by a counter here, not by asking the
@@ -774,7 +774,7 @@ def test_the_turn_ceiling_ends_an_exploration_that_never_converges(monkeypatch):
     assert 7 not in bot.interest_sessions
 
 
-def test_an_exploration_survives_up_to_the_ceiling(monkeypatch):
+def test_an_exploration_survives_up_to_the_ceiling(monkeypatch, isolated_subscribers_db):
     """The other side of the cap -- an off-by-one here would cut a real
     conversation short one turn early."""
     run_turn = _start_session(monkeypatch)
@@ -786,7 +786,7 @@ def test_an_exploration_survives_up_to_the_ceiling(monkeypatch):
     assert 7 in bot.interest_sessions
 
 
-def test_a_failing_turn_clears_the_session(monkeypatch):
+def test_a_failing_turn_clears_the_session(monkeypatch, isolated_subscribers_db):
     """Leaving a stale session behind would silently swallow every
     subsequent message from this chat -- worse than the failure itself."""
     _start_session(monkeypatch)
@@ -800,7 +800,7 @@ def test_a_failing_turn_clears_the_session(monkeypatch):
     assert 7 not in bot.interest_sessions
 
 
-def test_a_layer_4_block_clears_the_session(monkeypatch):
+def test_a_layer_4_block_clears_the_session(monkeypatch, isolated_subscribers_db):
     _start_session(monkeypatch)
     monkeypatch.setattr(bot.guardrails, "is_output_on_topic", MagicMock(return_value=False))
     bot.interest_sessions[7] = {"turns": 1}
@@ -812,15 +812,15 @@ def test_a_layer_4_block_clears_the_session(monkeypatch):
     assert 7 not in bot.interest_sessions
 
 
-def test_trial_limit_does_not_interrupt_an_open_exploration(monkeypatch, isolated_subscribers_db):
-    """Explicit 2026-09-18 design decision, committed regression guard for
-    it (previously only checked live, this session, against a real
-    model): a subscriber whose agent-interaction allowance ran out WHILE
-    an exploration was already open still gets this turn served normally
-    -- the trial-limit check in process_message sits after the
-    interest_sessions bypass, not before, deliberately.
-    interest_finder.MAX_TURNS already bounds how many more turns this can
-    cost, cheaper than cutting them off mid-conversation."""
+def test_trial_limit_interrupts_an_open_exploration(monkeypatch, isolated_subscribers_db):
+    """Reversed 2026-09-19 after live INT testing: the original design
+    (see this test's own prior name/docstring in git history) exempted an
+    already-open exploration's own turns from the trial-limit check,
+    which in practice looked like "no limit" to a subscriber who just
+    kept an exploration open. Every turn now spends one interaction,
+    continuation or not, and running out mid-exploration both blocks the
+    turn and clears the session -- it isn't left dangling for the
+    subscriber to keep bumping into."""
     run_turn = _start_session(monkeypatch)
     bot.interest_sessions[7] = {"turns": 1}
     subscriber_ops.request_access(7, "walt", "Walt")
@@ -829,8 +829,10 @@ def test_trial_limit_does_not_interrupt_an_open_exploration(monkeypatch, isolate
 
     result = asyncio.run(bot.process_message(7, "tell me more", "m", "g"))
 
-    run_turn.assert_called_once()
-    assert result["blocked_at"] is None
+    run_turn.assert_not_called()
+    assert result["blocked_at"] == "trial_limit_reached"
+    assert result["reply"] == bot.TRIAL_AGENT_LIMIT_MESSAGE
+    assert 7 not in bot.interest_sessions
 
 
 @pytest.mark.parametrize("category", ["set_interest", "remove_interest", "set_language"])
@@ -869,7 +871,7 @@ def test_find_interests_wins_a_multi_category_turn(monkeypatch, isolated_subscri
     run_turn.assert_called_once()
 
 
-def test_an_exploration_turn_is_kept_in_history(monkeypatch):
+def test_an_exploration_turn_is_kept_in_history(monkeypatch, isolated_subscribers_db):
     """Follow-ups are only intelligible in context -- "the second one"
     means nothing without the message that listed them."""
     _start_session(monkeypatch)

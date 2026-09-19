@@ -2060,6 +2060,25 @@ def test_push_digest_omits_remaining_note_when_unlimited(monkeypatch, isolated_s
     assert "remaining" not in sent_text
 
 
+def test_push_allowance_is_not_charged_when_nothing_is_sent(monkeypatch, isolated_subscribers_db):
+    """The real bug found live on INT, 2026-09-19: charging as soon as a
+    subscriber was due (before knowing whether the cycle would actually
+    produce anything) meant their one remaining push could be spent on a
+    cycle that sent them nothing at all -- a subscriber's last unit
+    disappearing with nothing to show for it. The charge now only
+    happens on a genuine PUSH_DELIVERED outcome; a peek (not a consume)
+    still gates entry so an exhausted subscriber's cycle never runs at
+    all (see test_push_stops_and_notifies_admin_when_trial_limit_reached
+    above)."""
+    subscriber_ops.request_access(64, "victor", "Victor")
+    subscriber_ops.decide(64, approved=True)
+    subscriber_ops.set_pushes_remaining(64, 1)
+
+    _cycle_with(monkeypatch, chat_id=64, digest="", mark_links_shown=MagicMock())
+
+    assert subscriber_ops.get_pushes_remaining(64) == 1
+
+
 def test_model_error_before_generation_does_not_advance_last_push_at(monkeypatch, isolated_subscribers_db, recorded_outcomes):
     """Nothing was generated, so nothing was billed -- there is no reason to
     make the subscriber wait a full interval for a transient provider blip."""
@@ -2593,3 +2612,45 @@ def test_a_later_interests_model_failure_still_records_delivered(
     detail = recorded_outcomes.detail_for(50)
     assert "1 interest(s) sent" in detail
     assert "model call failed" in detail
+
+
+def test_a_later_interests_model_failure_still_charges_the_trial_allowance(
+    monkeypatch, isolated_subscribers_db,
+):
+    """The real gap qa-engineer found, 2026-09-19: PUSH_DELIVERED can also
+    be recorded from the "sent wins over a later failure" exception
+    branches above (same real 2026-09-03 incident this test mirrors), not
+    just the normal end-of-loop branch -- a subscriber with a finite
+    allowance who genuinely received a digest through THIS path was never
+    being charged for it, a real free-push leak. Same setup as
+    test_a_later_interests_model_failure_still_records_delivered above,
+    minus the outcome/detail assertions that test already covers."""
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
+    subscriber_ops.request_access(65, "yolanda", "Yolanda")
+    subscriber_ops.decide(65, approved=True)
+    subscriber_ops.set_pushes_remaining(65, 1)
+    sub = _subscriber(65, interests=["AI", "Robotics"])
+    monkeypatch.setattr(subscriber_ops, "list_push_enabled_subscribers", lambda: [sub])
+    monkeypatch.setattr(subscriber_ops, "mark_links_shown", MagicMock())
+    monkeypatch.setattr(subscriber_ops, "advance_last_push_at", MagicMock())
+    _stub_cache_and_categories(monkeypatch)
+
+    by_topic = {"AI": ["https://e.com/ai2"], "Robotics": ["https://e.com/robots2"]}
+
+    def fake_select(cached, topics, cats, since, already_pushed, **kwargs):
+        topic = topics[0]
+        return [{**_article(link), "topic": topic}
+                for link in by_topic.get(topic, []) if link not in already_pushed]
+
+    monkeypatch.setattr(news_push, "select_candidate_articles", fake_select)
+    monkeypatch.setattr(
+        news_push, "write_push_digest",
+        MagicMock(side_effect=[
+            '<b>D</b> <a href="https://e.com/ai2">s</a>',
+            RuntimeError("Request timed out."),
+        ]))
+    monkeypatch.setattr(news_push.guardrails, "is_output_on_topic", lambda model, digest: True)
+
+    asyncio.run(news_push.run_push_cycle(model="fake-model", send=AsyncMock(), now=now))
+
+    assert subscriber_ops.get_pushes_remaining(65) == 0
