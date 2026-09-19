@@ -366,8 +366,13 @@ def get_pushes_remaining(chat_id: int) -> int | None:
 
 def try_consume_push(chat_id: int) -> bool:
     """Same shape as try_consume_agent_interaction above, for the separate
-    push allowance -- news_push.py calls this once per subscriber per
-    cycle, before doing any of that cycle's real (paid) work."""
+    push allowance. Unlike that one, `news_push.py` does NOT call this
+    up front -- entry to a cycle is gated by a plain peek
+    (get_pushes_remaining) so an exhausted subscriber's cycle never runs
+    real (paid) work, but the actual charge here fires exactly once per
+    cycle, only at the point a message is genuinely delivered
+    (`push_outcome_ops.PUSH_DELIVERED`) -- see news_push.run_push_cycle's
+    own comments for why (2026-09-19 revision, found via live testing)."""
     return get_storage().try_consume_push(chat_id)
 
 

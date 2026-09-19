@@ -802,6 +802,27 @@ async def process_message(chat_id: int, user_text: str, model, guard_model, embe
         if guardrails.fails_local_prefilter(user_text):
             return {"blocked_at": "layer1_prefilter", "category": None, "reply": guardrails.REDIRECT_MESSAGE}
 
+        # Free-trial usage cap (requested 2026-09-18, changed 2026-09-19
+        # after live INT testing surfaced that the original placement --
+        # after the interest_sessions bypass, so an open exploration's own
+        # turns were never re-checked -- read as "no limit" to a
+        # subscriber who kept an exploration open past their allowance.
+        # Every turn now spends one interaction if the subscriber has a
+        # finite allowance, whether it opens a new request or continues
+        # one already in progress. Checked before the interest_sessions
+        # bypass below AND before layer 2's paid router call for a
+        # brand-new request -- the cheapest correct place either way,
+        # same reasoning as layer 1 running first. If this blocks a turn
+        # that WAS continuing an open exploration, that session is
+        # cleared too (pop is a safe no-op otherwise) -- same "don't
+        # leave a dead session behind" rule every other hard stop out of
+        # _process_find_interests already follows. See
+        # subscriber_ops.try_consume_agent_interaction's own docstring
+        # for what "no limit" (NULL/-1) means.
+        if not subscriber_ops.try_consume_agent_interaction(chat_id):
+            interest_sessions.pop(chat_id, None)
+            return {"blocked_at": "trial_limit_reached", "category": None, "reply": TRIAL_AGENT_LIMIT_MESSAGE}
+
         # An in-flight interest exploration takes precedence over layer 2 --
         # deliberately, and this ordering is the whole point of
         # interest_sessions. A follow-up like "yes" or "the second one"
@@ -813,20 +834,6 @@ async def process_message(chat_id: int, user_text: str, model, guard_model, embe
         # below on whatever the exploration replies.
         if chat_id in interest_sessions:
             return await _process_find_interests(chat_id, user_text, model, guard_model, embedder)
-
-        # Free-trial usage cap (requested 2026-09-18): checked here, not
-        # before the interest_sessions bypass above, so an exploration
-        # already in progress runs to its own natural end even if this
-        # message would have been the one to exhaust the allowance --
-        # interest_finder.MAX_TURNS already bounds that to at most a
-        # couple more turns, cheaper than the alternative of cutting a
-        # subscriber off mid-conversation. A brand-new request past the
-        # limit is stopped here, before layer 2's paid router call --
-        # the cheapest correct place, same reasoning as layer 1 running
-        # first. See subscriber_ops.try_consume_agent_interaction's own
-        # docstring for what "no limit" (NULL/-1) means.
-        if not subscriber_ops.try_consume_agent_interaction(chat_id):
-            return {"blocked_at": "trial_limit_reached", "category": None, "reply": TRIAL_AGENT_LIMIT_MESSAGE}
 
         # Guardrail layer 2 -- the router (docs/plans/context-management-plan.md):
         # one structured-output call answers "is this on-topic", "what kind of

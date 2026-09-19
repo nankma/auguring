@@ -351,21 +351,35 @@ migration runs, with no backfill/grandfathering code needed at all. Only
 a subscriber who goes through `decide(chat_id, approved=True)` AFTER this
 shipped gets a real, finite allowance.
 
-**Where each is checked** — both deliberately as early as possible, before
-any paid work happens for that request/cycle:
-- AI interactions: `bot.process_message`, right after the `interest_sessions`
-  continuation bypass and right before layer 2's paid router call. An
-  exploration already in progress is NOT re-checked turn by turn — it
-  runs to its own natural end (`interest_finder.MAX_TURNS` already bounds
-  that to at most a couple more turns), rather than cutting a subscriber
-  off mid-conversation. A brand-new request past the limit gets
-  `TRIAL_AGENT_LIMIT_MESSAGE` and never reaches the router.
-- Pushes: `news_push.run_push_cycle`, right after the due-check, before
-  any candidate-article/digest work for that subscriber's cycle. One
-  "push" = one cycle, not one per-interest message — consuming happens
-  once regardless of how many interests get sent that cycle. A limited
-  subscriber sees their remaining count appended to each digest they
-  still receive (omitted entirely for an unlimited one).
+**Where each is checked:**
+- AI interactions: `bot.process_message`, before the `interest_sessions`
+  continuation bypass and before layer 2's paid router call — the
+  cheapest correct place either way. **Revised 2026-09-19, live on INT**:
+  the original version checked this only for a brand-new request,
+  deliberately exempting an already-open exploration's own turns (see git
+  history) so a conversation would run to its own natural end rather than
+  being cut off mid-flow. Live testing showed this reads as "no limit" in
+  practice — a subscriber who just kept an exploration open never got
+  re-checked. Every turn now spends one interaction, continuation or not;
+  exhausting it mid-exploration both returns `TRIAL_AGENT_LIMIT_MESSAGE`
+  and clears the session, so it isn't left dangling.
+- Pushes: `news_push.run_push_cycle`. **Also revised 2026-09-19, live on
+  INT**: the original version consumed the allowance as soon as a
+  subscriber was found due, before knowing whether the cycle would
+  actually produce anything to send — live testing surfaced this as a
+  real problem: a subscriber's only remaining push could be, and was,
+  spent on a cycle that judged nothing relevant and sent them nothing at
+  all. Now a PEEK (not a consume) gates entry — blocking only a
+  subscriber already at exactly 0, so cost control is unchanged — and the
+  actual decrement happens once, only at the moment a message is
+  genuinely delivered (`push_outcome_ops.PUSH_DELIVERED`). One "push" =
+  one delivered cycle, not one per-interest message, regardless of how
+  many interests get sent that cycle. A limited subscriber sees their
+  post-charge remaining count appended to each digest they receive
+  (omitted entirely for an unlimited one). The tradeoff accepted: a
+  subscriber on their last unit can still cost one generation call on a
+  cycle that ends up sending nothing — preferred over ever silently
+  spending the one thing this number promises them.
 
 **Admin notification is a deliberate, narrow exception to the 2026-08-28
 Logfire-alerts split** (`news_push._push_job` dropped direct admin-Telegram
