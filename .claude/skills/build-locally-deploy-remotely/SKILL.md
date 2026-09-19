@@ -316,6 +316,30 @@ gotcha already noted elsewhere in this project's deploy history (orphaned
 times is "something else already had the port," not any one specific
 tool.
 
+## A cold container's cache can genuinely be empty for several minutes
+
+If the news-cache backend is `sqlite_vec` (INT, as of the 2026-09-06
+cutover) and the container has been freshly created/restarted, don't
+trust an early "No related news found" smoke-test reply as a regression
+without checking the timing first. Real incident, 2026-09-18 (PR #101
+deploy): a fresh container's first ingest tick runs
+`cleanup_expired()` (48h TTL) *before* the real fetch+classify+embed+write
+pipeline refills the store — if the store's existing rows are all older
+than 48h (e.g. a store last populated by a one-off script days earlier,
+not by live traffic), cleanup can archive 100% of it in one shot, and the
+refill takes real wall-clock time (classification + embedding of
+1000+ articles across many sources, sequential model calls) — easily
+10-15 minutes. Smoke queries sent inside that window get a genuine,
+correctly-behaving empty result (not blocked, not erroring) because the
+active pool really is empty at that moment, not because search itself is
+broken. Confirmed via direct sqlite3 inspection (`select count(*) from
+articles where archived_at is null`) that the count went from 0 to 1554
+on its own, and the exact same queries that had returned empty then
+returned correct, real trend reports. If an early smoke case looks like a
+relevance-gate failure right after a cold start specifically, wait for
+one full ingest cycle to finish (or re-check the active-row count) before
+concluding it's a regression.
+
 ## After every deploy: run the smoke test
 
 **Step 4, always, no exceptions:** after the container is restarted on the
