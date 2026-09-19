@@ -929,6 +929,28 @@ def _strike_unreachable_subscriber(chat_id: int, now: datetime) -> None:
             now, detail=detail)
 
 
+async def _stop_push_at_trial_limit(chat_id: int, now: datetime, notify_admin) -> None:
+    """Turns push off once subscriber_ops.try_consume_push reports this
+    subscriber's free-trial allowance is exhausted -- same "only
+    push_enabled, everything else survives" reversibility as
+    _strike_unreachable_subscriber above, except an admin reset
+    (subscriber_ops.reset_push_limit) is what turns it back on here, not
+    the subscriber themselves.
+
+    `notify_admin` is `async def notify_admin(chat_id: int) -> None` --
+    same injected-callable shape as `send` (run_push_cycle's own
+    docstring), so this module still needs no live Bot/Application to
+    test. None (the default) skips notification silently, same as
+    `embedder=None` being an optional enhancement elsewhere in this
+    module -- a deployment with no admin configured still turns push off
+    correctly, it just doesn't tell anyone."""
+    subscriber_ops.set_push_enabled(chat_id, False)
+    _record(chat_id, push_outcome_ops.PUSH_TRIAL_LIMIT_REACHED,
+            "free-trial push allowance exhausted -- push turned off", now)
+    if notify_admin is not None:
+        await notify_admin(chat_id)
+
+
 def _record(chat_id: int, outcome: str, message: str, now: datetime,
             detail: str | None = None) -> None:
     """Reports a push outcome two ways, from one call site so they cannot
@@ -1012,7 +1034,8 @@ def is_subscriber_due(last_push_at: datetime | None, interval_hours: int, now: d
     return elapsed_hours >= interval_hours
 
 
-async def run_push_cycle(model, send: "callable", now: datetime | None = None, embedder=None) -> None:
+async def run_push_cycle(model, send: "callable", now: datetime | None = None, embedder=None,
+                         notify_admin: "callable" = None) -> None:
     """One scheduler tick: for every push-enabled, due subscriber with at
     least one interest, select candidate articles from the shared cache,
     and if there are any, write and send a digest. `send` is
@@ -1026,6 +1049,13 @@ async def run_push_cycle(model, send: "callable", now: datetime | None = None, e
     including ticks where nobody was due -- not just when something
     actually sends. See _record for why both, and
     docs/plans/incident-monitoring-plan.md for what reads the rows.
+
+    `notify_admin=None` (the default): `async def notify_admin(chat_id: int)
+    -> None`, called only when a subscriber's free-trial push allowance
+    runs out (see `_stop_push_at_trial_limit`) -- everything else here
+    still reports through `_record`/Logfire, not this. None is a safe
+    default (no admin configured, or a test that doesn't care), same
+    "optional, degrades quietly" shape as `embedder=None`.
 
     `embedder=None` (the default) threads straight through to every
     select_candidate_articles call, which degrades near-duplicate
@@ -1082,6 +1112,18 @@ async def run_push_cycle(model, send: "callable", now: datetime | None = None, e
             )
             continue
         print(f"[news_push] chat_id={chat_id}: due -- checking for new articles")
+
+        # Free-trial push allowance (requested 2026-09-18), checked and
+        # consumed HERE -- before any real (paid) work for this cycle
+        # starts, same placement reasoning as the due-check just above.
+        # Consuming counts this cycle as one push regardless of how many
+        # of this subscriber's interests actually end up sent below (a
+        # "push" is one cycle, not one message -- see
+        # subscriber_ops.try_consume_push's own docstring).
+        if not subscriber_ops.try_consume_push(chat_id):
+            await _stop_push_at_trial_limit(chat_id, now, notify_admin)
+            continue
+        pushes_remaining = subscriber_ops.get_pushes_remaining(chat_id)
 
         # What record_push must be told, and whether it must be told at
         # all. None until an LLM has been paid to write a digest; a list
@@ -1215,6 +1257,14 @@ async def run_push_cycle(model, send: "callable", now: datetime | None = None, e
                 if not _model_call(guardrails.is_output_on_topic, model, digest):
                     blocked += 1
                     continue
+
+                # Appended after the guardrail check, not before -- fixed,
+                # non-model text has nothing to be checked, and appending
+                # it earlier risks the output-topic check misreading a
+                # "you have N left" sentence as off-topic self-disclosure.
+                # Omitted entirely for an unlimited subscriber (None/-1).
+                if pushes_remaining is not None and pushes_remaining != -1:
+                    digest = f"{digest}\n\nYou have {pushes_remaining} push(es) remaining in your trial."
 
                 try:
                     await send(chat_id, digest, topic=topic)

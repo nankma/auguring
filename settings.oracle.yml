@@ -214,6 +214,12 @@ interest_finder:
   max_turns: 8
   max_steps_per_turn: 20
 
+# Free-trial usage caps -- see settings.yml's own comment for the full
+# reasoning, and docs/plans/bot-features-plan.md section 6.
+trial:
+  agent_interaction_limit: 50
+  push_limit: 20
+
 subscription:
   default_interval_hours: 24
   min_interval_hours: 1

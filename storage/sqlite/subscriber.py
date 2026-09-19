@@ -31,11 +31,27 @@ class SubscriberMixin:
             ), {"chat_id": chat_id, "username": username, "first_name": first_name,
                 "status": status, "requested_at": requested_at})
 
-    def decide(self, chat_id: int, status: str, decided_at: str) -> None:
+    def decide(self, chat_id: int, status: str, decided_at: str,
+               agent_interactions_remaining: int | None = None,
+               pushes_remaining: int | None = None) -> None:
+        """`agent_interactions_remaining`/`pushes_remaining` are the trial
+        allowances to assign on approval (None on a deny, or when the
+        caller passes nothing) -- see subscriber_ops.decide. Always
+        written, not conditionally: a deny writing None here is a no-op
+        against a row that was already None (a pending row never had
+        these set), so there's no special-casing needed for the deny
+        path."""
         with self._engine.begin() as conn:
             conn.execute(text(
-                "UPDATE subscribers SET status = :status, decided_at = :decided_at WHERE chat_id = :chat_id"
-            ), {"status": status, "decided_at": decided_at, "chat_id": chat_id})
+                """
+                UPDATE subscribers
+                SET status = :status, decided_at = :decided_at,
+                    agent_interactions_remaining = :agent_remaining,
+                    pushes_remaining = :push_remaining
+                WHERE chat_id = :chat_id
+                """
+            ), {"status": status, "decided_at": decided_at, "chat_id": chat_id,
+                "agent_remaining": agent_interactions_remaining, "push_remaining": pushes_remaining})
 
     def list_pending(self, status: str) -> list[tuple]:
         with self._engine.begin() as conn:
@@ -276,3 +292,73 @@ class SubscriberMixin:
             ), {"chat_id": chat_id, "status": status, "requested_at": requested_at,
                 "date": date, "count": count + 1})
             return True
+
+    # --- Free-trial usage caps (agent interactions / news pushes) --------
+    #
+    # Deliberately NOT the same shape as try_consume_search_quota above:
+    # that one resets its count every UTC day; these never reset on their
+    # own -- NULL/-1 means unlimited, otherwise the stored value IS the
+    # count of uses left, decremented straight to 0 and never replenished
+    # except by an explicit admin reset (subscriber_ops.reset_*_limit).
+    # No INSERT/upsert branch either: unlike search quota (which can be
+    # consumed by any status), these only ever apply to an already-
+    # APPROVED row that subscriber_ops.decide already created -- a
+    # missing row is treated as unlimited (see get_* below) rather than
+    # silently created here.
+
+    def _get_remaining(self, chat_id: int, column: str) -> int | None:
+        """Shared body for get_agent_interactions_remaining/
+        get_pushes_remaining -- `column` is always one of those two
+        hardcoded literals from this file's own callers, never anything
+        derived from user input, so building it straight into the SQL
+        text is safe."""
+        with self._engine.begin() as conn:
+            row = conn.execute(
+                text(f"SELECT {column} FROM subscribers WHERE chat_id = :chat_id"),
+                {"chat_id": chat_id},
+            ).fetchone()
+        return row[0] if row else None
+
+    def _set_remaining(self, chat_id: int, column: str, value: int | None) -> None:
+        with self._engine.begin() as conn:
+            conn.execute(text(
+                f"UPDATE subscribers SET {column} = :value WHERE chat_id = :chat_id"
+            ), {"value": value, "chat_id": chat_id})
+
+    def _try_consume_remaining(self, chat_id: int, column: str) -> bool:
+        """Shared body for try_consume_agent_interaction/try_consume_push:
+        True and decrements if this subscriber still has some of `column`
+        left (or has no limit at all -- NULL or -1, never decremented);
+        False, without decrementing, once it's down to 0 or below."""
+        with self._engine.begin() as conn:
+            row = conn.execute(
+                text(f"SELECT {column} FROM subscribers WHERE chat_id = :chat_id"),
+                {"chat_id": chat_id},
+            ).fetchone()
+            remaining = row[0] if row else None
+            if remaining is None or remaining == -1:
+                return True
+            if remaining <= 0:
+                return False
+            conn.execute(text(
+                f"UPDATE subscribers SET {column} = :new WHERE chat_id = :chat_id"
+            ), {"new": remaining - 1, "chat_id": chat_id})
+            return True
+
+    def get_agent_interactions_remaining(self, chat_id: int) -> int | None:
+        return self._get_remaining(chat_id, "agent_interactions_remaining")
+
+    def set_agent_interactions_remaining(self, chat_id: int, value: int | None) -> None:
+        self._set_remaining(chat_id, "agent_interactions_remaining", value)
+
+    def try_consume_agent_interaction(self, chat_id: int) -> bool:
+        return self._try_consume_remaining(chat_id, "agent_interactions_remaining")
+
+    def get_pushes_remaining(self, chat_id: int) -> int | None:
+        return self._get_remaining(chat_id, "pushes_remaining")
+
+    def set_pushes_remaining(self, chat_id: int, value: int | None) -> None:
+        self._set_remaining(chat_id, "pushes_remaining", value)
+
+    def try_consume_push(self, chat_id: int) -> bool:
+        return self._try_consume_remaining(chat_id, "pushes_remaining")

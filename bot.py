@@ -61,6 +61,16 @@ _events: EventLogger = get_event_logger("argus.bot")
 
 TELEGRAM_MESSAGE_LIMIT = 4096
 
+# What a subscriber sees once subscriber_ops.try_consume_agent_interaction
+# refuses them (see process_message's own comment on why the check sits
+# where it does). Plain text, not guardrails.REDIRECT_MESSAGE -- this
+# isn't a guardrail violation, it's a real, honest reason their message
+# didn't go through.
+TRIAL_AGENT_LIMIT_MESSAGE = (
+    "You've used all of your trial's AI interactions. Contact the admin "
+    "if you'd like more."
+)
+
 # How often the periodic-push scheduler checks who's due (see
 # register_push_job below) -- independent of any individual subscriber's
 # push_interval_hours (subscriber_ops.MIN_PUSH_INTERVAL_HOURS floors that at 1h),
@@ -238,6 +248,49 @@ async def notify_admin(admin_bot_token: str, admin_chat_id: int, chat_id: int, u
         text=f"New access request from {label} (chat_id={chat_id}).",
         reply_markup=keyboard,
     )
+
+
+async def _notify_admin_of_trial_limit(
+    admin_bot_token: str, admin_chat_id: int, chat_id: int, label: str, reset_kind: str,
+) -> None:
+    """Ping the admin when a subscriber's free-trial allowance runs out --
+    `label` is what shows in the message ("AI interaction" / "news push"),
+    `reset_kind` is "reset_agent" or "reset_push", matching admin_bot.py's
+    `handle_trial_reset` callback-data prefix.
+
+    A deliberate, narrow reintroduction of direct-to-admin Telegram
+    messaging for `news_push.py`'s caller specifically -- `_push_job`
+    dropped admin_bot_token/admin_chat_id on 2026-08-28 because the push
+    RETRY loop no longer decides anything alert-worthy (that moved to
+    Logfire alerts). This is a different kind of event: a subscriber
+    hitting a business-policy limit needs a human decision (reset or
+    leave it), the same "admin stays in the loop" shape as `notify_admin`
+    above for a new access request -- not an ops-health signal, so it
+    does not belong on the Logfire-alerts side of that 2026-08-28 split.
+
+    Fails open, deliberately (found in qa-engineer review, 2026-09-19): a
+    best-effort side notification must never take down its caller's own
+    primary flow if it breaks. Uncaught, this coroutine's own exception
+    would have silenced `handle_message`'s reply to the subscriber
+    entirely (it's awaited before their reply_text call) and, worse,
+    would have aborted `run_push_cycle`'s WHOLE tick -- every other due
+    subscriber not yet processed that cycle -- since the caller
+    (`_stop_push_at_trial_limit`) runs outside `run_push_cycle`'s own
+    per-subscriber try/except isolation. A failed admin ping should cost
+    exactly one missed notification, nothing else."""
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Reset", callback_data=f"trial:{reset_kind}:{chat_id}")]]
+    )
+    try:
+        await Bot(token=admin_bot_token).send_message(
+            chat_id=admin_chat_id,
+            text=f"Subscriber {chat_id} reached their {label} trial limit.",
+            reply_markup=keyboard,
+        )
+    except Exception as exc:
+        _events.log("trial_limit_admin_notify_failed",
+                     {"message": "notifying admin of a trial-limit event failed", "chat_id": chat_id, "label": label},
+                     level=Level.WARN, exc=exc)
 
 
 async def check_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -761,6 +814,20 @@ async def process_message(chat_id: int, user_text: str, model, guard_model, embe
         if chat_id in interest_sessions:
             return await _process_find_interests(chat_id, user_text, model, guard_model, embedder)
 
+        # Free-trial usage cap (requested 2026-09-18): checked here, not
+        # before the interest_sessions bypass above, so an exploration
+        # already in progress runs to its own natural end even if this
+        # message would have been the one to exhaust the allowance --
+        # interest_finder.MAX_TURNS already bounds that to at most a
+        # couple more turns, cheaper than the alternative of cutting a
+        # subscriber off mid-conversation. A brand-new request past the
+        # limit is stopped here, before layer 2's paid router call --
+        # the cheapest correct place, same reasoning as layer 1 running
+        # first. See subscriber_ops.try_consume_agent_interaction's own
+        # docstring for what "no limit" (NULL/-1) means.
+        if not subscriber_ops.try_consume_agent_interaction(chat_id):
+            return {"blocked_at": "trial_limit_reached", "category": None, "reply": TRIAL_AGENT_LIMIT_MESSAGE}
+
         # Guardrail layer 2 -- the router (docs/plans/context-management-plan.md):
         # one structured-output call answers "is this on-topic", "what kind of
         # request(s) is this", and (for Route B categories) the arguments each
@@ -809,14 +876,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not await check_access(update, context):
         return
 
+    chat_id = update.effective_chat.id
     result = await process_message(
-        update.effective_chat.id,
+        chat_id,
         update.message.text,
         context.bot_data["model"],
         context.bot_data["guard_model"],
         context.bot_data.get("embedder"),
     )
     final_content = result["reply"]
+
+    if result["blocked_at"] == "trial_limit_reached":
+        await _notify_admin_of_trial_limit(
+            context.bot_data["admin_bot_token"], context.bot_data["admin_chat_id"],
+            chat_id, "AI interaction", "reset_agent",
+        )
 
     chunks = split_for_telegram(final_content)
     delivered_chunks = []
@@ -896,14 +970,30 @@ async def _push_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     async def send(chat_id: int, text: str, topic: str | None = None) -> None:
         await send_push_digest(context.bot, chat_id, text, topic=topic)
 
+    async def notify_admin_of_push_limit(chat_id: int) -> None:
+        await _notify_admin_of_trial_limit(
+            context.bot_data["admin_bot_token"], context.bot_data["admin_chat_id"],
+            chat_id, "news push", "reset_push",
+        )
+
     # .get(), not [] -- an embedder is an enhancement (near-duplicate
     # collapse, offbeat selection), never something run_push_cycle
     # requires to function. See news_embed's module docstring.
     #
-    # No admin_bot_token/admin_chat_id here (removed 2026-08-28) -- the
-    # retry loop no longer decides anything alert-worthy or sends
-    # Telegram directly, see news_push._emit_html_validation_attempt.
-    await news_push.run_push_cycle(model, send, embedder=context.bot_data.get("embedder"))
+    # admin_bot_token/admin_chat_id were removed from here 2026-08-28
+    # because the retry loop didn't decide anything alert-worthy (ops
+    # health moved to Logfire alerts, see news_push._emit_html_validation_attempt).
+    # `notify_admin_of_push_limit` above is a narrower, deliberate
+    # reintroduction for one specific business-policy event (a
+    # subscriber's free-trial push allowance running out) -- see
+    # _notify_admin_of_trial_limit's own docstring for why that's a
+    # different kind of event, not a reversal of the 2026-08-28 reasoning.
+    # Named distinctly from the module-level `notify_admin` (the
+    # new-access-request approval ping, different signature entirely) so
+    # the two don't read as the same function at a glance.
+    await news_push.run_push_cycle(
+        model, send, embedder=context.bot_data.get("embedder"),
+        notify_admin=notify_admin_of_push_limit)
 
 
 def register_push_job(app: Application) -> None:

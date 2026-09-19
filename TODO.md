@@ -20,43 +20,17 @@ pass first, per that rule.
   per hour" cap in `bot.py`. See `docs/plans/security-plan.md` finding #4
   (Low, "Not started -- cheap to fix, low urgency").
 
-- [ ] **Build per-user free-trial usage limits: an AI-agent interaction
+- [x] ~~Build per-user free-trial usage limits: an AI-agent interaction
   cap and a separate news-push cap, each cutting the user off (not the
-  whole bot) once reached, with the admin notified either time.**
-  Requested 2026-09-18. This is the concrete shape for the two open cost-
-  control gaps above and just above the push section below -- "Add rate
-  limiting for approved users" (inbound message rate) and "Decide whether
-  push has a total-volume cap" (outbound push volume) -- specifically
-  framed around a free-trial model where a subscriber gets a fixed
-  allowance before something has to happen, not an unlimited approved
-  account. Four required behaviors, as specified:
-  1. Every user has two independent counters: an AI-agent interaction
-     limit and a news-push limit.
-  2. Once the agent limit is reached, stop accepting that user's messages
-     for agent interaction -- they need a reply telling them so, not
-     silence (a fixed "trial limit reached" message is the obvious
-     default, same shape as `guardrails.REDIRECT_MESSAGE` for a different
-     trigger).
-  3. Once the push limit is reached, stop pushing news to that user --
-     mirrors `_strike_unreachable_subscriber`'s existing "turn push off"
-     mechanism in `news_push.py`, but triggered by a count instead of by
-     consecutive delivery failures.
-  4. Notify the admin when EITHER limit is hit, so a human decides
-     whether to reset/extend/leave it -- same "admin stays in the loop"
-     pattern this project already uses for `check_access()`'s approval
-     flow (`admin_bot.py`), not a fully automatic grant of more quota.
-
-  Not designed in detail yet -- real open questions before this is buildable:
-  - What are the actual numbers, and over what window (a flat lifetime
-    count? per day/week? resettable, or a true one-time trial)?
-  - Does the agent-limit counter include every category, or just the
-    expensive ones (`find_interests`/`news_query` run the full agent
-    loop; `set_language`/etc. are much cheaper) -- and does a
-    layer-2-router call that never reaches the agent loop still count?
-  - Where do the two counters live -- a new column/table per subscriber,
-    same shape as the existing `push_consecutive_failures` column?
-  - Is this purely per-user, or does it also want a global ceiling
-    (separate concern, same as the existing "rate limiting" item above)?
+  whole bot) once reached, with the admin notified either time.~~ **Done
+  2026-09-19** — see `docs/plans/bot-features-plan.md` section 6 for the
+  full design as built: remaining-count columns (`NULL`/`-1` = unlimited,
+  so every subscriber approved before this shipped is grandfathered for
+  free), checked at the cheapest point in each path, admin gets a
+  "Reset" button. Note this only partly overlaps the still-open "Add rate
+  limiting for approved users" item below — that one is about inbound
+  MESSAGE RATE (a time-window cap), this is a lifetime TRIAL allowance;
+  neither makes the other unnecessary.
 
 - [ ] **Add CI vulnerability/image scanning.** `.github/workflows/ci.yml`
   runs `pytest` only -- nothing scans `environment.yml`'s pinned packages
@@ -245,13 +219,7 @@ pass first, per that rule.
   to check or configure this programmatically today. Put aside for now,
   2026-09-18 -- revisit if/when the email-digest plan is picked up.
 
-- [ ] **Decide whether push has a total-volume cap, not just a
-  frequency one.** `push_interval_hours` bounds how OFTEN a subscriber is
-  pushed and `UNREACHABLE_STRIKES` (default 3) auto-disables push after
-  repeated delivery FAILURES, but nothing bounds how many pushes a
-  subscriber can receive in total -- a subscriber with push enabled and
-  reachable keeps getting digests (each one a real `search_news`+
-  DeepSeek cost) indefinitely. Related to, but distinct from, this file's
-  existing "Add rate limiting for approved users" item above (that one's
-  about inbound message rate, this is about outbound push volume) --
-  raised 2026-09-18, not designed yet.
+- [x] ~~Decide whether push has a total-volume cap, not just a frequency
+  one.~~ **Done 2026-09-19** — see `docs/plans/bot-features-plan.md`
+  section 6 (free-trial usage caps): `pushes_remaining` per subscriber,
+  consumed once per cycle, admin-resettable.

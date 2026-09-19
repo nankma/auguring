@@ -529,3 +529,128 @@ def test_try_consume_search_query_is_scoped_per_subscriber(isolated_subscribers_
     assert subscriber_ops.try_consume_search_query(82, today, daily_cap=1) is True
     assert subscriber_ops.try_consume_search_query(82, today, daily_cap=1) is False
     assert subscriber_ops.try_consume_search_query(83, today, daily_cap=1) is True
+
+
+# --- Free-trial usage caps (agent interactions / news pushes) ------------
+# Deliberately unlike search_query's daily quota above: no reset, and
+# NULL/-1 means unlimited rather than "not consumed yet today". See
+# storage.try_consume_agent_interaction/try_consume_push's own docstrings.
+
+
+def test_decide_approve_assigns_the_trial_allowances(isolated_subscribers_db):
+    subscriber_ops.request_access(90, "frank", "Frank")
+    subscriber_ops.decide(90, approved=True)
+    assert subscriber_ops.get_agent_interactions_remaining(90) == subscriber_ops.TRIAL_AGENT_INTERACTION_LIMIT
+    assert subscriber_ops.get_pushes_remaining(90) == subscriber_ops.TRIAL_PUSH_LIMIT
+
+
+def test_a_pre_existing_approved_subscriber_from_before_this_feature_has_no_limit(isolated_subscribers_db):
+    """A real subscriber approved BEFORE agent_interactions_remaining/
+    pushes_remaining existed -- a legacy table missing those two columns
+    (and status already 'approved' from before the migration ever ran,
+    not a row decide() created after this feature shipped), migrated via
+    ADDITIVE_COLUMNS. Same "drop table, minimal legacy schema, re-run
+    init_db()" pattern as
+    test_init_db_migrates_schema_missing_interests_column above -- the
+    scenario test_a_subscriber_with_no_row_has_no_limit (below) doesn't
+    actually cover, since that one has no row at all rather than a real
+    pre-migration approved one."""
+    with sqlite3.connect(isolated_subscribers_db) as conn:
+        conn.execute("DROP TABLE subscribers")
+        conn.execute(
+            """
+            CREATE TABLE subscribers (
+                chat_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                status TEXT NOT NULL,
+                requested_at TEXT NOT NULL,
+                decided_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO subscribers (chat_id, username, first_name, status, requested_at, decided_at) "
+            "VALUES (100, 'legacy', 'Legacy', 'approved', '2026-01-01T00:00:00', '2026-01-01T00:00:00')"
+        )
+    storage.init_db()  # ADDITIVE_COLUMNS lands the two new columns as NULL on this row
+
+    assert subscriber_ops.get_agent_interactions_remaining(100) is None
+    assert subscriber_ops.get_pushes_remaining(100) is None
+    assert subscriber_ops.try_consume_agent_interaction(100) is True
+    assert subscriber_ops.try_consume_push(100) is True
+
+
+def test_decide_deny_leaves_the_allowances_unset(isolated_subscribers_db):
+    subscriber_ops.request_access(91, "grace", "Grace")
+    subscriber_ops.decide(91, approved=False)
+    assert subscriber_ops.get_agent_interactions_remaining(91) is None
+    assert subscriber_ops.get_pushes_remaining(91) is None
+
+
+def test_a_subscriber_with_no_row_has_no_limit(isolated_subscribers_db):
+    """A chat_id nobody has ever called decide() for -- covers both a
+    genuinely unknown chat_id and, more importantly, every subscriber
+    approved before this feature existed: the schema migration leaves
+    their row's new columns NULL, and NULL must mean unlimited, not
+    zero."""
+    assert subscriber_ops.get_agent_interactions_remaining(999) is None
+    assert subscriber_ops.try_consume_agent_interaction(999) is True
+    assert subscriber_ops.try_consume_push(999) is True
+
+
+def test_try_consume_agent_interaction_decrements_and_blocks_at_zero(isolated_subscribers_db):
+    subscriber_ops.request_access(92, "heidi", "Heidi")
+    subscriber_ops.decide(92, approved=True)
+    subscriber_ops.set_agent_interactions_remaining(92, 2)
+
+    assert subscriber_ops.try_consume_agent_interaction(92) is True
+    assert subscriber_ops.get_agent_interactions_remaining(92) == 1
+    assert subscriber_ops.try_consume_agent_interaction(92) is True
+    assert subscriber_ops.get_agent_interactions_remaining(92) == 0
+    # At zero: refused, and NOT decremented further into the negatives.
+    assert subscriber_ops.try_consume_agent_interaction(92) is False
+    assert subscriber_ops.get_agent_interactions_remaining(92) == 0
+
+
+def test_try_consume_agent_interaction_minus_one_means_unlimited(isolated_subscribers_db):
+    subscriber_ops.request_access(93, "ivan", "Ivan")
+    subscriber_ops.decide(93, approved=True)
+    subscriber_ops.set_agent_interactions_remaining(93, -1)
+
+    for _ in range(5):
+        assert subscriber_ops.try_consume_agent_interaction(93) is True
+    # Never decremented -- still exactly -1, not drifting toward 0.
+    assert subscriber_ops.get_agent_interactions_remaining(93) == -1
+
+
+def test_try_consume_push_decrements_and_blocks_at_zero(isolated_subscribers_db):
+    subscriber_ops.request_access(94, "judy", "Judy")
+    subscriber_ops.decide(94, approved=True)
+    subscriber_ops.set_pushes_remaining(94, 1)
+
+    assert subscriber_ops.try_consume_push(94) is True
+    assert subscriber_ops.get_pushes_remaining(94) == 0
+    assert subscriber_ops.try_consume_push(94) is False
+
+
+def test_reset_agent_interaction_limit_restores_the_current_setting(isolated_subscribers_db):
+    subscriber_ops.request_access(95, "mallory", "Mallory")
+    subscriber_ops.decide(95, approved=True)
+    subscriber_ops.set_agent_interactions_remaining(95, 0)
+
+    subscriber_ops.reset_agent_interaction_limit(95)
+
+    assert subscriber_ops.get_agent_interactions_remaining(95) == subscriber_ops.TRIAL_AGENT_INTERACTION_LIMIT
+
+
+def test_reset_push_limit_restores_the_allowance_and_re_enables_push(isolated_subscribers_db):
+    subscriber_ops.request_access(96, "niaj", "Niaj")
+    subscriber_ops.decide(96, approved=True)
+    subscriber_ops.set_pushes_remaining(96, 0)
+    subscriber_ops.set_push_enabled(96, False)
+
+    subscriber_ops.reset_push_limit(96)
+
+    assert subscriber_ops.get_pushes_remaining(96) == subscriber_ops.TRIAL_PUSH_LIMIT
+    assert subscriber_ops.get_push_enabled(96) is True

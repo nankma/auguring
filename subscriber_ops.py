@@ -30,6 +30,17 @@ PUSHED_LINK_RETENTION_HOURS = get_settings().resolved("subscription.pushed_link_
 # MAX_INTERESTS_PER_PUSH in news_push.py is what actually bounds noise.
 MAX_INTERESTS = get_settings().resolved("subscription.max_interests", default=10)
 
+# Free-trial usage caps, assigned once at approval time (see decide()
+# below) -- requested 2026-09-18. 50 agent interactions is enough to run a
+# full find_interests exploration (up to interest_finder.MAX_TURNS turns)
+# plus several direct news queries and a couple of settings changes; 20
+# pushes is roughly 3 weeks at the default 24h interval, or under a week
+# at the minimum 1h interval -- both picked to let a trial subscriber
+# genuinely evaluate the bot, not to be a tripwire. Global values, not
+# per-subscriber-configurable, at least for now.
+TRIAL_AGENT_INTERACTION_LIMIT = get_settings().resolved("trial.agent_interaction_limit", default=50)
+TRIAL_PUSH_LIMIT = get_settings().resolved("trial.push_limit", default=20)
+
 
 def get_status(chat_id: int) -> str | None:
     return get_storage().get_status(chat_id)
@@ -43,7 +54,17 @@ def request_access(chat_id: int, username: str | None, first_name: str | None) -
 
 
 def decide(chat_id: int, approved: bool) -> None:
-    get_storage().decide(chat_id, APPROVED if approved else DENIED, datetime.now().isoformat())
+    """Approving assigns this subscriber their free-trial allowances
+    (TRIAL_AGENT_INTERACTION_LIMIT/TRIAL_PUSH_LIMIT) -- a deny passes None
+    for both, which is a no-op against a row that was never approved.
+    Existing subscribers approved before this feature shipped are
+    unaffected: this only runs at the moment of approval, so their row's
+    columns stay whatever the schema migration left them (NULL, meaning
+    unlimited -- see storage/schema.py's ADDITIVE_COLUMNS comment)."""
+    agent_limit = TRIAL_AGENT_INTERACTION_LIMIT if approved else None
+    push_limit = TRIAL_PUSH_LIMIT if approved else None
+    get_storage().decide(chat_id, APPROVED if approved else DENIED, datetime.now().isoformat(),
+                         agent_limit, push_limit)
 
 
 def list_pending() -> list[tuple]:
@@ -302,6 +323,65 @@ def try_consume_search_query(chat_id: int, today: str, daily_cap: int = 10) -> b
     automatically once `today` no longer matches the subscriber's last
     stored date -- see storage's try_consume_search_quota."""
     return get_storage().try_consume_search_quota(chat_id, APPROVED, datetime.now().isoformat(), daily_cap, today)
+
+
+# --- Free-trial usage caps (agent interactions / news pushes) ------------
+#
+# See decide()'s own docstring for how a subscriber gets their initial
+# allowance, and TRIAL_AGENT_INTERACTION_LIMIT/TRIAL_PUSH_LIMIT above for
+# the actual numbers. Unlike try_consume_search_query above, neither of
+# these resets on its own -- once spent, only an explicit admin reset
+# (reset_agent_interaction_limit/reset_push_limit, wired to admin_bot.py's
+# "Reset" button) restores it.
+
+
+def get_agent_interactions_remaining(chat_id: int) -> int | None:
+    return get_storage().get_agent_interactions_remaining(chat_id)
+
+
+def try_consume_agent_interaction(chat_id: int) -> bool:
+    """True if this message may proceed to the agent pipeline (and
+    decrements the allowance if one exists); False once a subscriber with
+    a finite allowance has used it all. A subscriber with no allowance at
+    all (NULL, meaning approved before this feature existed, or -1) is
+    always True -- see storage.try_consume_agent_interaction."""
+    return get_storage().try_consume_agent_interaction(chat_id)
+
+
+def set_agent_interactions_remaining(chat_id: int, value: int | None) -> None:
+    get_storage().set_agent_interactions_remaining(chat_id, value)
+
+
+def reset_agent_interaction_limit(chat_id: int) -> None:
+    """Admin action: restores this subscriber's full trial allowance
+    (the CURRENT setting, not whatever it was when they were first
+    approved -- an operator who changes trial.agent_interaction_limit and
+    then resets someone gets the new number)."""
+    set_agent_interactions_remaining(chat_id, TRIAL_AGENT_INTERACTION_LIMIT)
+
+
+def get_pushes_remaining(chat_id: int) -> int | None:
+    return get_storage().get_pushes_remaining(chat_id)
+
+
+def try_consume_push(chat_id: int) -> bool:
+    """Same shape as try_consume_agent_interaction above, for the separate
+    push allowance -- news_push.py calls this once per subscriber per
+    cycle, before doing any of that cycle's real (paid) work."""
+    return get_storage().try_consume_push(chat_id)
+
+
+def set_pushes_remaining(chat_id: int, value: int | None) -> None:
+    get_storage().set_pushes_remaining(chat_id, value)
+
+
+def reset_push_limit(chat_id: int) -> None:
+    """Admin action: restores the full trial allowance AND turns push back
+    on -- hitting the limit disabled it (see
+    news_push._stop_push_at_trial_limit), so a reset that left push off
+    would look like nothing happened."""
+    set_pushes_remaining(chat_id, TRIAL_PUSH_LIMIT)
+    set_push_enabled(chat_id, True)
 
 
 def reset_push_consecutive_failures(chat_id: int) -> None:

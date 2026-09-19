@@ -513,7 +513,7 @@ def _start_session(monkeypatch, reply="Which of these interest you?", done=False
     return run_turn
 
 
-def test_router_choosing_find_interests_opens_a_session(monkeypatch):
+def test_router_choosing_find_interests_opens_a_session(monkeypatch, isolated_subscribers_db):
     run_turn = _start_session(monkeypatch)
     monkeypatch.setattr(bot.guardrails, "classify_message", MagicMock(
         return_value=guardrails.MessageClassification(on_topic=True, categories=["find_interests"])))
@@ -812,8 +812,29 @@ def test_a_layer_4_block_clears_the_session(monkeypatch):
     assert 7 not in bot.interest_sessions
 
 
+def test_trial_limit_does_not_interrupt_an_open_exploration(monkeypatch, isolated_subscribers_db):
+    """Explicit 2026-09-18 design decision, committed regression guard for
+    it (previously only checked live, this session, against a real
+    model): a subscriber whose agent-interaction allowance ran out WHILE
+    an exploration was already open still gets this turn served normally
+    -- the trial-limit check in process_message sits after the
+    interest_sessions bypass, not before, deliberately.
+    interest_finder.MAX_TURNS already bounds how many more turns this can
+    cost, cheaper than cutting them off mid-conversation."""
+    run_turn = _start_session(monkeypatch)
+    bot.interest_sessions[7] = {"turns": 1}
+    subscriber_ops.request_access(7, "walt", "Walt")
+    subscriber_ops.decide(7, approved=True)
+    subscriber_ops.set_agent_interactions_remaining(7, 0)
+
+    result = asyncio.run(bot.process_message(7, "tell me more", "m", "g"))
+
+    run_turn.assert_called_once()
+    assert result["blocked_at"] is None
+
+
 @pytest.mark.parametrize("category", ["set_interest", "remove_interest", "set_language"])
-def test_each_interest_agent_category_routes_here_alone(monkeypatch, category):
+def test_each_interest_agent_category_routes_here_alone(monkeypatch, category, isolated_subscribers_db):
     """Regression guard for the pre-2026-09-10 check (`"find_interests"
     in classification.categories`), which would have sent set_interest/
     remove_interest/set_language straight to the old one-shot Route B
@@ -832,7 +853,7 @@ def test_each_interest_agent_category_routes_here_alone(monkeypatch, category):
     run_turn.assert_called_once()
 
 
-def test_find_interests_wins_a_multi_category_turn(monkeypatch):
+def test_find_interests_wins_a_multi_category_turn(monkeypatch, isolated_subscribers_db):
     """find_interests opens a MODE, so it can't be one segment of a joined
     reply -- the exploration agent can act on the rest of the message
     itself (it can save and drop interests), which a joined reply could

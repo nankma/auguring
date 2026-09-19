@@ -19,6 +19,11 @@ PUSH_CHAT_NOT_FOUND = "chat_not_found"
 PUSH_MODEL_ERROR = "model_error"
 PUSH_CYCLE_FAILED = "cycle_failed"
 PUSH_DISABLED = "disabled"
+# A subscriber's free-trial push allowance ran out (requested 2026-09-18).
+# Excluded from PUSH_GENERATED_OUTCOMES below for the same reason
+# no_interests is: news_push._stop_push_at_trial_limit returns before
+# write_push_digest, so no digest was paid for this cycle.
+PUSH_TRIAL_LIMIT_REACHED = "trial_limit_reached"
 
 # Outcomes meaning an LLM was actually called to write a digest -- the
 # denominator of the delivered/generated ratio (criterion 3,

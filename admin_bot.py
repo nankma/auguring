@@ -59,6 +59,34 @@ async def handle_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await Bot(token=context.bot_data["info_bot_token"]).send_message(chat_id=chat_id, text=notice)
 
 
+async def handle_trial_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles the "Reset" button on `bot.py`'s `_notify_admin_of_trial_limit`
+    message -- `query.data` is `trial:reset_agent:{chat_id}` or
+    `trial:reset_push:{chat_id}`, matching that function's `reset_kind`
+    argument. Resets to the CURRENT `trial.*_limit` setting, not whatever
+    the subscriber's original allowance was (see
+    subscriber_ops.reset_agent_interaction_limit/reset_push_limit's own
+    docstrings) -- an operator who's changed the setting since gets the
+    new number, not the stale one."""
+    query = update.callback_query
+    if query.from_user.id != context.bot_data["admin_chat_id"]:
+        await query.answer("Not authorized.", show_alert=True)
+        return
+
+    _, kind, chat_id_str = query.data.split(":")
+    chat_id = int(chat_id_str)
+    if kind == "reset_agent":
+        subscriber_ops.reset_agent_interaction_limit(chat_id)
+        notice = "Your AI interaction trial limit has been reset."
+    else:
+        subscriber_ops.reset_push_limit(chat_id)
+        notice = "Your news push has been reset and re-enabled."
+
+    await query.answer()
+    await query.edit_message_text(query.message.text + "\n\nReset by admin.", reply_markup=None)
+    await Bot(token=context.bot_data["info_bot_token"]).send_message(chat_id=chat_id, text=notice)
+
+
 # --- category review (docs/plans/taxonomy-and-admin-plan.md A4) ------------
 #
 # The classifier records labels it reaches for that the taxonomy doesn't
@@ -182,6 +210,7 @@ def main():
     app.bot_data["info_bot_token"] = get_settings().resolved("delivery.telegram.bot-token", required=True)
     app.add_handler(CallbackQueryHandler(handle_category_decision, pattern=r"^cat:"))
     app.add_handler(CallbackQueryHandler(handle_decision, pattern=r"^(approve|deny):"))
+    app.add_handler(CallbackQueryHandler(handle_trial_reset, pattern=r"^trial:"))
     app.add_handler(MessageHandler(filters.ALL, reject_non_admin))
     register_error_handler(app, "argus.admin_bot")
 
