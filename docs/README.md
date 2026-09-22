@@ -49,6 +49,7 @@ Status table.
 | `data-layer-plan.md` | SQLite vs. a shared database — deferred, why |
 | `deployment-plan.md` | Containerization, cloud provider, CI/CD |
 | `email-digest-plan.md` | Email as an outbound-only push-digest channel — proposed, nothing built |
+| `front-door-agent-plan.md` | Retiring `end_exploration`/session state for one always-on agent; context stays with the agent, tools get none — proposed, nothing built |
 | `guardrails-plan.md` | The four-layer guardrail design and its incidents |
 | `incident-monitoring-plan.md` | What counts as an incident; the three criteria, criterion 1 built |
 | `interest-finder-plan.md` | The "help me find my interests" conversation — why it gets an agent loop, session state, the two ceilings, and how it became the front door for adding/removing interests and switching language too |
