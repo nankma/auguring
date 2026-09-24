@@ -161,13 +161,23 @@ def _get_conversation(chat_id: int) -> dict:
     The pending offer ages out by the SAME MAX_HISTORY_AGE rule as the
     messages around it, via its own "set_at" -- it is part of this
     conversation's data now, not a separately-tracked session with its
-    own lifetime (docs/plans/front-door-agent-plan.md)."""
+    own lifetime (docs/plans/front-door-agent-plan.md). Two checks, not
+    one, because MAX_HISTORY_AGE and MAX_HISTORY_MESSAGES are independent
+    caps: a pure age check alone would miss the case where the COUNT cap
+    trims away the very message that made the offer (its timestamp always
+    matches or precedes "set_at") while the offer itself is still within
+    the age window -- which would leave classify_confirmation's
+    history[-1] anchor pointing at a later, unrelated reply. Code-review
+    finding: caught before this could actually happen live."""
     conv = conversations.get(chat_id, {"messages": [], "timestamps": [], "pending_offer": None})
     now = datetime.now(timezone.utc)
     messages, timestamps = _trim_history(conv["messages"], conv["timestamps"], now)
     pending_offer = conv["pending_offer"]
-    if pending_offer is not None and now - pending_offer["set_at"] > MAX_HISTORY_AGE:
-        pending_offer = None
+    if pending_offer is not None:
+        if now - pending_offer["set_at"] > MAX_HISTORY_AGE:
+            pending_offer = None
+        elif timestamps and pending_offer["set_at"] < timestamps[0]:
+            pending_offer = None
     conv = {"messages": messages, "timestamps": timestamps, "pending_offer": pending_offer}
     conversations[chat_id] = conv
     return conv
@@ -599,6 +609,16 @@ async def _process_agent_turn(chat_id: int, user_text: str, model, guard_model, 
     elif not history and await asyncio.to_thread(
             interest_finder.reads_as_bare_confirmation, guard_model, user_text):
         reply = await _lost_context_reply(chat_id, guard_model)
+        # Only real model output (a translation) needs layer 4 -- same
+        # reasoning as _execute_pending_proposal: the untranslated English
+        # template is our own fixed string, but a translated one is real,
+        # unchecked LLM output like any other.
+        if subscriber_ops.get_language(chat_id):
+            reply = _strip_report_preamble(_normalize_markdown_bold(reply))
+            output_on_topic = await asyncio.to_thread(guardrails.is_output_on_topic, guard_model, reply)
+            if not output_on_topic:
+                return {"blocked_at": "layer4_output_check", "category": "context_lost",
+                        "reply": guardrails.REDIRECT_MESSAGE}
         new_messages = [HumanMessage(content=user_text), AIMessage(content=reply)]
         _persist_turn(chat_id, history + new_messages, history_timestamps, new_messages, None)
         return {"blocked_at": None, "category": "context_lost", "reply": reply}

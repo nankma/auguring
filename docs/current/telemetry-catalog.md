@@ -105,15 +105,24 @@ Every row also carries `otel.status_code=ERROR` and a recorded exception
 | `router_failed` | `argus.guardrails` | `guardrails.classify_message` (layer 2) | **ERROR** | — | load-bearing: silent fail-open here is the exact 2026-08-21 incident (`docs/plans/guardrails-plan.md`) — don't let a future alert audit downgrade this to WARN |
 | `output_check_failed` | `argus.guardrails` | `guardrails.is_output_on_topic` (layer 4) | **ERROR** | — | same reasoning as `router_failed`, its layer-4 mirror |
 | `search_query_rewrite_failed` | `argus.agent` | `agent._rewrite_search_query` | WARN | `query` | added 2026-09-05 alongside search_news's query-rewrite step; missing from this table until now, not a new event |
-| `interest_exploration_failed` | `argus.bot` | `bot._process_find_interests` | ERROR | `chat_id` | the exploration agent loop raising; the session is cleared, so the subscriber sees an error rather than being stuck in a mode |
-| `interest_exploration_out_of_turns` | `argus.bot` | `bot._process_find_interests` | WARN | `chat_id`, `turns` | not an error — a subscriber who never converged. Worth watching as a RATE: frequent hits mean the elicitation method isn't working, which nothing else measures |
-| `interest_turn_out_of_steps` | `argus.interest_finder` | `interest_finder.run_turn` | WARN | `chat_id`, `max_steps` | ONE turn hit the LangGraph step ceiling — measured cause is a topic with no coverage the model keeps rephrasing. Distinct from `interest_exploration_out_of_turns`, which is the whole conversation |
-| `interest_saved_from_exploration` | `argus.interest_finder` | `interest_finder.execute_save` | INFO | `chat_id`, `topic`, `turns` | the outcome event — the numerator in "how many explorations produce an interest". `execute_save` is the single write path, reached from both the `save_interest` tool and `bot._execute_pending_proposal`'s deterministic confirmation gate, so this fires exactly once per real save regardless of which path triggered it |
-| `interest_exploration_ended` | `argus.interest_finder` | `interest_finder.end_exploration` | INFO | `chat_id`, `reason`, `turns`, `saved_count`, `dropped_count` | fires on every model-ended exploration, INCLUDING ones that saved nothing; the denominator for the row above |
+| `interest_exploration_failed` | `argus.bot` | `bot._execute_pending_proposal` | ERROR | `chat_id`, `topic` | executing a CONFIRMED propose_interest/propose_remove/propose_definition raised; the pending offer is cleared, so a later reply doesn't bind to a write that never happened |
+| `agent_turn_failed` | `argus.bot` | `bot._process_agent_turn` | ERROR | `chat_id` | the front-door agent's own turn (interest_finder.run_turn) raising -- since docs/plans/front-door-agent-plan.md, this is every on-topic message, not just a find_interests-style conversation |
+| `interest_turn_out_of_steps` | `argus.interest_finder` | `interest_finder.run_turn` | WARN | `chat_id`, `max_steps` | ONE turn hit the LangGraph step ceiling — measured cause is a topic with no coverage the model keeps rephrasing |
+| `interest_saved_from_exploration` | `argus.interest_finder` | `interest_finder.execute_save` | INFO | `chat_id`, `topic` | the outcome event — the numerator in "how many conversations produce an interest". `execute_save` is the single write path, reached from both the `save_interest` tool and `bot._execute_pending_proposal`'s deterministic confirmation gate, so this fires exactly once per real save regardless of which path triggered it |
 | `confirmation_check_failed` | `argus.interest_finder` | `interest_finder.classify_confirmation` | WARN | — | the affirm/decline/unclear classifier failing; fails open to "unclear", which just falls through to the normal agent turn -- never worse than before this mechanism existed |
-| `interest_definition_redefined` | `argus.interest_finder` | `interest_finder.execute_redefine` | INFO | `chat_id`, `topic`, `turns` | docs/plans/interest-definition-plan.md's outcome event, mirroring `interest_saved_from_exploration` -- fires exactly once per real per-subscriber definition write, from `execute_redefine`, the single write path reached from both the `save_definition` tool and the deterministic confirmation gate |
+| `bare_confirmation_check_failed` | `argus.interest_finder` | `interest_finder.reads_as_bare_confirmation` | WARN | — | the orphaned-confirmation classifier failing; fails open to False (treated as an ordinary self-contained message), so a hiccup here costs nothing worse than the normal pipeline running |
+| `interest_definition_redefined` | `argus.interest_finder` | `interest_finder.execute_redefine` | INFO | `chat_id`, `topic` | docs/plans/interest-definition-plan.md's outcome event, mirroring `interest_saved_from_exploration` -- fires exactly once per real per-subscriber definition write, from `execute_redefine`, the single write path reached from both the `save_definition` tool and the deterministic confirmation gate |
 
-None of these nineteen have a dedicated alert yet — they're new visibility,
+`interest_exploration_out_of_turns` and `interest_exploration_ended`
+(and `interest_finder.end_exploration` itself) were retired 2026-09-24
+along with the `MAX_TURNS` ceiling and the "exploration" conversational
+mode they measured -- see docs/plans/front-door-agent-plan.md. There is
+no more separate "conversation ended"/"conversation ran too long" signal
+to log: the front-door agent's conversation just keeps going, bounded
+only by the trial usage limit (which already has its own
+`trial_limit_reached` handling, untouched by this change).
+
+None of these have a dedicated alert yet — they're new visibility,
 not new paging. `router_failed`/`output_check_failed` are the strongest
 candidates for one, given the incident they're already tied to.
 
@@ -132,14 +141,19 @@ in the order they execute:
 
 | `span_name` (`event`) | `otel_scope_name` | Emitted by | Attributes beyond `message` | Fires |
 |---|---|---|---|---|
-| `latency_layer2_classify` | `argus.bot` | `bot.process_message` | `duration_seconds` (float) | Every message, all categories — not search_news-specific |
+| `latency_layer2_classify` | `argus.bot` | `bot._process_agent_turn` | `duration_seconds` (float) | Every message that reaches the router — skipped when a pending offer is still standing (see docs/plans/front-door-agent-plan.md) |
 | `latency_query_rewrite` | `argus.agent` | `agent._rewrite_search_query` | `duration_seconds` | Every search_news call with a non-None `guard_model` |
 | `latency_definition_generation` | `argus.agent` | `agent.search_news` | `duration_seconds` | Only on a cache-miss for the (rewritten) topic — skipped entirely once a topic's definition is cached |
 | `latency_cache_read_relevance_filter` | `argus.agent` | `agent.search_news` | `duration_seconds` | Every search_news call (news_cache.read_all() + news_embed.filter_by_relevance) |
 | `latency_report_writing` | `argus.agent` | `agent.search_news` | `duration_seconds` | Every search_news call that reaches the model (i.e. the candidate pool wasn't empty) |
-| `latency_search_news_total` | `argus.bot` | `bot._route_a_reply` | `duration_seconds` | Every news_query turn -- wall-clock for the whole search_news call, should roughly equal the sum of the four `agent.*` events above plus DB/quota overhead not separately timed |
-| `latency_layer4_output_check` | `argus.bot` | `bot._route_a_reply` | `duration_seconds` | Every news_query turn |
-| `latency_interest_turn` | `argus.bot` | `bot._process_find_interests` | `duration_seconds` | Every turn of a `find_interests` exploration — the one place in this codebase that still runs an agent LOOP, so this is where a per-turn blowup (PR #85's failure) would show up first |
+| `latency_agent_turn` | `argus.bot` | `bot._process_agent_turn` | `duration_seconds` | Every on-topic turn since docs/plans/front-door-agent-plan.md -- wall-clock for the whole `interest_finder.run_turn` call (which internally may call `agent.search_news` as a tool, among others), not broken out per internal step the way the four `agent.*` events above are for a direct `search_news` call |
+
+`latency_search_news_total` and `latency_layer4_output_check`
+(`bot._route_a_reply`) and `latency_interest_turn`
+(`bot._process_find_interests`) were retired 2026-09-24 along with those
+functions -- `latency_agent_turn` above is their replacement, covering
+every category now that there's one front-door path instead of separate
+routes.
 
 **Real numbers measured live on INT, 2026-09-05** (two genuinely new
 topics, each a real cache-miss so all seven events fired): 11.23s and

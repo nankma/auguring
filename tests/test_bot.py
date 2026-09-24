@@ -214,6 +214,26 @@ def test_get_conversation_keeps_a_fresh_pending_offer(isolated_subscribers_db):
     assert conv["pending_offer"] == offer
 
 
+def test_get_conversation_drops_a_pending_offer_whose_anchor_message_was_count_trimmed(isolated_subscribers_db):
+    """Code-review finding: MAX_HISTORY_AGE and MAX_HISTORY_MESSAGES are
+    independent caps -- a pending offer within the age window can still
+    have the message that made it trimmed away by the COUNT cap, which
+    would otherwise leave classify_confirmation's history[-1] anchor
+    pointing at a later, unrelated reply."""
+    now = datetime.now(timezone.utc)
+    offer = {"topic": "AI", "action": "add", "definition": "d", "set_at": now - timedelta(minutes=30)}
+    # 25 messages, all within MAX_HISTORY_AGE, more than MAX_HISTORY_MESSAGES
+    # (20) -- the count cap alone would trim the first 5, including the one
+    # timestamped alongside the offer.
+    messages = [f"msg{i}" for i in range(25)]
+    timestamps = [now - timedelta(minutes=30) + timedelta(seconds=i) for i in range(25)]
+    bot.conversations[45] = {"messages": messages, "timestamps": timestamps, "pending_offer": offer}
+
+    conv = bot._get_conversation(45)
+
+    assert conv["pending_offer"] is None
+
+
 def _make_update(chat_id, username="alice", first_name="Alice", text="What's new with OpenAI?"):
     message = MagicMock()
     message.reply_text = AsyncMock()

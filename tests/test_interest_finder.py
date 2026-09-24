@@ -798,6 +798,27 @@ def test_a_bare_confirmation_with_nothing_pending_gets_an_honest_reply(monkeypat
     assert "record of it" in result["reply"]
 
 
+def test_a_translated_lost_context_reply_still_goes_through_layer_4(monkeypatch, isolated_subscribers_db):
+    """The untranslated English template is our own fixed string, but a
+    translated one is real, unchecked model output -- same reasoning as
+    _execute_pending_proposal's own translated-reply check. Code-review
+    finding: this path was initially skipping layer 4 entirely."""
+    subscriber_ops.set_language(7, "Spanish")
+    monkeypatch.setattr(bot.guardrails, "fails_local_prefilter", MagicMock(return_value=False))
+    monkeypatch.setattr(bot.interest_finder, "reads_as_bare_confirmation", MagicMock(return_value=True))
+    translate = MagicMock(return_value="No tengo ningún registro de eso.")
+    monkeypatch.setattr(bot, "_translate_confirmation", translate)
+    output_check = MagicMock(return_value=False)
+    monkeypatch.setattr(bot.guardrails, "is_output_on_topic", output_check)
+
+    result = asyncio.run(bot.process_message(7, "si", "m", "g"))
+
+    translate.assert_called_once()
+    output_check.assert_called_once()
+    assert result["blocked_at"] == "layer4_output_check"
+    assert result["reply"] == guardrails.REDIRECT_MESSAGE
+
+
 def test_layer_1_still_runs_with_a_pending_offer(monkeypatch):
     """A standing offer is not an exemption -- an injection attempt is
     still an injection attempt."""

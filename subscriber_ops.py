@@ -32,7 +32,7 @@ MAX_INTERESTS = get_settings().resolved("subscription.max_interests", default=10
 
 # Free-trial usage caps, assigned once at approval time (see decide()
 # below) -- requested 2026-09-18. 50 agent interactions is enough to run a
-# full find_interests exploration (up to interest_finder.MAX_TURNS turns)
+# full find_interests-style conversation (several back-and-forth turns)
 # plus several direct news queries and a couple of settings changes; 20
 # pushes is roughly 3 weeks at the default 24h interval, or under a week
 # at the minimum 1h interval -- both picked to let a trial subscriber
