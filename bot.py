@@ -577,18 +577,22 @@ async def _process_agent_turn(chat_id: int, user_text: str, model, guard_model, 
     propose_definition) takes priority over everything below, INCLUDING
     layer 2 -- a bare "yes" carries no topical signal for the router to
     classify, so letting layer 2 see it first would route it somewhere
-    unrelated. When there is neither a pending offer NOR any conversation
-    history at all, a message that only makes sense as answering
-    something gets the honest _lost_context_reply instead of being
-    guessed at by the agent -- see
-    interest_finder.reads_as_bare_confirmation's own docstring for the
-    incident this exists to catch. The "no history either" condition
+    unrelated. More generally, layer 2 only ever runs on the FIRST
+    message of a fresh (empty-history) conversation -- see the comment at
+    its call site below for why a narrower "only skip it when there's a
+    pending offer" gate was tried first and measured to be a real
+    regression.
+
+    When there is neither a pending offer NOR any conversation history at
+    all, a message that only makes sense as answering something gets the
+    honest _lost_context_reply instead of being guessed at by the agent
+    -- see interest_finder.reads_as_bare_confirmation's own docstring for
+    the incident this exists to catch. The "no history either" condition
     matters: with real history the top-level agent can resolve an
     ordinary contextual follow-up ("the first one") itself, same as any
     other reference to earlier in the conversation -- this check is only
     for the case where there is nothing left to resolve it against at
-    all. Only a genuinely self-contained (or genuinely unresolvable)
-    message reaches layer 2's on-topic gate."""
+    all."""
     conv = _get_conversation(chat_id)
     history, history_timestamps, pending_offer = conv["messages"], conv["timestamps"], conv["pending_offer"]
 
@@ -624,16 +628,27 @@ async def _process_agent_turn(chat_id: int, user_text: str, model, guard_model, 
         return {"blocked_at": None, "category": "context_lost", "reply": reply}
 
     category = "find_interests"
-    if pending_offer is None:
+    if not history:
         # Guardrail layer 2 -- the router (docs/plans/context-management-plan.md):
         # one structured-output call answers "is this on-topic" and "what
         # kind of request(s) is this". Only its on_topic gate drives
         # anything now; `categories` is kept purely as a label for the
         # return value/telemetry below, not to pick a dispatch path.
-        # Skipped when a pending offer is still standing (verdict was
-        # "unclear" above) -- it was already gated when the offer was
-        # first made, and re-running it risks rejecting a topic-free
-        # confirmation as off-topic.
+        #
+        # Runs ONLY on the first message of a fresh (empty-history)
+        # conversation -- ANY ongoing conversation skips it, not just one
+        # with a live pending offer. Measured live (qa-engineer,
+        # 2026-09-24): a topic-free but genuinely contextual reply
+        # ("sure", "the first one") is misclassified as off-topic by this
+        # same router a third to all of the time -- the old design's
+        # blanket "any message in an open exploration skips layer 2"
+        # protected against exactly this, and narrowing that to
+        # "only when a pending offer exists" (this module's first attempt
+        # at this) was a real regression, not a simplification. Layer 1
+        # (local prefilter) and layer 4 (output check) still run
+        # regardless, same as they always did for a mid-exploration
+        # message under the old design -- layer 2 was never the sole
+        # defense against a mid-conversation off-topic pivot.
         _t0 = time.monotonic()
         classification = await asyncio.to_thread(guardrails.classify_message, guard_model, user_text)
         _events.log("latency_layer2_classify", {"message": "router classified the message",

@@ -570,12 +570,21 @@ def test_router_classification_flows_through_to_the_agent_turn(monkeypatch, isol
 
 def _pending(chat_id: int, topic: str, action: str, definition: str | None = None) -> None:
     """Seeds bot.conversations[chat_id] with a standing pending offer,
-    already timestamped -- the shape _get_conversation reads."""
+    already timestamped -- the shape _get_conversation reads. Also seeds
+    the placeholder assistant message that made the offer -- a real
+    pending offer never exists without at least that one message
+    (_persist_turn always writes them together), and bot.py's own layer-2
+    skip condition now keys off "any history at all", not just the offer
+    itself, so a test with a pending offer but empty history would
+    exercise a state that can't actually occur."""
+    now = datetime.now(timezone.utc)
     offer = {"topic": topic, "action": action}
     if definition is not None:
         offer["definition"] = definition
-    offer["set_at"] = datetime.now(timezone.utc)
-    bot.conversations[chat_id] = {"messages": [], "timestamps": [], "pending_offer": offer}
+    offer["set_at"] = now
+    bot.conversations[chat_id] = {
+        "messages": [AIMessage(content="Should I go ahead?")], "timestamps": [now], "pending_offer": offer,
+    }
 
 
 def test_an_affirmed_proposal_is_saved_without_the_agent_loop_running(monkeypatch, isolated_subscribers_db):
@@ -777,6 +786,34 @@ def test_a_pending_offer_skips_the_router_entirely(monkeypatch, isolated_subscri
     assert result["category"] == "find_interests"
 
 
+def test_layer_2_is_skipped_for_any_ongoing_conversation_not_just_a_pending_offer(
+    monkeypatch, isolated_subscribers_db
+):
+    """Measured live by qa-engineer, 2026-09-24: a topic-free but
+    genuinely contextual reply ("sure", "the first one") answering an
+    ordinary agent question -- NOT a propose_interest confirmation, so no
+    pending offer exists yet -- got misclassified as off-topic by layer 2
+    up to 100% of the time in one sample once the skip condition was
+    narrowed to "only when a pending offer exists". Layer 2 must skip for
+    ANY ongoing conversation (any non-empty history), matching the old
+    design's blanket mid-exploration bypass, not just the pending-offer
+    case."""
+    run_turn = _stub_agent_turn(monkeypatch)
+    classify = MagicMock()
+    monkeypatch.setattr(bot.guardrails, "classify_message", classify)
+    bot.conversations[7] = {
+        "messages": [AIMessage(content="Here are a few examples, which land?")],
+        "timestamps": [datetime.now(timezone.utc)],
+        "pending_offer": None,
+    }
+
+    result = asyncio.run(bot.process_message(7, "the first one", "m", "g"))
+
+    classify.assert_not_called()
+    run_turn.assert_called_once()
+    assert result["blocked_at"] is None
+
+
 def test_a_bare_confirmation_with_nothing_pending_gets_an_honest_reply(monkeypatch, isolated_subscribers_db):
     """docs/plans/front-door-agent-plan.md's actual defect: a confirmation-
     shaped message can outlive the offer it was answering (a conversation
@@ -900,3 +937,37 @@ def test_an_agent_turn_is_kept_in_history(monkeypatch, isolated_subscribers_db):
 
     messages = bot.conversations[7]["messages"]
     assert [m.content for m in messages] == ["yes", "Which of these interest you?"]
+
+
+def test_a_new_pending_offer_from_a_real_tool_call_gets_a_fresh_set_at(
+        cached_articles, isolated_subscribers_db, monkeypatch):
+    """QA coverage gap, 2026-09-24: bot._persist_turn's "stamp set_at
+    fresh for a brand-new offer" branch was only ever exercised through
+    the _pending() test helper, which always pre-seeds an offer that
+    already carries set_at -- so the "fresh" branch's actual behavior was
+    never asserted end to end. This drives it through the real (non-
+    mocked) run_turn -> propose_interest path instead."""
+    monkeypatch.setattr(bot.guardrails, "fails_local_prefilter", MagicMock(return_value=False))
+    monkeypatch.setattr(bot.guardrails, "classify_message", MagicMock(
+        return_value=guardrails.MessageClassification(on_topic=True, categories=["find_interests"])))
+    monkeypatch.setattr(bot.guardrails, "is_output_on_topic", MagicMock(return_value=True))
+    # Explicitly stubbed rather than left to the real classifier: it would
+    # otherwise call guard_model.with_structured_output(...).invoke(...)
+    # on the SAME FakeToolCallingModel instance used below, consuming one
+    # of its two scripted responses before run_turn's own agent loop gets
+    # to them.
+    monkeypatch.setattr(bot.interest_finder, "reads_as_bare_confirmation", MagicMock(return_value=False))
+    model = FakeToolCallingModel(responses=[
+        AIMessage(content="", tool_calls=[
+            {"name": "propose_interest",
+             "args": {"topic": "chips", "definition": "chip manufacturing"}, "id": "1"}]),
+        AIMessage(content="Should I add chips?"),
+    ])
+
+    before = datetime.now(timezone.utc)
+    asyncio.run(bot.process_message(7, "add chips", model, model, embedder=FakeEmbedder()))
+    after = datetime.now(timezone.utc)
+
+    offer = bot.conversations[7]["pending_offer"]
+    assert offer["topic"] == "chips"
+    assert before <= offer["set_at"] <= after

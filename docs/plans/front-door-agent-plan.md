@@ -24,21 +24,37 @@ Implemented as two PRs: **Step A** (#105) added `search_news`/`start_push`/
 `stop_push` as agent tools with routing untouched; **Step B** (this pass)
 switched all routing to the single agent, merged `chat_histories`/
 `interest_sessions` into `conversations`, and deleted Route A/B's
-deterministic dispatch along with `end_exploration`/`MAX_TURNS`. A known,
-accepted residual risk from Step A carries forward: multi-tool-call
-reliability within one turn is not 100% (measured ~7% for
-`stop_push`-right-after-`start_push`); Step B's removal of the separate
-deterministic multi-category join means a multi-intent message ("add X
-and tell me what's new") now depends on this same reliability instead of
-a guarantee. Accepted for the same reason -- narrow blast radius today,
-expected to improve once Jev (item 5) is available.
+deterministic dispatch along with `end_exploration`/`MAX_TURNS`.
 
-A new, narrower live-model question this pass surfaces (see
-`tools/run_smoke_tests.py` case 18): without item 1's old blanket
-"mid-exploration messages skip the router" behavior, a topic-free but
-genuinely contextual follow-up ("the first one") now reaches layer 2's
-on-topic classifier for the first time. Not yet verified live whether the
-router reliably classifies this as on-topic -- flagged for qa-engineer.
+**Two things qa-engineer measured live against the real model, 2026-09-24,
+after Step B first shipped:**
+
+1. **Layer 2 misclassifying a contextual mid-conversation follow-up as
+   off-topic -- real, fixed.** Step B's first cut narrowed the router's
+   skip condition to "only when a pending offer exists" (item 4's own
+   scope). Measured: a topic-free but genuinely contextual reply ("sure",
+   "the first one") answering an ordinary agent question -- not a
+   propose_interest confirmation, so no pending offer exists yet --
+   got misclassified as off-topic 1/3 to 3/3 of the time across a small
+   sample (67% overall on-topic across 6 phrasings × 3 trials). Fixed by
+   widening the skip condition back to "any ongoing conversation" (any
+   non-empty history), matching the OLD design's blanket bypass -- layer
+   1 (local prefilter) and layer 4 (output check) were never dependent on
+   layer 2 catching this, so nothing is lost by widening it back. Layer 2
+   now runs only on the first message of a fresh (empty-history)
+   conversation.
+
+2. **Multi-intent reliability -- real, NOT fixed, needs a decision.**
+   Step A's own accepted-risk framing ("~7% for `stop_push`-right-after-
+   `start_push`") was assumed to extend to Step B's removal of the
+   separate deterministic multi-category join. Measured instead, for "add
+   robotics to my interests and tell me what's new with it": **3/25 (12%)
+   trials satisfied BOTH intents.** The dominant failure mode wasn't a
+   partial/deferred answer -- the news half was answered well and the
+   interest-add half was silently dropped entirely, not mentioned at all.
+   This is a materially different (and much worse) number than the
+   assumption it was accepted under. Not resolved as of this writing --
+   see the open items below.
 
 ## What triggered this
 
@@ -204,6 +220,18 @@ changes is who invokes it and who holds the conversation.
 
 ## Open
 
+- **Multi-intent reliability (12% measured, see Status above) needs a
+  decision.** Options considered but not yet chosen between: (a) accept
+  it as-is, same reasoning as the rest of this plan's accepted risks --
+  narrow-ish blast radius, expected to improve once Jev is available; (b)
+  restore some form of deterministic handling specifically for the
+  "add/remove an interest + ask a news question in the same message"
+  shape, without reintroducing a general category-based dispatch split;
+  (c) something else. Whichever is chosen, `tools/run_smoke_tests.py`
+  case 14 and `tests/test_interest_finder.py`'s
+  `test_multi_category_messages_still_go_through_one_agent_turn` should
+  be revisited to reflect the actual decision, not just document the
+  measurement.
 - **Jev early access is not granted yet.** Item 5 is blocked on it, and
   its API is not OpenAI-wire-compatible, so it needs its own adapter
   (`agent.build_model_from_config`'s `ChatOpenAI` path cannot reach it).
