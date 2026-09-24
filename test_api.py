@@ -97,7 +97,9 @@ class _Handler(BaseHTTPRequestHandler):
 
         server = self.server  # type: _Server
         future = asyncio.run_coroutine_threadsafe(
-            info_bot.process_message(chat_id, text, server.model, server.guard_model, server.embedder), server.loop
+            info_bot.process_message(
+                chat_id, text, server.model, server.guard_model, server.jev_api_key, server.embedder),
+            server.loop,
         )
         try:
             result = future.result(timeout=CALL_TIMEOUT_SECONDS)
@@ -116,15 +118,16 @@ class _Handler(BaseHTTPRequestHandler):
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, loop, model, guard_model, embedder=None):
+    def __init__(self, loop, model, guard_model, jev_api_key, embedder=None):
         super().__init__((HOST, PORT), _Handler)
         self.loop = loop
         self.model = model
         self.guard_model = guard_model
+        self.jev_api_key = jev_api_key
         self.embedder = embedder
 
 
-def start(model, guard_model, embedder=None) -> _Server | None:
+def start(model, guard_model, jev_api_key, embedder=None) -> _Server | None:
     """Starts the test API in a background thread if ENABLE_TEST_API is
     set; returns None (does nothing) otherwise. Call stop() with the
     returned server on shutdown. Must be called from the thread running
@@ -133,7 +136,7 @@ def start(model, guard_model, embedder=None) -> _Server | None:
     if not resolved_optional("test_api.enabled"):
         return None
     loop = asyncio.get_running_loop()
-    server = _Server(loop, model, guard_model, embedder)
+    server = _Server(loop, model, guard_model, jev_api_key, embedder)
     thread = threading.Thread(target=server.serve_forever, daemon=True, name="test-api")
     thread.start()
     print(f"[test_api] listening on {HOST}:{PORT} (ENABLE_TEST_API set) -- POST /test_message")

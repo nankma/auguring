@@ -74,6 +74,14 @@ models:
     reasoning_effort: none
     request_timeout_seconds: 20
 
+# Jev (TypeSafe AI), reached via OpenRouter -- backs guardrails.py's
+# layers 2 and 4 only (docs/plans/front-door-agent-plan.md item 5). See
+# settings.yml's own comment for the full reasoning.
+jev:
+  api-key:
+    trailsign-resolve: environment-variable
+    name: OPENROUTER_API_KEY
+
 # ONE news_source: key for the whole file -- a second top-level mapping
 # silently drops everything above it (real incident, see
 # docs/standaloneplan/01-settings-migration.md's "news_source.*"
@@ -211,7 +219,6 @@ search:
 
 interest_finder:
   max_examples: 5
-  max_turns: 8
   max_steps_per_turn: 20
 
 # Free-trial usage caps -- see settings.yml's own comment for the full

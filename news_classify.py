@@ -308,8 +308,10 @@ def classify_articles(model, articles: list[dict], taxonomy: Taxonomy,
 
 
 class CategoryDescription(BaseModel):
-    # Reasoning first so the model works before it commits, the same
-    # field-order lesson already applied in guardrails.OutputCheck.
+    # Reasoning first so the model works before it commits -- the same
+    # field-order lesson measured in docs/plans/guardrails-plan.md (structured
+    # output is generated key-by-key in schema order, so a trailing
+    # reasoning field can't causally inform the fields above it).
     reasoning: str
     description: str
 
@@ -377,7 +379,7 @@ def _interest_request(text: str, alongside: list[str] | None) -> str:
 
 class NormalizedInterest(BaseModel):
     # Reasoning first so the model commits after working, not before --
-    # the field-order lesson from guardrails.OutputCheck.
+    # the field-order lesson from docs/plans/guardrails-plan.md.
     reasoning: str
     english: str
     # An explicit judgment, made BEFORE the examples, because asking only
@@ -496,7 +498,7 @@ def normalize_interest(model, text: str, alongside: list[str] | None = None) -> 
 
 class _RetrievalExpansion(BaseModel):
     # Reasoning first -- same field-order lesson as everywhere else in
-    # this module (guardrails.OutputCheck, NormalizedInterest).
+    # this module (docs/plans/guardrails-plan.md, NormalizedInterest).
     reasoning: str
     definition: str
 

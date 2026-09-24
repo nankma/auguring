@@ -11,10 +11,11 @@ vs. still planned (test suite, CI, real telemetry backend).
 The system prompt is layered per docs/plans/context-management-plan.md, not one
 static string: LAYER1_IDENTITY (tight, always-present) + LAYER2 (the
 news_query research/formatting instructions -- the only kind of turn that
-still reaches this agent loop, since settings categories are dispatched
-directly by dispatch_settings below, see that doc's settings-dispatch
-refactor) + layer 3 (the calling user's stored interests and language
-preference, read fresh from subscriber_ops) are composed by _compose_prompt()
+still reaches this agent loop; every other on-topic category runs through
+interest_finder.py's own conversational agent instead, see
+docs/plans/front-door-agent-plan.md) + layer 3 (the calling user's stored
+interests and language preference, read fresh from subscriber_ops) are
+composed by _compose_prompt()
 on every model call via LangChain's `dynamic_prompt` middleware -- see that
 doc for the research behind this shape and why it doesn't need a
 hand-built LangGraph graph.
@@ -154,13 +155,15 @@ LAYER1_IDENTITY = (
 # news_query used to be the only category that reached the agent loop --
 # it no longer does either, as of 2026-09-05 (see search_news's own note
 # below): its retrieval turned out to be fully boundable to a fixed
-# pipeline, the same way set_interest/remove_interest/start_push/
-# stop_push/set_language already were. Those are dispatched directly by
-# agent.dispatch_settings (below) once the router has already extracted
-# their arguments, per docs/plans/context-management-plan.md's
-# settings-dispatch refactor. LAYER1_IDENTITY/_compose_prompt/
-# build_agent/run_agent below are kept working but currently unused by
-# any live route -- see TOOLS's own comment for why.
+# pipeline. Every other on-topic category (set_interest/remove_interest/
+# start_push/stop_push/set_language/find_interests) now runs through
+# interest_finder.py's own conversational agent instead
+# (docs/plans/front-door-agent-plan.md), which calls build_agent/run_agent
+# below directly with its OWN tools/prompt (its own compose_prompt, not
+# this one) -- those two ARE a live route again, just never through this
+# module's own _compose_prompt/TOOLS. LAYER1_IDENTITY/_compose_prompt/
+# TOOLS/compose_prompt below are what's still unused by any live route --
+# see TOOLS's own comment for why.
 
 # Shared with news_push.py's digest-writing prompt (see that module) so the
 # two places that ever write a trend report can't drift apart the way
@@ -248,9 +251,10 @@ def _compose_prompt(request) -> str:
     language preference, if any). See docs/plans/context-management-plan.md.
 
     Settings confirmations (interests/push/language) used to have their
-    own layer-2 fragments here and go through this same loop; they're
-    dispatched directly by agent.dispatch_settings now, so this function
-    no longer branches on category at all."""
+    own layer-2 fragments here and go through this same loop; they run
+    through interest_finder.py's own agent now
+    (docs/plans/front-door-agent-plan.md), so this function no longer
+    branches on category at all."""
     context = request.runtime.context or {}
     parts = [LAYER1_IDENTITY, _NEWS_QUERY_INSTRUCTIONS]
 
@@ -404,12 +408,13 @@ def search_news(chat_id: int, query: str, history: list, model, guard_model, emb
     """Search the already-ingested news cache for `query` and return the
     most relevant recent articles as a finished, ready-to-send report --
     a one-off lookup, not a subscription; it does not add or change any
-    of the user's interests. Not a LangChain tool any more (see this
-    module's own note above) -- a plain function bot.py's news_query
-    route calls directly, exactly once per user question, guaranteed.
+    of the user's interests. Not a LangChain tool of THIS module any more
+    (see this module's own note above) -- called via interest_finder.py's
+    own search_news tool now (docs/plans/front-door-agent-plan.md), which
+    always passes an empty `history` (see that tool's own docstring for
+    why); direct callers may still pass real history.
 
-    `history` is this chat's prior conversation turns (whatever shape
-    bot.py's chat_histories already holds), used only by the
+    `history` is this chat's prior conversation turns, used only by the
     query-rewrite step to resolve a context-dependent follow-up -- this
     function itself has no memory of its own and makes no other use of
     it. `guard_model`/`embedder` are optional (default None) and this
@@ -505,40 +510,6 @@ def search_news(chat_id: int, query: str, history: list, model, guard_model, emb
     cited_links = telegram_html.links_actually_sent(report, results)
     subscriber_ops.mark_links_shown(chat_id, cited_links, datetime.now(timezone.utc))
     return report
-
-
-# --- Route B: settings dispatch, outside the agent loop -------------------
-# docs/plans/context-management-plan.md's settings-dispatch refactor.
-# set_interest/remove_interest/start_push/stop_push/set_language are
-# bounded, deterministic state changes the router (guardrails.classify_message)
-# has already fully decided, arguments included -- there's nothing left for
-# an agent loop to reason about, so bot.py's process_message calls this
-# directly instead of going through build_agent/run_agent for these
-# categories. Deterministic and model-free by design (the doc's own stated
-# goal): every branch here is a plain subscriber_ops write plus a template
-# string, fully unit-testable with no fake model needed. The one exception
-# a caller has to handle separately is translation -- this always returns
-# the English confirmation; bot.py translates it if the user has a
-# language preference set (checked *after* calling this, so a fresh
-# set_language change takes effect on its own confirmation too).
-
-# Public -- bot.py's process_message checks membership in this to decide
-# Route A vs. Route B for a given category. Shrunk 2026-09-10: adding,
-# removing, and reading back an interest, plus setting the reply
-# language, all moved to the SAME conversational agent as find_interests
-# (see agent.INTEREST_AGENT_CATEGORIES below and
-# docs/plans/interest-finder-plan.md's "front door" redesign) -- pushing
-# is a scheduling setting, not an interest, and is the only thing left
-# that's genuinely a one-shot, model-free settings change.
-ROUTE_B_CATEGORIES = {"start_push", "stop_push"}
-
-# Categories that open (or continue) the interest_finder conversational
-# agent instead of being dispatched by Route B or Route A. Split out from
-# ROUTE_B_CATEGORIES above rather than merged into it: these categories
-# are model-free in their EXTRACTION (the router still pulls out
-# topics/language as a conversation-opening hint) but not in their
-# EXECUTION -- see bot.py's process_message for where this is consulted.
-INTEREST_AGENT_CATEGORIES = {"find_interests", "set_interest", "remove_interest", "set_language"}
 
 
 def add_one_interest(chat_id: int, topic: str, model, known: list[str], definition: str) -> str:
@@ -637,38 +608,13 @@ def add_one_interest(chat_id: int, topic: str, model, known: list[str], definiti
     return reply
 
 
-def dispatch_settings(category: str, chat_id: int, classification) -> str:
-    """Performs the state change for one Route B category and returns an
-    English confirmation string. `classification` is the
-    guardrails.MessageClassification the router produced -- its
-    push_interval_hours field carries the one argument either remaining
-    category needs.
-
-    Shrunk 2026-09-10 to push scheduling only: adding/removing an
-    interest and setting the reply language moved to the interest_finder
-    conversational agent (see ROUTE_B_CATEGORIES/INTEREST_AGENT_CATEGORIES
-    above) -- interests always show a grounded definition and preview
-    before saving now, which a one-shot dispatch here can't do, and
-    reply-language switching needed to work mid-exploration, which a
-    separate Route B category can't either. No model parameter any more:
-    nothing left in this function makes an LLM call -- that was only ever
-    set_interest's own normalization step."""
-    if category == "start_push":
-        return enable_push(chat_id, classification.push_interval_hours)
-
-    if category == "stop_push":
-        return disable_push(chat_id)
-
-    raise ValueError(f"dispatch_settings called with a non-Route-B category: {category!r}")
-
-
 def enable_push(chat_id: int, interval_hours: int | None = None) -> str:
     """Turns the periodic digest on, optionally setting its interval, and
-    returns the English confirmation. Extracted from dispatch_settings so
-    the conversational agent's own start_push tool and the router's Route
-    B dispatch share ONE implementation -- two copies of "what turning
-    push on means" would drift, and the interval-validation branch below
-    is exactly the kind of detail that drifts first."""
+    returns the English confirmation. Called directly by the
+    interest_finder agent's start_push tool -- the only caller now that
+    Route B's deterministic settings dispatch has been retired
+    (docs/plans/front-door-agent-plan.md; every on-topic message goes
+    through the same conversational agent)."""
     subscriber_ops.set_push_enabled(chat_id, True)
     if interval_hours is not None:
         try:
@@ -680,8 +626,8 @@ def enable_push(chat_id: int, interval_hours: int | None = None) -> str:
 
 
 def disable_push(chat_id: int) -> str:
-    """The stop half of enable_push above -- same shared-implementation
-    reasoning."""
+    """The stop half of enable_push above -- called directly by the
+    interest_finder agent's stop_push tool, same reasoning."""
     subscriber_ops.set_push_enabled(chat_id, False)
     # A user's own stop is a deliberate reset, unlike the automatic
     # 3-strikes disable (news_push._strike_unreachable_subscriber),
@@ -698,9 +644,9 @@ def disable_push(chat_id: int) -> str:
 def build_agent(model, tools=None, middleware=None):
     """Builds a LangChain tool-calling agent -- an open-ended loop where
     the MODEL decides how many steps to take. Reserved for tasks that
-    genuinely can't be bounded in advance; everything bounded goes
-    through a fixed pipeline instead (see search_news's own note, and
-    dispatch_settings below, for the two shapes this codebase uses).
+    genuinely can't be bounded in advance; a one-off news search is
+    bounded, so it stays a fixed pipeline instead (see search_news's own
+    note) rather than a loop through this function.
 
     `tools`/`middleware` default to this module's own (currently empty)
     TOOLS and news-query prompt, preserving the original single-argument

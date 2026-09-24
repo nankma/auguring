@@ -56,10 +56,11 @@ news_cache:
 # The AI connector -- works with any provider speaking the OpenAI
 # /chat/completions wire format (Together.ai, Groq, Fireworks, a
 # self-hosted vLLM server, ...). `main` is the agent's own model;
-# `guardrail` backs the router/output-check layers (guardrails.py) --
-# independently swappable, shown here pointed at the same model.
-# reasoning_effort/request_timeout_seconds are optional; omit
-# reasoning_effort for a provider that doesn't accept it.
+# `guardrail` backs classify_confirmation/reads_as_bare_confirmation/
+# translation/interest-normalization (guardrails.py's router and output
+# check moved to Jev, see jev: below) -- independently swappable, shown
+# here pointed at the same model. reasoning_effort/request_timeout_seconds
+# are optional; omit reasoning_effort for a provider that doesn't accept it.
 models:
   main:
     url: https://api.deepseek.com
@@ -79,6 +80,18 @@ models:
     # Shorter than main's -- backs a live Telegram user's own message,
     # not a background batch job (agent.build_model_from_config's docstring).
     request_timeout_seconds: 20
+
+# Jev (TypeSafe AI's typed-decision model), reached via OpenRouter's alpha
+# decisions endpoint -- not a models.* entry since it isn't OpenAI-wire-
+# compatible (jev_client.py calls the endpoint directly, no
+# agent.build_model_from_config path). Backs guardrails.py's layers 2 and
+# 4 only (docs/plans/front-door-agent-plan.md item 5) -- fast, cheap,
+# typed yes/no decisions, never the conversational agent's own tool-
+# calling or free-text generation, which stays on models.main/guardrail.
+jev:
+  api-key:
+    trailsign-resolve: environment-variable
+    name: OPENROUTER_API_KEY
 
 # The news-fetching pipeline. ONE news_source: key for the whole file --
 # a second top-level `news_source:` mapping silently shadows this entire
@@ -263,17 +276,17 @@ search:
 # max_examples: how many real headlines one example-showing step puts in
 # front of the subscriber -- a "how much can a person weigh at once"
 # number (docs/analysis/interest-elicitation-survey.md), not a retrieval
-# one. max_turns: hard ceiling on user turns in one exploration, enforced
-# by bot.py, so a subscriber who keeps switching direction gets told
-# honestly it isn't working instead of looping. max_steps_per_turn: cap
-# measured, not guessed -- an uncovered topic makes the model rephrase and
-# re-search ~15 times, so 10 (the first value) cut real work off; see
-# docs/plans/interest-finder-plan.md's "two ceilings" section.
-# on model/tool steps WITHIN one turn -- the unbounded-cost failure PR #85
-# measured, and a different thing from max_turns.
+# one. max_steps_per_turn: cap on model/tool steps WITHIN one turn -- the
+# unbounded-cost failure PR #85 measured (an uncovered topic makes the
+# model rephrase and re-search ~15 times, so 10, the first value, cut
+# real work off); see docs/plans/interest-finder-plan.md's "two ceilings"
+# section. The other ceiling that section describes, max_turns (a hard
+# cap on user turns in one exploration), was retired 2026-09-24 -- this
+# agent is now the one always-on front door for every on-topic message
+# (docs/plans/front-door-agent-plan.md), so there is no separate
+# exploration "mode" left to bound the length of.
 interest_finder:
   max_examples: 5
-  max_turns: 8
   max_steps_per_turn: 20
 
 # Free-trial usage caps, assigned once per subscriber at approval time

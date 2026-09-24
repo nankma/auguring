@@ -5,11 +5,13 @@ the same shape works locally and in a long-running Kubernetes Deployment
 later. See docs/plans/deployment-plan.md.
 
 Reuses setup_telemetry from agent.py unchanged — this file only adds the
-Telegram-specific plumbing (per-chat history, handler registration, the
-polling loop). news_query replies go through agent.search_news, a plain
-deterministic function, not agent.py's build_agent/run_agent tool-calling
-loop -- see search_news's own docstring for why (kept working but
-currently unused by any live route, in case a future feature needs it).
+Telegram-specific plumbing (per-chat conversation state, handler
+registration, the polling loop). Every on-topic message -- a news
+question, adding/removing/redefining an interest, push settings, reply
+language -- goes through the same always-on interest_finder conversational
+agent now (see process_message, docs/plans/front-door-agent-plan.md);
+agent.search_news is one of that agent's own tools, not a separate
+deterministic dispatch path.
 
 Access is gated by an approval workflow (see docs/plans/bot-features-plan.md item
 1): ADMIN_CHAT_ID is always allowed; anyone else's first message registers
@@ -35,10 +37,7 @@ from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
-from agent import (
-    INTEREST_AGENT_CATEGORIES, ROUTE_B_CATEGORIES, build_model_from_settings, dispatch_settings,
-    search_news, setup_telemetry,
-)
+from agent import build_model_from_settings, setup_telemetry
 from app_settings import get_settings
 import admin_bot
 import guardrails
@@ -87,12 +86,28 @@ PUSH_TICK_SECONDS = get_settings().resolved("push.tick_seconds", default=900)
 # not push delivery.
 INGEST_TICK_SECONDS = get_settings().resolved("news_source.tick_seconds", default=900)
 
-# Per-chat conversation history. In-memory only — lost on restart, same as
-# the CLI's messages list. Not persisted; fine for now, revisit if needed.
-# Each value is (messages, timestamps) -- a parallel list of when each
-# message was added, needed for the age-based trim below since LangChain
-# message objects/dicts carry no wall-clock timestamp of their own.
-chat_histories: dict[int, tuple[list, list[datetime]]] = {}
+# Per-chat conversation state -- messages AND a pending confirmation
+# offer, as ONE object with ONE lifetime (docs/plans/front-door-agent-plan.md).
+# In-memory only — lost on restart, same as the CLI's messages list. Not
+# persisted; fine for now, revisit if needed.
+#
+# conversations[chat_id] = {
+#     "messages": list, "timestamps": list[datetime] (parallel to messages
+#         -- needed for the age-based trim below since LangChain message
+#         objects/dicts carry no wall-clock timestamp of their own),
+#     "pending_offer": {"topic":..., "action":..., "definition":...,
+#         "set_at": datetime} | None,
+# }
+#
+# Before 2026-09-24 this was two separate structures (chat_histories +
+# interest_sessions) with two separate lifetimes -- and that mismatch was
+# a real defect (docs/plans/front-door-agent-plan.md's "actual defect"
+# section): a session could close in the same turn a question was asked,
+# while the message history survived, so a subscriber's later "yes" could
+# outlive the very question it was answering and fall through to be
+# misinterpreted elsewhere. Merging them into one object with one trim
+# policy removes the mismatch instead of patching each way it could occur.
+conversations: dict[int, dict] = {}
 
 # Real question, 2026-08-09: does the layered system prompt (agent.py's
 # _compose_prompt) or this conversation history risk a context-window
@@ -107,29 +122,6 @@ chat_histories: dict[int, tuple[list, list[datetime]]] = {}
 # on a new question), so there's little value in keeping much around.
 MAX_HISTORY_AGE = timedelta(hours=1)
 MAX_HISTORY_MESSAGES = 20
-
-# Per-chat "an interest exploration is in progress" state -- the one piece
-# of real conversational MODE this bot has (see interest_finder.py).
-#
-# It exists because every other path here is stateless per message: layer
-# 2 classifies each message on its own, which works fine when every
-# message carries its own topical signal. An exploration's follow-ups
-# don't -- "yes", "the second one", "more like that but hardware" mean
-# nothing to a classifier reading them cold, and would be routed
-# somewhere unrelated. agent.add_one_interest's own comment already named
-# this gap from the other side, explaining why it offers a hint rather
-# than asking a question: "asking would need state ('this subscriber owes
-# me an answer') that the next message would otherwise be routed straight
-# past". This is that state.
-#
-# In-memory, same as chat_histories and with the same consequence: a
-# container restart drops an in-flight exploration and the subscriber
-# has to start over. Accepted deliberately -- this is a conversation, not
-# a transaction, and nothing is half-written when it's lost (interests
-# are only ever saved on an explicit confirmed step).
-#
-# {chat_id: {"turns": int, "done": bool, "saved": [...], "dropped": [...]}}
-interest_sessions: dict[int, dict] = {}
 
 
 def _trim_history(messages: list, timestamps: list[datetime], now: datetime) -> tuple[list, list[datetime]]:
@@ -159,16 +151,36 @@ def _trim_history(messages: list, timestamps: list[datetime], now: datetime) -> 
     return list(trimmed_messages), list(trimmed_timestamps)
 
 
-def _get_trimmed_history(chat_id: int) -> tuple[list, list[datetime]]:
-    """Reads this chat's history and trims it, storing the trimmed result
-    back immediately -- stale entries get dropped every turn regardless
-    of whether *this* turn's exchange ends up persisted (see
-    handle_message), not just when a new message happens to push past
-    the limit."""
-    messages, timestamps = chat_histories.get(chat_id, ([], []))
-    messages, timestamps = _trim_history(messages, timestamps, datetime.now(timezone.utc))
-    chat_histories[chat_id] = (messages, timestamps)
-    return messages, timestamps
+def _get_conversation(chat_id: int) -> dict:
+    """Reads this chat's conversation and trims it, storing the trimmed
+    result back immediately -- stale entries get dropped every turn
+    regardless of whether *this* turn's exchange ends up persisted (see
+    handle_message), not just when a new message happens to push past a
+    limit.
+
+    The pending offer ages out by the SAME MAX_HISTORY_AGE rule as the
+    messages around it, via its own "set_at" -- it is part of this
+    conversation's data now, not a separately-tracked session with its
+    own lifetime (docs/plans/front-door-agent-plan.md). Two checks, not
+    one, because MAX_HISTORY_AGE and MAX_HISTORY_MESSAGES are independent
+    caps: a pure age check alone would miss the case where the COUNT cap
+    trims away the very message that made the offer (its timestamp always
+    matches or precedes "set_at") while the offer itself is still within
+    the age window -- which would leave classify_confirmation's
+    history[-1] anchor pointing at a later, unrelated reply. Code-review
+    finding: caught before this could actually happen live."""
+    conv = conversations.get(chat_id, {"messages": [], "timestamps": [], "pending_offer": None})
+    now = datetime.now(timezone.utc)
+    messages, timestamps = _trim_history(conv["messages"], conv["timestamps"], now)
+    pending_offer = conv["pending_offer"]
+    if pending_offer is not None:
+        if now - pending_offer["set_at"] > MAX_HISTORY_AGE:
+            pending_offer = None
+        elif timestamps and pending_offer["set_at"] < timestamps[0]:
+            pending_offer = None
+    conv = {"messages": messages, "timestamps": timestamps, "pending_offer": pending_offer}
+    conversations[chat_id] = conv
+    return conv
 
 
 _MARKDOWN_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
@@ -404,7 +416,7 @@ async def handle_interests_command(update: Update, context: ContextTypes.DEFAULT
     # Normalized here too, not only on the conversational path: this
     # command bypasses the router entirely, so an interest typed as
     # "/interests 光通訊" would otherwise be stored untranslated and search
-    # for nothing. Same reasoning as dispatch_settings.
+    # for nothing.
     raw = [t.strip() for t in text_after_command.split(",") if t.strip()]
     # This command writes the list wholesale rather than going through
     # subscriber_ops.add_interest, so it has to enforce the cap itself -- without
@@ -481,71 +493,8 @@ def _translate_confirmation(model, text: str, language: str) -> str:
     return result.content
 
 
-async def _route_b_reply(chat_id: int, classification, guard_model, category: str) -> tuple[str | None, str]:
-    """Runs one Route B category (push scheduling only, since 2026-09-10
-    -- see agent.dispatch_settings's own docstring) and returns
-    (blocked_at, reply) -- no history side effects, since a multi-category
-    turn (see _process_multi_category) needs to combine several of these
-    into one history entry, not one each. See
-    docs/plans/context-management-plan.md's settings-dispatch refactor for
-    why this is model-free except for the one translation call below."""
-    reply = dispatch_settings(category, chat_id, classification)
-
-    # A language preference governs every reply, not just news_query --
-    # checked *after* dispatch_settings, so a set_language turn's own
-    # confirmation is written in the language it just set. Layer 4 only
-    # runs on this path: a plain English template isn't model output, so
-    # there's nothing to check when no translation happened.
-    language = subscriber_ops.get_language(chat_id)
-    if language:
-        reply = await asyncio.to_thread(_translate_confirmation, guard_model, reply, language)
-        # Same safety nets Route A applies to its own model-generated text
-        # -- this is real LLM output too, not the fixed template above.
-        reply = _strip_report_preamble(_normalize_markdown_bold(reply))
-        output_on_topic = await asyncio.to_thread(guardrails.is_output_on_topic, guard_model, reply, category)
-        if not output_on_topic:
-            return "layer4_output_check", guardrails.REDIRECT_MESSAGE
-
-    return None, reply
-
-
-async def _route_a_reply(
-    model, chat_id: int, user_text: str, history: list, category: str, guard_model, embedder=None
-) -> tuple[str | None, str]:
-    """Runs the news_query search (agent.search_news -- a plain,
-    deterministic function, not a tool-calling agent loop, see its own
-    docstring) and returns (blocked_at, reply). `history` is this chat's
-    prior turns, used only by search_news's own query-rewrite step to
-    resolve a context-dependent follow-up ("what about Nvidia?") --
-    passed straight through, not otherwise touched here. guard_model/
-    embedder are both optional -- search_news degrades gracefully without
-    either, so a caller that hasn't built one yet (or a test) can pass
-    embedder=None."""
-    try:
-        _t0 = time.monotonic()
-        report = await asyncio.to_thread(search_news, chat_id, user_text, history, model, guard_model, embedder)
-        _events.log("latency_search_news_total", {"message": "search_news returned",
-                     "duration_seconds": round(time.monotonic() - _t0, 3)})
-    except Exception as exc:
-        return "agent_error", f"Something went wrong: {exc}"
-
-    final_content = _strip_report_preamble(_normalize_markdown_bold(report))
-
-    # Guardrail layer 4: re-checks the model's actual output before it's
-    # sent -- the layer that catches drift layers 1-3 missed, since the
-    # failure is only visible in what the model wrote, not the input.
-    _t0 = time.monotonic()
-    output_on_topic = await asyncio.to_thread(guardrails.is_output_on_topic, guard_model, final_content, category)
-    _events.log("latency_layer4_output_check", {"message": "output guardrail checked the reply",
-                 "duration_seconds": round(time.monotonic() - _t0, 3)})
-    if not output_on_topic:
-        return "layer4_output_check", guardrails.REDIRECT_MESSAGE
-
-    return None, final_content
-
-
 async def _execute_pending_proposal(
-    chat_id: int, user_text: str, pending: dict, session: dict, guard_model,
+    chat_id: int, user_text: str, pending: dict, guard_model, jev_api_key: str,
     history: list, history_timestamps: list[datetime],
 ) -> dict:
     """Deterministically completes a propose_interest or
@@ -556,30 +505,22 @@ async def _execute_pending_proposal(
     the write happens directly, in code, the moment classify_confirmation
     says "affirm" -- it cannot depend on the model remembering to act.
 
-    Mirrors _route_b_reply's shape (execute, translate if needed, re-run
-    layer 4) since this is functionally the same kind of deterministic
-    settings write, just triggered from inside an exploration instead of
-    the router -- except layer 4 always runs here, even without
-    translation, unlike _route_b_reply's plain fixed-template case: every
-    branch below (execute_save/execute_drop/execute_redefine) embeds a
-    model-normalized topic name or subscriber-chosen definition, not a
-    fixed string, so it's real model-adjacent output every time, not
-    just when translated."""
+    An error or a layer-4 block here explicitly clears the conversation's
+    pending_offer (rather than leaving it standing) -- a confirmed
+    proposal that failed to execute must not silently bind to a later,
+    unrelated "yes"."""
     topic, action = pending["topic"], pending["action"]
     try:
         if action == "add":
-            reply = interest_finder.execute_save(chat_id, topic, pending["definition"], guard_model, session)
+            reply = interest_finder.execute_save(chat_id, topic, pending["definition"], guard_model)
         elif action == "remove":
-            reply = interest_finder.execute_drop(chat_id, topic, session)
+            reply = interest_finder.execute_drop(chat_id, topic)
         elif action == "redefine":
-            reply = interest_finder.execute_redefine(chat_id, topic, pending["definition"], session)
+            reply = interest_finder.execute_redefine(chat_id, topic, pending["definition"])
         else:
             raise ValueError(f"unknown pending_proposal action: {action!r}")
     except Exception as exc:
-        # Same invariant as every other exit from _process_find_interests:
-        # an error clears the session rather than leaving it stuck in a
-        # mode the subscriber can't get out of.
-        interest_sessions.pop(chat_id, None)
+        conversations[chat_id]["pending_offer"] = None
         _events.log("interest_exploration_failed",
                      {"message": "executing a confirmed proposal raised", "chat_id": chat_id, "topic": topic},
                      level=Level.ERROR, exc=exc)
@@ -591,182 +532,195 @@ async def _execute_pending_proposal(
         reply = await asyncio.to_thread(_translate_confirmation, guard_model, reply, language)
         reply = _strip_report_preamble(_normalize_markdown_bold(reply))
 
-    output_on_topic = await asyncio.to_thread(guardrails.is_output_on_topic, guard_model, reply, "find_interests")
+    output_on_topic = await asyncio.to_thread(
+        guardrails.is_output_on_topic, reply, jev_api_key, user_text)
     if not output_on_topic:
-        interest_sessions.pop(chat_id, None)
+        conversations[chat_id]["pending_offer"] = None
         return {"blocked_at": "layer4_output_check", "category": "find_interests",
                 "reply": guardrails.REDIRECT_MESSAGE}
 
     new_messages = [HumanMessage(content=user_text), AIMessage(content=reply)]
-    _persist_turn(chat_id, history + new_messages, history_timestamps, new_messages)
+    _persist_turn(chat_id, history + new_messages, history_timestamps, new_messages, None)
     return {"blocked_at": None, "category": "find_interests", "reply": reply}
 
 
-async def _process_find_interests(chat_id: int, user_text: str, model, guard_model, embedder=None) -> dict:
-    """One exchange of an interest-finding exploration -- both the first
-    one (routed here by layer 2) and every follow-up (routed here by the
-    session check in process_message, bypassing layer 2 entirely).
+async def _lost_context_reply(chat_id: int, guard_model) -> str:
+    """The honest reply for a message that only makes sense as answering
+    a pending offer, when this conversation has no pending offer on
+    record -- docs/plans/front-door-agent-plan.md's actual defect: history
+    and a pending offer used to have different lifetimes, so a stray
+    "yes" could survive the very question it was answering. A fixed,
+    translated template, not a model-generated guess -- guessing what
+    they meant is exactly what this replaces."""
+    reply = ("I think that's answering something I asked earlier, but I don't have a "
+             "record of it any more -- it's been a while, or the bot restarted in "
+             "between. Could you say again what you'd like?")
+    language = subscriber_ops.get_language(chat_id)
+    if language:
+        reply = await asyncio.to_thread(_translate_confirmation, guard_model, reply, language)
+    return reply
 
-    Two ceilings, deliberately separate. interest_finder.MAX_STEPS_PER_TURN
-    caps what ONE turn may spend internally; MAX_TURNS below caps the
-    conversation. The second one is enforced here rather than by the model
-    because "we're going in circles" is exactly the self-assessment models
-    are unreliable at -- a counter is not.
 
-    The session is cleared on every exit that isn't "keep going": the
-    model finishing, the turn ceiling, or an error. Leaving a stale entry
-    behind would silently swallow the subscriber's next message, which is
-    a far worse failure than making them re-open an exploration."""
-    session = interest_sessions.setdefault(chat_id, {"turns": 0})
-    session["turns"] += 1
+async def _process_agent_turn(
+    chat_id: int, user_text: str, model, guard_model, jev_api_key: str, embedder=None,
+) -> dict:
+    """The single front-door path for every on-topic message, regardless
+    of what layer 2 would classify it as -- a news question, adding/
+    removing/redefining an interest, push settings, reply language, all
+    go through the same always-on interest_finder conversational agent
+    now (docs/plans/front-door-agent-plan.md). Replaces the old Route A
+    (news_query, dispatched straight to agent.search_news)/Route B
+    (start_push/stop_push, dispatched straight to agent.enable_push/
+    disable_push)/interest_finder-only split: Step A already gave this
+    agent every tool those routes used, so there was nothing left for a
+    separate deterministic dispatch to do that the agent's own
+    tool-calling can't.
 
-    history, history_timestamps = _get_trimmed_history(chat_id)
+    A pending offer (an unanswered propose_interest/propose_remove/
+    propose_definition) takes priority over everything below, INCLUDING
+    layer 2 -- a bare "yes" carries no topical signal for the router to
+    classify, so letting layer 2 see it first would route it somewhere
+    unrelated. More generally, layer 2 only ever runs on the FIRST
+    message of a fresh (empty-history) conversation -- see the comment at
+    its call site below for why a narrower "only skip it when there's a
+    pending offer" gate was tried first and measured to be a real
+    regression.
 
-    if session["turns"] > interest_finder.MAX_TURNS:
-        interest_sessions.pop(chat_id, None)
-        _events.log("interest_exploration_out_of_turns",
-                     {"message": "exploration hit the turn ceiling without converging",
-                      "chat_id": chat_id, "turns": session["turns"]}, level=Level.WARN)
-        reply = interest_finder.out_of_turns_message()
-        new_messages = [HumanMessage(content=user_text), AIMessage(content=reply)]
-        _persist_turn(chat_id, history + new_messages, history_timestamps, new_messages)
-        return {"blocked_at": None, "category": "find_interests", "reply": reply}
+    When there is neither a pending offer NOR any conversation history at
+    all, a message that only makes sense as answering something gets the
+    honest _lost_context_reply instead of being guessed at by the agent
+    -- see interest_finder.reads_as_bare_confirmation's own docstring for
+    the incident this exists to catch. The "no history either" condition
+    matters: with real history the top-level agent can resolve an
+    ordinary contextual follow-up ("the first one") itself, same as any
+    other reference to earlier in the conversation -- this check is only
+    for the case where there is nothing left to resolve it against at
+    all."""
+    conv = _get_conversation(chat_id)
+    history, history_timestamps, pending_offer = conv["messages"], conv["timestamps"], conv["pending_offer"]
 
-    # A pending propose_interest takes priority over the agent loop
-    # entirely -- classify_confirmation is a small, bounded call (same
-    # shape as guardrails.classify_message), not a new open-ended loop.
-    # "affirm" executes the write directly in code, never depending on
-    # the model to call save_interest/drop_interest itself. "decline"/
-    # "unclear" fall through to the normal turn below -- exactly as if no
-    # proposal were pending -- so a miss here is never worse than before
-    # this mechanism existed, only ever an improvement over it.
-    pending = session.get("pending_proposal")
-    if pending is not None:
+    if pending_offer is not None:
         # The subscriber's reply answers whatever the assistant said LAST
         # (history[-1], persisted at the end of the turn that set/refreshed
-        # this proposal) -- not the proposal in isolation. See
+        # this offer) -- not the offer in isolation. See
         # classify_confirmation's own docstring for the incident this
         # anchoring fixes.
         last_assistant_reply = history[-1].content if history else ""
         verdict = await asyncio.to_thread(
             interest_finder.classify_confirmation, guard_model, user_text, last_assistant_reply)
         if verdict == "affirm":
-            session.pop("pending_proposal", None)
             return await _execute_pending_proposal(
-                chat_id, user_text, pending, session, guard_model, history, history_timestamps)
+                chat_id, user_text, pending_offer, guard_model, jev_api_key, history, history_timestamps)
         if verdict == "decline":
-            session.pop("pending_proposal", None)
+            pending_offer = None
+    elif not history and await asyncio.to_thread(
+            interest_finder.reads_as_bare_confirmation, guard_model, user_text):
+        reply = await _lost_context_reply(chat_id, guard_model)
+        # Only real model output (a translation) needs layer 4 -- same
+        # reasoning as _execute_pending_proposal: the untranslated English
+        # template is our own fixed string, but a translated one is real,
+        # unchecked LLM output like any other. No user_text here (skipping
+        # the completeness question): this reply doesn't attempt to
+        # address the subscriber's message, it says plainly that it
+        # couldn't -- "did it address everything asked" isn't a
+        # meaningful question for an apology.
+        if subscriber_ops.get_language(chat_id):
+            reply = _strip_report_preamble(_normalize_markdown_bold(reply))
+            output_on_topic = await asyncio.to_thread(guardrails.is_output_on_topic, reply, jev_api_key)
+            if not output_on_topic:
+                return {"blocked_at": "layer4_output_check", "category": "context_lost",
+                        "reply": guardrails.REDIRECT_MESSAGE}
+        new_messages = [HumanMessage(content=user_text), AIMessage(content=reply)]
+        _persist_turn(chat_id, history + new_messages, history_timestamps, new_messages, None)
+        return {"blocked_at": None, "category": "context_lost", "reply": reply}
 
+    category = "find_interests"
+    if not history:
+        # Guardrail layer 2 -- the router, on Jev since
+        # docs/plans/front-door-agent-plan.md item 5: one Jev call answers
+        # "is this on-topic" and "what
+        # kind of request(s) is this". Only its on_topic gate drives
+        # anything now; `categories` is kept purely as a label for the
+        # return value/telemetry below, not to pick a dispatch path.
+        #
+        # Runs ONLY on the first message of a fresh (empty-history)
+        # conversation -- ANY ongoing conversation skips it, not just one
+        # with a live pending offer. Measured live (qa-engineer,
+        # 2026-09-24): a topic-free but genuinely contextual reply
+        # ("sure", "the first one") is misclassified as off-topic by this
+        # same router a third to all of the time -- the old design's
+        # blanket "any message in an open exploration skips layer 2"
+        # protected against exactly this, and narrowing that to
+        # "only when a pending offer exists" (this module's first attempt
+        # at this) was a real regression, not a simplification. Layer 1
+        # (local prefilter) and layer 4 (output check) still run
+        # regardless, same as they always did for a mid-exploration
+        # message under the old design -- layer 2 was never the sole
+        # defense against a mid-conversation off-topic pivot.
+        _t0 = time.monotonic()
+        classification = await asyncio.to_thread(guardrails.classify_message, user_text, jev_api_key)
+        _events.log("latency_layer2_classify", {"message": "router classified the message",
+                     "duration_seconds": round(time.monotonic() - _t0, 3)})
+        if not classification.on_topic:
+            return {"blocked_at": "layer2_router", "category": classification.categories[0],
+                    "reply": guardrails.REDIRECT_MESSAGE}
+        category = classification.categories[0]
+
+    session = {"pending_proposal": pending_offer}
     try:
         _t0 = time.monotonic()
-        reply, done = await asyncio.to_thread(
+        reply = await asyncio.to_thread(
             interest_finder.run_turn, chat_id, user_text, history, session, model, guard_model, embedder
         )
-        _events.log("latency_interest_turn", {"message": "interest_finder turn returned",
+        _events.log("latency_agent_turn", {"message": "front-door agent turn returned",
                      "duration_seconds": round(time.monotonic() - _t0, 3)})
     except Exception as exc:
-        interest_sessions.pop(chat_id, None)
-        _events.log("interest_exploration_failed", {"message": "exploration turn raised", "chat_id": chat_id},
+        _events.log("agent_turn_failed", {"message": "front-door agent turn raised", "chat_id": chat_id},
                      level=Level.ERROR, exc=exc)
-        return {"blocked_at": "agent_error", "category": "find_interests",
-                "reply": f"Something went wrong: {exc}"}
+        return {"blocked_at": "agent_error", "category": category, "reply": f"Something went wrong: {exc}"}
 
     final_content = _strip_report_preamble(_normalize_markdown_bold(reply))
 
-    # Layer 4, same as every other model-generated reply. guardrails'
-    # output-scope prompt was extended for this category specifically --
-    # an exploration reply is headlines plus a question, which is neither
-    # a news report nor a settings confirmation.
     output_on_topic = await asyncio.to_thread(
-        guardrails.is_output_on_topic, guard_model, final_content, "find_interests")
+        guardrails.is_output_on_topic, final_content, jev_api_key, user_text)
     if not output_on_topic:
-        interest_sessions.pop(chat_id, None)
-        return {"blocked_at": "layer4_output_check", "category": "find_interests",
-                "reply": guardrails.REDIRECT_MESSAGE}
-
-    if done:
-        interest_sessions.pop(chat_id, None)
+        return {"blocked_at": "layer4_output_check", "category": category, "reply": guardrails.REDIRECT_MESSAGE}
 
     new_messages = [HumanMessage(content=user_text), AIMessage(content=final_content)]
-    _persist_turn(chat_id, history + new_messages, history_timestamps, new_messages)
-    return {"blocked_at": None, "category": "find_interests", "reply": final_content}
+    _persist_turn(chat_id, history + new_messages, history_timestamps, new_messages, session.get("pending_proposal"))
+    return {"blocked_at": None, "category": category, "reply": final_content}
 
 
-def _persist_turn(chat_id: int, all_messages: list, history_timestamps: list[datetime], new_messages: list) -> None:
+def _persist_turn(
+    chat_id: int, all_messages: list, history_timestamps: list[datetime], new_messages: list,
+    pending_offer: dict | None,
+) -> None:
     """Stores `all_messages` (the full list to keep, including everything
     already in history) as this chat's new history, with a fresh shared
-    timestamp for `new_messages` -- the portion actually added this turn.
-    Only ever called once a turn is accepted -- a rejected exchange
-    doesn't pollute the conversation history the next turn sees."""
+    timestamp for `new_messages` -- the portion actually added this turn
+    -- and `pending_offer` as the conversation's new outstanding proposal
+    (or None). Only ever called once a turn is accepted -- a rejected
+    exchange doesn't pollute the conversation the next turn sees.
+
+    Stamps a fresh "set_at" onto `pending_offer` only if it doesn't
+    already have one -- a brand-new proposal (propose_interest et al.
+    always build a fresh dict with no "set_at") gets timed from now, while
+    one just carried over unresolved from a prior turn (verdict was
+    "unclear") keeps aging from when it was FIRST offered, not from every
+    turn it's merely still standing."""
     now = datetime.now(timezone.utc)
-    chat_histories[chat_id] = (all_messages, history_timestamps + [now] * len(new_messages))
+    if pending_offer is not None and "set_at" not in pending_offer:
+        pending_offer = {**pending_offer, "set_at": now}
+    conversations[chat_id] = {
+        "messages": all_messages,
+        "timestamps": history_timestamps + [now] * len(new_messages),
+        "pending_offer": pending_offer,
+    }
 
 
-async def _process_single_category(
-    chat_id: int, user_text: str, category: str, classification, model, guard_model, history: list,
-    history_timestamps: list[datetime], embedder=None,
+async def process_message(
+    chat_id: int, user_text: str, model, guard_model, jev_api_key: str, embedder=None,
 ) -> dict:
-    """The ordinary case -- classification.categories has exactly one
-    entry, the overwhelmingly common shape. Kept as its own path (rather
-    than always going through the general multi-category loop) for
-    symmetry with _process_multi_category, even though Route A and
-    Route B now persist history the same simple way -- see
-    docs/plans/context-management-plan.md's multi-category routing
-    section."""
-    if category in ROUTE_B_CATEGORIES:
-        blocked_at, reply = await _route_b_reply(chat_id, classification, guard_model, category)
-    else:
-        # Route A: news_query. chat_id feeds search_news's per-subscriber
-        # daily quota/dedup memory; `history` feeds its query-rewrite step
-        # (resolving a context-dependent follow-up like "what about
-        # Nvidia?"), nothing else.
-        blocked_at, reply = await _route_a_reply(
-            model, chat_id, user_text, history, category, guard_model, embedder
-        )
-    if blocked_at is not None:
-        return {"blocked_at": blocked_at, "category": category, "reply": reply}
-    new_messages = [HumanMessage(content=user_text), AIMessage(content=reply)]
-    _persist_turn(chat_id, history + new_messages, history_timestamps, new_messages)
-    return {"blocked_at": None, "category": category, "reply": reply}
-
-
-async def _process_multi_category(
-    chat_id: int, user_text: str, classification, model, guard_model, history: list,
-    history_timestamps: list[datetime], embedder=None,
-) -> dict:
-    """A message carrying more than one intent (e.g. "add robotics to my
-    interests and tell me what's new with it") -- each category in
-    classification.categories is dispatched in order and the replies are
-    joined into one message. All-or-nothing: if any segment is blocked,
-    the whole reply becomes REDIRECT_MESSAGE rather than sending a partial
-    result -- simplest and safest, matching the single-category behavior
-    this generalizes. See docs/plans/context-management-plan.md's
-    multi-category routing section for the design and its open points.
-
-    Each category sees the same original `history` and `user_text` --
-    not each other's replies from this same turn -- and the whole turn is
-    persisted as a single (Human, AI) pair with the joined final text, not
-    one pair per category, so history stays one entry per real user turn."""
-    reply_parts = []
-    for category in classification.categories:
-        if category in ROUTE_B_CATEGORIES:
-            blocked_at, reply = await _route_b_reply(chat_id, classification, guard_model, category)
-        else:
-            blocked_at, reply = await _route_a_reply(
-                model, chat_id, user_text, history, category, guard_model, embedder
-            )
-        if blocked_at is not None:
-            return {"blocked_at": blocked_at, "category": category, "reply": guardrails.REDIRECT_MESSAGE}
-        reply_parts.append(reply)
-
-    final_content = "\n\n".join(reply_parts)
-    new_messages = [HumanMessage(content=user_text), AIMessage(content=final_content)]
-    _persist_turn(chat_id, history + new_messages, history_timestamps, new_messages)
-
-    return {"blocked_at": None, "category": classification.categories[0], "reply": final_content}
-
-
-async def process_message(chat_id: int, user_text: str, model, guard_model, embedder=None) -> dict:
     """The actual guardrail/agent/formatting pipeline, independent of
     Telegram's Update/Context objects -- extracted so test_api.py's local
     curl endpoint (docs/reference/local-testing-api-plan.md) exercises this exact
@@ -778,8 +732,9 @@ async def process_message(chat_id: int, user_text: str, model, guard_model, embe
     blocked_at names which layer stopped the message (None if it went all
     the way through) -- useful for a test caller to assert on without
     parsing the reply text or cross-referencing docker logs/Logfire.
-    `category` is the first (or only) category classified for this turn --
-    see _process_multi_category for how more than one is handled.
+    `category` reflects what layer 2 classified the message as when it
+    ran (see _process_agent_turn) -- purely informational now, not a
+    dispatch decision; every on-topic message goes to the same agent.
 
     Logs and re-raises on an unhandled failure ANYWHERE in the pipeline
     below (a DeepSeek timeout, a tool call raising, guardrails.
@@ -803,76 +758,18 @@ async def process_message(chat_id: int, user_text: str, model, guard_model, embe
             return {"blocked_at": "layer1_prefilter", "category": None, "reply": guardrails.REDIRECT_MESSAGE}
 
         # Free-trial usage cap (requested 2026-09-18, changed 2026-09-19
-        # after live INT testing surfaced that the original placement --
-        # after the interest_sessions bypass, so an open exploration's own
-        # turns were never re-checked -- read as "no limit" to a
-        # subscriber who kept an exploration open past their allowance.
-        # Every turn now spends one interaction if the subscriber has a
-        # finite allowance, whether it opens a new request or continues
-        # one already in progress. Checked before the interest_sessions
-        # bypass below AND before layer 2's paid router call for a
-        # brand-new request -- the cheapest correct place either way,
-        # same reasoning as layer 1 running first. If this blocks a turn
-        # that WAS continuing an open exploration, that session is
-        # cleared too (pop is a safe no-op otherwise) -- same "don't
-        # leave a dead session behind" rule every other hard stop out of
-        # _process_find_interests already follows. See
-        # subscriber_ops.try_consume_agent_interaction's own docstring
+        # after live INT testing surfaced that checking it only for a
+        # brand-new request read as "no limit" to a subscriber who kept a
+        # conversation going past their allowance). Every turn now spends
+        # one interaction if the subscriber has a finite allowance,
+        # whether it opens a new request or continues one already in
+        # progress. Checked before anything else that costs a model call.
+        # See subscriber_ops.try_consume_agent_interaction's own docstring
         # for what "no limit" (NULL/-1) means.
         if not subscriber_ops.try_consume_agent_interaction(chat_id):
-            interest_sessions.pop(chat_id, None)
             return {"blocked_at": "trial_limit_reached", "category": None, "reply": TRIAL_AGENT_LIMIT_MESSAGE}
 
-        # An in-flight interest exploration takes precedence over layer 2 --
-        # deliberately, and this ordering is the whole point of
-        # interest_sessions. A follow-up like "yes" or "the second one"
-        # carries no topical signal for the router to classify, so letting
-        # layer 2 see it first would route it somewhere unrelated and the
-        # conversation would silently fall apart mid-flow. Layer 1 still
-        # runs above (it is free, local, and an injection attempt mid-
-        # exploration is still an injection attempt); layer 4 still runs
-        # below on whatever the exploration replies.
-        if chat_id in interest_sessions:
-            return await _process_find_interests(chat_id, user_text, model, guard_model, embedder)
-
-        # Guardrail layer 2 -- the router (docs/plans/context-management-plan.md):
-        # one structured-output call answers "is this on-topic", "what kind of
-        # request(s) is this", and (for Route B categories) the arguments each
-        # one needs -- gating the expensive agent call and, for settings
-        # categories, replacing it entirely.
-        _t0 = time.monotonic()
-        classification = await asyncio.to_thread(guardrails.classify_message, guard_model, user_text)
-        _events.log("latency_layer2_classify", {"message": "router classified the message",
-                     "duration_seconds": round(time.monotonic() - _t0, 3)})
-        if not classification.on_topic:
-            return {"blocked_at": "layer2_router", "category": classification.categories[0], "reply": guardrails.REDIRECT_MESSAGE}
-
-        # find_interests, and (since 2026-09-10) set_interest/
-        # remove_interest/set_language all open the SAME conversational
-        # MODE now -- adding an interest always shows a grounded
-        # definition and real examples before saving, never a blind
-        # one-shot add (docs/plans/interest-finder-plan.md's front-door
-        # redesign), and removing/language-switching moved alongside it
-        # so they keep working mid-exploration instead of needing to
-        # escape it. This can't be one segment of a multi-category reply
-        # the way the settings categories used to be -- it owns the turns
-        # that follow. If the router sees ANY of these categories, the
-        # whole message goes to the agent; it can act on the rest of what
-        # they said itself (it has tools for all four), which a joined
-        # reply could not.
-        if INTEREST_AGENT_CATEGORIES.intersection(classification.categories):
-            return await _process_find_interests(chat_id, user_text, model, guard_model, embedder)
-
-        history, history_timestamps = _get_trimmed_history(chat_id)
-
-        if len(classification.categories) == 1:
-            return await _process_single_category(
-                chat_id, user_text, classification.categories[0], classification, model, guard_model,
-                history, history_timestamps, embedder,
-            )
-        return await _process_multi_category(
-            chat_id, user_text, classification, model, guard_model, history, history_timestamps, embedder
-        )
+        return await _process_agent_turn(chat_id, user_text, model, guard_model, jev_api_key, embedder)
     except Exception as exc:
         _events.log("process_message_failed", {"message": "unhandled pipeline failure", "chat_id": chat_id},
                      level=Level.ERROR, exc=exc)
@@ -889,6 +786,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         update.message.text,
         context.bot_data["model"],
         context.bot_data["guard_model"],
+        context.bot_data["jev_api_key"],
         context.bot_data.get("embedder"),
     )
     final_content = result["reply"]
@@ -1090,7 +988,8 @@ async def _start_test_api(app: Application) -> None:
     combined_bot.py's run_both() starting test_api after the loop is
     already running (test_api.start() needs asyncio.get_running_loop())."""
     app.bot_data["test_api_server"] = test_api.start(
-        app.bot_data["model"], app.bot_data["guard_model"], app.bot_data.get("embedder")
+        app.bot_data["model"], app.bot_data["guard_model"], app.bot_data["jev_api_key"],
+        app.bot_data.get("embedder"),
     )
 
 
@@ -1116,6 +1015,13 @@ def main():
     # user's own message, not a background batch job. See
     # build_model_from_config's own docstring.
     guard_model = build_model_from_settings(settings, "models.guardrail", default_timeout=20.0)
+    # Jev (TypeSafe AI), reached via OpenRouter -- backs guardrails.py's
+    # layers 2 and 4 (docs/plans/front-door-agent-plan.md item 5), not a
+    # models.* entry since it isn't OpenAI-wire-compatible (jev_client.py
+    # calls OpenRouter's decisions endpoint directly). required=True: with
+    # Route A/B retired, there's no fallback path left for either layer
+    # once this is missing, same criticality as DEEPSEEK_API_KEY above.
+    jev_api_key = get_settings().resolved("jev.api-key", required=True)
     # None on any failure (missing package, missing model files, out of
     # memory) rather than raising -- an embedder is an enhancement to
     # push quality, never something startup depends on. See news_embed's
@@ -1125,6 +1031,7 @@ def main():
     app = Application.builder().token(token).post_init(_start_test_api).post_shutdown(_stop_test_api).build()
     app.bot_data["model"] = model
     app.bot_data["guard_model"] = guard_model
+    app.bot_data["jev_api_key"] = jev_api_key
     app.bot_data["embedder"] = embedder
     app.bot_data["admin_chat_id"] = int(get_settings().resolved("delivery.telegram.admin-chat-id", required=True))
     app.bot_data["admin_bot_token"] = get_settings().resolved("delivery.telegram.admin-bot-token", required=True)

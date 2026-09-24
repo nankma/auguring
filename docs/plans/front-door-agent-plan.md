@@ -1,6 +1,7 @@
 # One always-on agent, no session state
 
-Written 2026-09-22. Status: **proposed, nothing built.**
+Written 2026-09-22. Status: **all six items shipped 2026-09-24 (Steps
+A, B, and the Jev migration).**
 
 Retires `end_exploration` and the `interest_sessions` mode switch. The
 front door becomes a single always-running conversational agent that
@@ -12,12 +13,58 @@ the bot says so instead of guessing.
 
 | # | Item | Status |
 |---|------|--------|
-| 1 | Retire `end_exploration` / `interest_sessions` | Proposed |
-| 2 | Conversation object = messages + pending offer, one lifetime | Proposed |
-| 3 | Tools/sub-calls receive no conversation context | Partly true already — see below |
-| 4 | "I lost the thread" reply when context is missing | Proposed |
-| 5 | Layers 2 and 4 move to Jev (TypeSafe AI) | Blocked on early access |
-| 6 | `search_news` becomes a tool, internals unchanged | Proposed |
+| 1 | Retire `end_exploration` / `interest_sessions` | Shipped 2026-09-24 |
+| 2 | Conversation object = messages + pending offer, one lifetime | Shipped 2026-09-24 (`bot.conversations`) |
+| 3 | Tools/sub-calls receive no conversation context | Shipped 2026-09-24 (already true for `search_news`, extended to `start_push`/`stop_push` in Step A) |
+| 4 | "I lost the thread" reply when context is missing | Shipped 2026-09-24 -- narrower than first proposed: fires only when there is BOTH no pending offer AND no conversation history at all, via `interest_finder.reads_as_bare_confirmation`; real history is left to the top-level agent to resolve itself |
+| 5 | Layers 2 and 4 move to Jev (TypeSafe AI) | Shipped 2026-09-24 -- OpenRouter early access came through (`~typesafe/jev-latest`, `jev_client.py`); see "The Jev migration" below |
+| 6 | `search_news` becomes a tool, internals unchanged | Shipped 2026-09-24 (Step A) |
+
+Implemented as three passes: **Step A** (#105) added `search_news`/`start_push`/
+`stop_push` as agent tools with routing untouched; **Step B** switched all
+routing to the single agent, merged `chat_histories`/`interest_sessions`
+into `conversations`, and deleted Route A/B's deterministic dispatch
+along with `end_exploration`/`MAX_TURNS`; **the Jev migration** (same day,
+once OpenRouter access came through) moved layers 2 and 4 off the pinned
+LangChain guard_model onto Jev's typed-decision API.
+
+**Two things qa-engineer measured live against the real model, 2026-09-24,
+after Step B first shipped:**
+
+1. **Layer 2 misclassifying a contextual mid-conversation follow-up as
+   off-topic -- real, fixed.** Step B's first cut narrowed the router's
+   skip condition to "only when a pending offer exists" (item 4's own
+   scope). Measured: a topic-free but genuinely contextual reply ("sure",
+   "the first one") answering an ordinary agent question -- not a
+   propose_interest confirmation, so no pending offer exists yet --
+   got misclassified as off-topic 1/3 to 3/3 of the time across a small
+   sample (67% overall on-topic across 6 phrasings × 3 trials). Fixed by
+   widening the skip condition back to "any ongoing conversation" (any
+   non-empty history), matching the OLD design's blanket bypass -- layer
+   1 (local prefilter) and layer 4 (output check) were never dependent on
+   layer 2 catching this, so nothing is lost by widening it back. Layer 2
+   now runs only on the first message of a fresh (empty-history)
+   conversation.
+
+2. **Multi-intent reliability -- real, NOT fixed, made observable
+   instead.** Step A's own accepted-risk framing ("~7% for
+   `stop_push`-right-after-`start_push`") was assumed to extend to Step
+   B's removal of the separate deterministic multi-category join.
+   Measured instead, for "add robotics to my interests and tell me what's
+   new with it": **3/25 (12%) trials satisfied BOTH intents.** The
+   dominant failure mode wasn't a partial/deferred answer -- the news
+   half was answered well and the interest-add half was silently dropped
+   entirely, not mentioned at all. This is a materially different (and
+   much worse) number than the assumption it was accepted under.
+   Deliberately NOT fixed with a deterministic join (would reintroduce
+   the category-based dispatch split this whole plan retires) or with
+   auto-retry (could double-fire a tool call, or hallucinate a worse
+   response). Instead, the Jev migration below adds
+   `all_asks_addressed` -- an observability-only signal (an
+   `incomplete_reply` WARN event, not a block) that makes every future
+   occurrence of this failure mode queryable, so a real decision about
+   whether/how to act on it can be made from accumulated data rather
+   than a 25-trial sample.
 
 ## What triggered this
 
@@ -181,12 +228,113 @@ changes is who invokes it and who holds the conversation.
   quoted text could resolve "what about Nvidia?" / "第一個" differently.
   Measured, not assumed — see below.
 
+## The Jev migration
+
+OpenRouter early access came through 2026-09-24 (`~typesafe/jev-latest`,
+billed through an existing `OPENROUTER_API_KEY`, not a native TypeSafe
+key). Verified live against the real endpoint before building against it
+-- response shape matches `docs.typesafe.ai/api.md` exactly
+(`{"answers": {qid: {"type": "noul", "noul": 0.0-1.0}}, "usage": {...}}`),
+~0.17s round trip for a 3-question call. `jev_client.py` is a thin
+`requests`-based adapter (not OpenAI-wire-compatible, so
+`agent.build_model_from_config`'s `ChatOpenAI` path can't reach it, per
+`TODO.md`'s original note) -- `ask(state, questions, api_key)`, no
+interpretation of the answers, that's `guardrails.py`'s job.
+
+**Layer 4** was the clean case: `OutputCheck`'s two existing booleans
+(`discusses_own_configuration`, `appropriate_bot_content`) map 1:1 onto
+two independent `noul` questions in one Jev call. Added a third,
+`all_asks_addressed` (optional, only asked when the caller passes
+`user_text`) -- see item 2 above for why, and its own docstring in
+`guardrails.py` for why a `False` answer is logged
+(`incomplete_reply`, WARN) rather than blocking the reply.
+
+**Layer 2 was the harder fit.** Jev's `choice` primitive is strict
+single-select (verified against `docs.typesafe.ai/primitives/choice.md`),
+which can't represent "this message has two intents" the way the old
+router's `categories: list[Category]` field could -- and Jev is a typed-
+decision model, not a text generator, so it can't do the router's
+`topics`/`push_interval_hours`/`language` free-text extraction at all.
+Resolved by asking ONE independent `noul` question per category (plus
+`on_topic`) in the SAME Jev call -- multi-category support now comes from
+however many of those come back true, not from a combined field. The
+extraction fields are dropped entirely: nothing has read them for
+dispatch since Step B anyway (they were telemetry-only), so nothing of
+value was lost. `MessageClassification` shrank to `on_topic`/`categories`
+accordingly.
+
+### Writing questions for an independent yes/no is not the same job
+
+The first cut of those questions measured **badly** -- layer 2 at 71%
+overall, `find_interests` at 22% on a 60-trial re-check -- and the two
+root causes are worth recording, because both came from carrying
+single-select habits into an independent-question format, and neither
+was visible without printing raw `noul` scores per category:
+
+1. **A relative tiebreaker becomes an over-firing bug.** The first cut
+   reused the old `_ROUTER_PROMPT`'s "treat brevity charitably: a vague
+   question is almost always a news_query" line. In a single-select
+   prompt that is a sensible where-to-put-the-doubt rule. As an
+   independent yes/no it made `is_news_query` fire at **0.87-0.94** on
+   "help me figure out what to follow" and "我想追蹤機器人科技的新聞" --
+   messages not asking to be told news at all. The diagnosis only
+   appeared on raw scores: `find_interests` was being recognised
+   perfectly (0.88-0.98) the whole time; the 22% was almost entirely
+   `news_query` firing *alongside* it and breaking the exact-match
+   expectation. The fix is that each question states its own negative
+   boundary, naming the neighbouring requests it must not claim --
+   while still answering "is this request present" rather than "is this
+   the best label", so a genuine two-intent message still trips both.
+2. **`criteria` is not optional decoration.** Questions written with
+   bare `instructions` and no `criteria` clustered in the 0.46-0.57
+   band, where a 0.5 threshold is a coin flip. That is exactly what the
+   layer-4 dip was: a reply-language confirmation scored 0.47/0.49/0.52
+   on `appropriate_bot_content` across three trials, because the
+   enumerated subscription actions listed adding/removing an interest
+   and turning push on/off but never *setting the reply language* -- the
+   same content gap as the 2026-08-14 incident, surfacing differently
+   because Jev has no reasoning field to lean on. Naming the case fixed
+   it outright.
+
+A third finding was the most user-visible of the three and did not come
+from the pass/fail numbers at all: `on_topic` scored **0.46 and 0.32**
+for "我對加密貨幣很感興趣" and "我對比特幣很感興趣" -- below threshold, so those
+subscribers would get the "I only help with tech industry news" redirect.
+The *category* was correct in both (`set_interest` alone). "我對區塊鏈很感
+興趣" scored 0.60 on the identical sentence structure, which isolates the
+variable to the topic word: crypto and bitcoin read as finance rather
+than technology. This bot's own dataset has always treated them as in
+scope, so `on_topic`'s criteria now say so explicitly, naming the
+adjacent coverage (crypto/blockchain, semiconductors, hardware, cloud,
+tech earnings) rather than leaving "technology industry" to be read
+narrowly.
+
+**Measured after the rewrite** (`tools/measure_guardrails.py --trials 10`,
+490 trials, same dataset both times):
+
+| | first cut | after |
+|---|---|---|
+| Layer 2, single-category | 71% (62/87) | **99% (288/290)** |
+| — `find_interests` shapes | 22% (13/60) | **97% (58/60)** |
+| — `chinese_crypto` | 83% | **100% (40/40)** |
+| Layer 2, multi-intent | 83% | **98% (59/60)** |
+| Layer 4 | 93% | **100% (140/140)** |
+
+The two residual layer-2 misses are in `find_interests_shapes`, and the
+one multi-intent miss is `mixed_language_control` -- the case this
+dataset's own comment already documents as having no single true answer.
+
+`guard_model` (the pinned LangChain model) is untouched and still backs
+everything Jev can't do: `classify_confirmation`,
+`reads_as_bare_confirmation`, `_translate_confirmation`, interest
+normalization -- none of those fit a typed-decision shape.
+
 ## Open
 
-- **Jev early access is not granted yet.** Item 5 is blocked on it, and
-  its API is not OpenAI-wire-compatible, so it needs its own adapter
-  (`agent.build_model_from_config`'s `ChatOpenAI` path cannot reach it).
-  See `TODO.md`.
+- **Whether/how to act on `incomplete_reply` once real data accumulates.**
+  The Jev migration above made the 12% multi-intent finding observable
+  (an `incomplete_reply` WARN event) rather than fixing it. Revisit once
+  there's a real sample from production, not a 25-trial measurement.
 - **The original "No related news found" is still unexplained.** Ruled
   out: the `already_shown` filter (57 OpenAI articles were still
   available to every account checked) and the rewrite drift (measured
