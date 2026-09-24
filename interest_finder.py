@@ -247,6 +247,25 @@ _SYSTEM_PROMPT = (
     "leave them following something with no coverage. This works at any "
     "point in this conversation, not just at the start.\n\n"
 
+    "ONE-OFF NEWS QUESTIONS: if they ask a self-contained news "
+    "question (\"what's new with X\", \"any news on Y\") rather than "
+    "trying to find something durable to follow, call search_news "
+    "with a query that stands on its own -- resolve any reference to "
+    "earlier in THIS conversation yourself first (e.g. \"what about "
+    "that one\" -> the actual topic), since search_news gets no memory "
+    "of this conversation at all. This does not end the conversation; "
+    "keep going right after.\n\n"
+
+    "PUSH SETTINGS: if they want to turn the periodic push digest on "
+    "or off (optionally naming an interval in hours for on), call "
+    "start_push/stop_push directly -- same no-confirmation-needed "
+    "reasoning as set_language. CALL THE TOOL EVERY TIME, even if you "
+    "already believe you know the current state from earlier in THIS "
+    "SAME conversation (e.g. you just called start_push and they now "
+    "say to turn it off) -- never reply that push is on/off, or that "
+    "you've changed it, without a fresh tool call THIS turn to back it "
+    "up. Saying it happened is not the same as making it happen.\n\n"
+
     "WHEN TO STOP: call end_exploration as soon as they are satisfied, "
     "or if they say they are done, or if they have changed direction "
     "repeatedly without converging -- in that last case tell them "
@@ -492,6 +511,46 @@ def set_language(language: str, runtime: ToolRuntime) -> str:
 
 
 @tool
+def search_news(query: str, runtime: ToolRuntime) -> str:
+    """Search the already-ingested news cache for `query` and return a
+    ready-to-send trend report -- a one-off lookup, not a subscription;
+    it does not add or change any of the subscriber's interests. Use this
+    for a self-contained news question ("what's new with X", "any news on
+    Y") -- find_example_articles is the tool for narrowing down what to
+    FOLLOW, this is for answering a question right now.
+
+    Pass a query that stands on its own. No conversation history reaches
+    the search underneath this call -- if the subscriber's question
+    depends on something said earlier ("what about the other one?"),
+    resolve that yourself first (you hold the conversation; nothing
+    downstream of this tool does) and call this with the resolved,
+    self-contained topic. See docs/plans/front-door-agent-plan.md for why
+    that boundary exists -- letting conversation reach past this point is
+    exactly the mistake that produced a real incident."""
+    ctx = runtime.context
+    return agent.search_news(
+        ctx["chat_id"], query, [], ctx.get("model"), ctx.get("guard_model"), ctx.get("embedder"))
+
+
+@tool
+def start_push(interval_hours: int | None = None, *, runtime: ToolRuntime) -> str:
+    """Turn on the subscriber's periodic news-push digest -- optionally
+    at a stated interval in hours (omit to leave their current interval,
+    or the default, unchanged). Call this directly, immediately, no
+    proposal or confirmation step -- same reasoning as set_language: a
+    low-stakes, instantly reversible setting, not data that could leave
+    them following something with no coverage."""
+    return agent.enable_push(runtime.context["chat_id"], interval_hours)
+
+
+@tool
+def stop_push(runtime: ToolRuntime) -> str:
+    """Turn off the subscriber's periodic news-push digest. Call this
+    directly, same reasoning as start_push -- no proposal needed."""
+    return agent.disable_push(runtime.context["chat_id"])
+
+
+@tool
 def propose_definition(topic: str, definition: str, runtime: ToolRuntime) -> str:
     """Call this to propose a NEW retrieval definition for one of the
     subscriber's existing interests -- in the SAME turn you tell them
@@ -555,7 +614,8 @@ def end_exploration(reason: str, runtime: ToolRuntime) -> str:
 TOOLS = [
     find_example_articles, list_current_interests, show_definition,
     propose_interest, save_interest, propose_remove, drop_interest,
-    propose_definition, save_definition, set_language, end_exploration,
+    propose_definition, save_definition, set_language, search_news,
+    start_push, stop_push, end_exploration,
 ]
 
 
@@ -702,7 +762,7 @@ def run_turn(chat_id: int, user_text: str, history: list, session: dict,
     try:
         result = agent.run_agent(
             built, messages,
-            context={"chat_id": chat_id, "session": session,
+            context={"chat_id": chat_id, "session": session, "model": model,
                      "guard_model": guard_model, "embedder": embedder},
             recursion_limit=MAX_STEPS_PER_TURN,
         )

@@ -81,14 +81,15 @@ def _fake_structured_model(return_value) -> MagicMock:
     return model
 
 
-def _runtime(chat_id=1, session=None, embedder=None):
+def _runtime(chat_id=1, session=None, embedder=None, model=None, guard_model=None):
     """Stand-in for LangChain's ToolRuntime -- the tools only ever read
     `.context`, so a namespace with that one attribute is the whole
     surface they need."""
     return SimpleNamespace(context={
         "chat_id": chat_id,
         "session": session if session is not None else {},
-        "guard_model": None,
+        "model": model,
+        "guard_model": guard_model,
         "embedder": embedder,
     })
 
@@ -303,6 +304,56 @@ def test_set_language_sets_it_directly_with_no_confirmation_gate(isolated_subscr
     assert "Spanish" in result
 
 
+def test_start_push_enables_directly_with_no_confirmation_gate(monkeypatch):
+    """Same shape as set_language -- low-stakes, instantly reversible,
+    no propose/confirm needed. Delegates to agent.enable_push so Route
+    B's own start_push category (if it's ever reached from elsewhere)
+    and this tool share one implementation."""
+    enable = MagicMock(return_value="Turned on periodic news push, every 6 hour(s).")
+    monkeypatch.setattr(agent, "enable_push", enable)
+
+    result = interest_finder.start_push.func(6, runtime=_runtime(chat_id=7))
+
+    enable.assert_called_once_with(7, 6)
+    assert result == "Turned on periodic news push, every 6 hour(s)."
+
+
+def test_start_push_with_no_interval_passes_none_through(monkeypatch):
+    enable = MagicMock(return_value="Turned on periodic news push, every 24 hour(s).")
+    monkeypatch.setattr(agent, "enable_push", enable)
+
+    interest_finder.start_push.func(None, runtime=_runtime(chat_id=7))
+
+    enable.assert_called_once_with(7, None)
+
+
+def test_stop_push_disables_directly(monkeypatch):
+    disable = MagicMock(return_value="Turned off periodic news push.")
+    monkeypatch.setattr(agent, "disable_push", disable)
+
+    result = interest_finder.stop_push.func(_runtime(chat_id=7))
+
+    disable.assert_called_once_with(7)
+    assert result == "Turned off periodic news push."
+
+
+def test_search_news_tool_delegates_with_no_conversation_history(monkeypatch):
+    """The one-off-question tool this agent gained alongside start_push/
+    stop_push (docs/plans/front-door-agent-plan.md) -- deliberately calls
+    agent.search_news with an EMPTY history, not this conversation's own:
+    the agent itself is the only thing meant to read the conversation,
+    everything it dispatches to gets a self-contained query instead."""
+    search = MagicMock(return_value="a real trend report")
+    monkeypatch.setattr(agent, "search_news", search)
+    fake_model, fake_guard, fake_embedder = object(), object(), object()
+
+    result = interest_finder.search_news.func(
+        "OpenAI news", _runtime(chat_id=7, model=fake_model, guard_model=fake_guard, embedder=fake_embedder))
+
+    search.assert_called_once_with(7, "OpenAI news", [], fake_model, fake_guard, fake_embedder)
+    assert result == "a real trend report"
+
+
 def test_show_definition_says_so_when_none_exists(isolated_subscribers_db):
     """The exact gap this feature exists to fix (Defect 2): a bare
     interest has no definition at all. The tool must say so plainly, not
@@ -451,6 +502,26 @@ def test_run_turn_shows_examples_then_asks(cached_articles, isolated_subscribers
 
     assert reply == "Do either of these land?"
     assert done is False
+
+
+def test_run_turn_threads_the_turn_model_into_context_for_search_news(monkeypatch, isolated_subscribers_db):
+    """run_turn's OWN context dict, not just the tool function tested in
+    isolation above -- proves the exact `model` object passed into
+    run_turn is what search_news actually receives (the report-writing
+    model), not a different instance or a silently-missing None."""
+    search = MagicMock(return_value="a real trend report")
+    monkeypatch.setattr(agent, "search_news", search)
+    model = FakeToolCallingModel(responses=[
+        AIMessage(content="", tool_calls=[
+            {"name": "search_news", "args": {"query": "OpenAI news"}, "id": "1"}]),
+        AIMessage(content="Here's what's new."),
+    ])
+    session = {"turns": 1}
+
+    reply, done = interest_finder.run_turn(7, "what's new with OpenAI?", [], session, model)
+
+    assert reply == "Here's what's new."
+    search.assert_called_once_with(7, "OpenAI news", [], model, None, None)
 
 
 def test_run_turn_reports_done_once_the_model_ends_the_exploration(
