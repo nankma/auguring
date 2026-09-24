@@ -167,8 +167,8 @@ def run_deterministic_checks(text: str, category: str) -> dict:
 class EvalVerdict(BaseModel):
     # reasoning FIRST -- structured output is generated key-by-key in
     # schema order, so forcing reasoning-before-conclusion here is the
-    # same fix that raised guardrails.OutputCheck's reliability (see that
-    # class's docstring in guardrails.py).
+    # same fix measured in docs/plans/guardrails-plan.md (this project's
+    # own layer-4 field-order finding).
     reasoning: str
     meets_criteria: bool
 

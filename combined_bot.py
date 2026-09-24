@@ -48,13 +48,19 @@ import storage
 import subscriber_ops
 
 
-def build_info_app(model, admin_chat_id: int, admin_bot_token: str, guard_model=None, embedder=None) -> Application:
+def build_info_app(
+    model, admin_chat_id: int, admin_bot_token: str, guard_model=None, jev_api_key: str | None = None,
+    embedder=None,
+) -> Application:
     app = Application.builder().token(get_settings().resolved("delivery.telegram.bot-token", required=True)).build()
     app.bot_data["model"] = model
     # guard_model is independently configurable from agent's own model via
     # LLM_MODEL_CLASSIFIER -- see agent.build_model and
     # docs/plans/model-portability-plan.md's Level 2 per-stage routing.
     app.bot_data["guard_model"] = guard_model
+    # Jev (TypeSafe AI), reached via OpenRouter -- backs guardrails.py's
+    # layers 2 and 4 only (docs/plans/front-door-agent-plan.md item 5).
+    app.bot_data["jev_api_key"] = jev_api_key
     # None on any failure -- an enhancement to push quality, never
     # something the push/ingest jobs (bot.py's _push_job/_ingest_job,
     # reused here via register_push_job/register_ingest_job) require to
@@ -99,7 +105,8 @@ async def run_both(
         await admin_app.updater.start_polling()
 
         test_api_server = test_api.start(
-            info_app.bot_data["model"], info_app.bot_data["guard_model"], info_app.bot_data.get("embedder")
+            info_app.bot_data["model"], info_app.bot_data["guard_model"], info_app.bot_data["jev_api_key"],
+            info_app.bot_data.get("embedder"),
         )
 
         print("Both bots ready (polling). Ctrl+C to stop.")
@@ -140,13 +147,17 @@ def main():
     settings = get_settings()
     model = build_model_from_settings(settings, "models.main")
     # A short default_timeout here, not build_model_from_settings' usual
-    # 60s -- this model backs layer 2/4 guardrail calls on a live Telegram
-    # user's own message, not a background batch job. See
+    # 60s -- this model backs interest_finder's own guard_model calls on a
+    # live Telegram user's own message, not a background batch job. See
     # build_model_from_config's own docstring.
     guard_model = build_model_from_settings(settings, "models.guardrail", default_timeout=20.0)
+    # required=True: see bot.py's own main() for why -- no fallback path
+    # exists for guardrails.py's layers 2/4 once this is missing.
+    jev_api_key = get_settings().resolved("jev.api-key", required=True)
     embedder = news_embed.build_embedder()
 
-    info_app = build_info_app(model, admin_chat_id, admin_bot_token, guard_model=guard_model, embedder=embedder)
+    info_app = build_info_app(
+        model, admin_chat_id, admin_bot_token, guard_model=guard_model, jev_api_key=jev_api_key, embedder=embedder)
     admin_app = build_admin_app(admin_chat_id, info_bot_token)
 
     asyncio.run(run_both(info_app, admin_app, admin_bot_token, admin_chat_id))

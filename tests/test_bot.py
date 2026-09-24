@@ -251,6 +251,7 @@ def _make_context(admin_chat_id=999):
         "admin_chat_id": admin_chat_id,
         "admin_bot_token": "fake-admin-token",
         "guard_model": "fake-guard-model",
+        "jev_api_key": "fake-jev-key",
     }
     return context
 
@@ -603,7 +604,7 @@ def test_process_message_logs_and_reraises_an_unhandled_pipeline_failure(isolate
     span = _patch_events_span(monkeypatch)
 
     with pytest.raises(RuntimeError, match="simulated pipeline failure"):
-        asyncio.run(bot.process_message(999, "What's new with OpenAI?", "fake-model", "fake-guard-model"))
+        asyncio.run(bot.process_message(999, "What's new with OpenAI?", "fake-model", "fake-guard-model", "fake-jev-key"))
 
     assert len(span.exceptions) == 1
     assert isinstance(span.exceptions[0], RuntimeError)

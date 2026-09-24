@@ -494,7 +494,7 @@ def _translate_confirmation(model, text: str, language: str) -> str:
 
 
 async def _execute_pending_proposal(
-    chat_id: int, user_text: str, pending: dict, guard_model,
+    chat_id: int, user_text: str, pending: dict, guard_model, jev_api_key: str,
     history: list, history_timestamps: list[datetime],
 ) -> dict:
     """Deterministically completes a propose_interest or
@@ -532,7 +532,8 @@ async def _execute_pending_proposal(
         reply = await asyncio.to_thread(_translate_confirmation, guard_model, reply, language)
         reply = _strip_report_preamble(_normalize_markdown_bold(reply))
 
-    output_on_topic = await asyncio.to_thread(guardrails.is_output_on_topic, guard_model, reply)
+    output_on_topic = await asyncio.to_thread(
+        guardrails.is_output_on_topic, reply, jev_api_key, user_text)
     if not output_on_topic:
         conversations[chat_id]["pending_offer"] = None
         return {"blocked_at": "layer4_output_check", "category": "find_interests",
@@ -560,7 +561,9 @@ async def _lost_context_reply(chat_id: int, guard_model) -> str:
     return reply
 
 
-async def _process_agent_turn(chat_id: int, user_text: str, model, guard_model, embedder=None) -> dict:
+async def _process_agent_turn(
+    chat_id: int, user_text: str, model, guard_model, jev_api_key: str, embedder=None,
+) -> dict:
     """The single front-door path for every on-topic message, regardless
     of what layer 2 would classify it as -- a news question, adding/
     removing/redefining an interest, push settings, reply language, all
@@ -607,7 +610,7 @@ async def _process_agent_turn(chat_id: int, user_text: str, model, guard_model, 
             interest_finder.classify_confirmation, guard_model, user_text, last_assistant_reply)
         if verdict == "affirm":
             return await _execute_pending_proposal(
-                chat_id, user_text, pending_offer, guard_model, history, history_timestamps)
+                chat_id, user_text, pending_offer, guard_model, jev_api_key, history, history_timestamps)
         if verdict == "decline":
             pending_offer = None
     elif not history and await asyncio.to_thread(
@@ -616,10 +619,14 @@ async def _process_agent_turn(chat_id: int, user_text: str, model, guard_model, 
         # Only real model output (a translation) needs layer 4 -- same
         # reasoning as _execute_pending_proposal: the untranslated English
         # template is our own fixed string, but a translated one is real,
-        # unchecked LLM output like any other.
+        # unchecked LLM output like any other. No user_text here (skipping
+        # the completeness question): this reply doesn't attempt to
+        # address the subscriber's message, it says plainly that it
+        # couldn't -- "did it address everything asked" isn't a
+        # meaningful question for an apology.
         if subscriber_ops.get_language(chat_id):
             reply = _strip_report_preamble(_normalize_markdown_bold(reply))
-            output_on_topic = await asyncio.to_thread(guardrails.is_output_on_topic, guard_model, reply)
+            output_on_topic = await asyncio.to_thread(guardrails.is_output_on_topic, reply, jev_api_key)
             if not output_on_topic:
                 return {"blocked_at": "layer4_output_check", "category": "context_lost",
                         "reply": guardrails.REDIRECT_MESSAGE}
@@ -629,8 +636,9 @@ async def _process_agent_turn(chat_id: int, user_text: str, model, guard_model, 
 
     category = "find_interests"
     if not history:
-        # Guardrail layer 2 -- the router (docs/plans/context-management-plan.md):
-        # one structured-output call answers "is this on-topic" and "what
+        # Guardrail layer 2 -- the router, on Jev since
+        # docs/plans/front-door-agent-plan.md item 5: one Jev call answers
+        # "is this on-topic" and "what
         # kind of request(s) is this". Only its on_topic gate drives
         # anything now; `categories` is kept purely as a label for the
         # return value/telemetry below, not to pick a dispatch path.
@@ -650,7 +658,7 @@ async def _process_agent_turn(chat_id: int, user_text: str, model, guard_model, 
         # message under the old design -- layer 2 was never the sole
         # defense against a mid-conversation off-topic pivot.
         _t0 = time.monotonic()
-        classification = await asyncio.to_thread(guardrails.classify_message, guard_model, user_text)
+        classification = await asyncio.to_thread(guardrails.classify_message, user_text, jev_api_key)
         _events.log("latency_layer2_classify", {"message": "router classified the message",
                      "duration_seconds": round(time.monotonic() - _t0, 3)})
         if not classification.on_topic:
@@ -673,7 +681,8 @@ async def _process_agent_turn(chat_id: int, user_text: str, model, guard_model, 
 
     final_content = _strip_report_preamble(_normalize_markdown_bold(reply))
 
-    output_on_topic = await asyncio.to_thread(guardrails.is_output_on_topic, guard_model, final_content)
+    output_on_topic = await asyncio.to_thread(
+        guardrails.is_output_on_topic, final_content, jev_api_key, user_text)
     if not output_on_topic:
         return {"blocked_at": "layer4_output_check", "category": category, "reply": guardrails.REDIRECT_MESSAGE}
 
@@ -709,7 +718,9 @@ def _persist_turn(
     }
 
 
-async def process_message(chat_id: int, user_text: str, model, guard_model, embedder=None) -> dict:
+async def process_message(
+    chat_id: int, user_text: str, model, guard_model, jev_api_key: str, embedder=None,
+) -> dict:
     """The actual guardrail/agent/formatting pipeline, independent of
     Telegram's Update/Context objects -- extracted so test_api.py's local
     curl endpoint (docs/reference/local-testing-api-plan.md) exercises this exact
@@ -758,7 +769,7 @@ async def process_message(chat_id: int, user_text: str, model, guard_model, embe
         if not subscriber_ops.try_consume_agent_interaction(chat_id):
             return {"blocked_at": "trial_limit_reached", "category": None, "reply": TRIAL_AGENT_LIMIT_MESSAGE}
 
-        return await _process_agent_turn(chat_id, user_text, model, guard_model, embedder)
+        return await _process_agent_turn(chat_id, user_text, model, guard_model, jev_api_key, embedder)
     except Exception as exc:
         _events.log("process_message_failed", {"message": "unhandled pipeline failure", "chat_id": chat_id},
                      level=Level.ERROR, exc=exc)
@@ -775,6 +786,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         update.message.text,
         context.bot_data["model"],
         context.bot_data["guard_model"],
+        context.bot_data["jev_api_key"],
         context.bot_data.get("embedder"),
     )
     final_content = result["reply"]
@@ -976,7 +988,8 @@ async def _start_test_api(app: Application) -> None:
     combined_bot.py's run_both() starting test_api after the loop is
     already running (test_api.start() needs asyncio.get_running_loop())."""
     app.bot_data["test_api_server"] = test_api.start(
-        app.bot_data["model"], app.bot_data["guard_model"], app.bot_data.get("embedder")
+        app.bot_data["model"], app.bot_data["guard_model"], app.bot_data["jev_api_key"],
+        app.bot_data.get("embedder"),
     )
 
 
@@ -1002,6 +1015,13 @@ def main():
     # user's own message, not a background batch job. See
     # build_model_from_config's own docstring.
     guard_model = build_model_from_settings(settings, "models.guardrail", default_timeout=20.0)
+    # Jev (TypeSafe AI), reached via OpenRouter -- backs guardrails.py's
+    # layers 2 and 4 (docs/plans/front-door-agent-plan.md item 5), not a
+    # models.* entry since it isn't OpenAI-wire-compatible (jev_client.py
+    # calls OpenRouter's decisions endpoint directly). required=True: with
+    # Route A/B retired, there's no fallback path left for either layer
+    # once this is missing, same criticality as DEEPSEEK_API_KEY above.
+    jev_api_key = get_settings().resolved("jev.api-key", required=True)
     # None on any failure (missing package, missing model files, out of
     # memory) rather than raising -- an embedder is an enhancement to
     # push quality, never something startup depends on. See news_embed's
@@ -1011,6 +1031,7 @@ def main():
     app = Application.builder().token(token).post_init(_start_test_api).post_shutdown(_stop_test_api).build()
     app.bot_data["model"] = model
     app.bot_data["guard_model"] = guard_model
+    app.bot_data["jev_api_key"] = jev_api_key
     app.bot_data["embedder"] = embedder
     app.bot_data["admin_chat_id"] = int(get_settings().resolved("delivery.telegram.admin-chat-id", required=True))
     app.bot_data["admin_bot_token"] = get_settings().resolved("delivery.telegram.admin-bot-token", required=True)

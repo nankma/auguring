@@ -186,18 +186,28 @@ pass first, per that rule.
   tool-calling than an older checkpoint of the same model family hosted
   by Together.ai, and found GLM-5.3-Flash both reliable and better at
   recovering from a dead end in that one reproduction run -- one
-  conversation, not a benchmark, so nothing has been changed. Also
-  surfaced 2026-09-17: a purpose-built typed-decision model, Jev AI
-  (jevai.org), pitches itself directly at the "LLM guardrail scoring"
-  use case at a lower quoted per-token rate than DeepSeek's cache-miss
-  price (though DeepSeek's cache-hit price, which our repeated-system-
-  prompt guardrail calls likely benefit from, may already undercut it --
-  never measured). Not started either way: blocked on applying for Jev
-  AI's early access and writing a custom adapter (its API isn't
-  OpenAI-wire-compatible, so `agent.build_model_from_config`'s
-  `ChatOpenAI` path can't reach it as-is), then a real `tools/
-  measure_guardrails.py` comparison before trusting either option over
-  the current default.
+  conversation, not a benchmark, so nothing has been changed. Still open;
+  unaffected by the Jev item below, since `models.main`/`models.guardrail`
+  back the AGENT's own tool-calling/generation (and `guard_model`'s other
+  uses -- classify_confirmation, reads_as_bare_confirmation, translation,
+  interest normalization), none of which Jev can do.
+
+- [x] **Jev AI for layers 2/4 -- done 2026-09-24.** Surfaced 2026-09-17:
+  a purpose-built typed-decision model (jevai.org) pitched directly at
+  the "LLM guardrail scoring" use case. OpenRouter early access came
+  through 2026-09-24; `jev_client.py` is the custom adapter (its API
+  isn't OpenAI-wire-compatible, confirmed against the real endpoint, so
+  `agent.build_model_from_config`'s `ChatOpenAI` path genuinely can't
+  reach it). `guardrails.classify_message`/`is_output_on_topic` now run
+  on Jev -- see `docs/plans/front-door-agent-plan.md`'s "The Jev
+  migration" section for the design (independent yes/no questions per
+  category, since Jev's `choice` type is single-select-only) and what it
+  can't do (free-text extraction, so `topics`/`push_interval_hours`/
+  `language` are gone). `tools/measure_guardrails.py` was updated to call
+  the new signatures but NOT yet re-run for a real before/after accuracy
+  comparison against the old DeepSeek-based baseline -- worth doing
+  before trusting Jev's classification quality as strongly as the
+  now-retired baseline was measured.
 
 - [ ] **Resolve whether OCI's "Always Free" Email Delivery service is
   actually usable on this tenancy before building
