@@ -263,17 +263,17 @@ search:
 # max_examples: how many real headlines one example-showing step puts in
 # front of the subscriber -- a "how much can a person weigh at once"
 # number (docs/analysis/interest-elicitation-survey.md), not a retrieval
-# one. max_turns: hard ceiling on user turns in one exploration, enforced
-# by bot.py, so a subscriber who keeps switching direction gets told
-# honestly it isn't working instead of looping. max_steps_per_turn: cap
-# measured, not guessed -- an uncovered topic makes the model rephrase and
-# re-search ~15 times, so 10 (the first value) cut real work off; see
-# docs/plans/interest-finder-plan.md's "two ceilings" section.
-# on model/tool steps WITHIN one turn -- the unbounded-cost failure PR #85
-# measured, and a different thing from max_turns.
+# one. max_steps_per_turn: cap on model/tool steps WITHIN one turn -- the
+# unbounded-cost failure PR #85 measured (an uncovered topic makes the
+# model rephrase and re-search ~15 times, so 10, the first value, cut
+# real work off); see docs/plans/interest-finder-plan.md's "two ceilings"
+# section. The other ceiling that section describes, max_turns (a hard
+# cap on user turns in one exploration), was retired 2026-09-24 -- this
+# agent is now the one always-on front door for every on-topic message
+# (docs/plans/front-door-agent-plan.md), so there is no separate
+# exploration "mode" left to bound the length of.
 interest_finder:
   max_examples: 5
-  max_turns: 8
   max_steps_per_turn: 20
 
 # Free-trial usage caps, assigned once per subscriber at approval time

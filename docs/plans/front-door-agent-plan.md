@@ -1,6 +1,7 @@
 # One always-on agent, no session state
 
-Written 2026-09-22. Status: **proposed, nothing built.**
+Written 2026-09-22. Status: **items 1/2/3/4/6 shipped 2026-09-24 (Steps
+A+B); item 5 blocked.**
 
 Retires `end_exploration` and the `interest_sessions` mode switch. The
 front door becomes a single always-running conversational agent that
@@ -12,12 +13,32 @@ the bot says so instead of guessing.
 
 | # | Item | Status |
 |---|------|--------|
-| 1 | Retire `end_exploration` / `interest_sessions` | Proposed |
-| 2 | Conversation object = messages + pending offer, one lifetime | Proposed |
-| 3 | Tools/sub-calls receive no conversation context | Partly true already — see below |
-| 4 | "I lost the thread" reply when context is missing | Proposed |
-| 5 | Layers 2 and 4 move to Jev (TypeSafe AI) | Blocked on early access |
-| 6 | `search_news` becomes a tool, internals unchanged | Proposed |
+| 1 | Retire `end_exploration` / `interest_sessions` | Shipped 2026-09-24 |
+| 2 | Conversation object = messages + pending offer, one lifetime | Shipped 2026-09-24 (`bot.conversations`) |
+| 3 | Tools/sub-calls receive no conversation context | Shipped 2026-09-24 (already true for `search_news`, extended to `start_push`/`stop_push` in Step A) |
+| 4 | "I lost the thread" reply when context is missing | Shipped 2026-09-24 -- narrower than first proposed: fires only when there is BOTH no pending offer AND no conversation history at all, via `interest_finder.reads_as_bare_confirmation`; real history is left to the top-level agent to resolve itself |
+| 5 | Layers 2 and 4 move to Jev (TypeSafe AI) | Blocked on early access -- layer 2 (`classify_message`) kept as-is on the existing pinned model, now used only for on-topic gating, not dispatch |
+| 6 | `search_news` becomes a tool, internals unchanged | Shipped 2026-09-24 (Step A) |
+
+Implemented as two PRs: **Step A** (#105) added `search_news`/`start_push`/
+`stop_push` as agent tools with routing untouched; **Step B** (this pass)
+switched all routing to the single agent, merged `chat_histories`/
+`interest_sessions` into `conversations`, and deleted Route A/B's
+deterministic dispatch along with `end_exploration`/`MAX_TURNS`. A known,
+accepted residual risk from Step A carries forward: multi-tool-call
+reliability within one turn is not 100% (measured ~7% for
+`stop_push`-right-after-`start_push`); Step B's removal of the separate
+deterministic multi-category join means a multi-intent message ("add X
+and tell me what's new") now depends on this same reliability instead of
+a guarantee. Accepted for the same reason -- narrow blast radius today,
+expected to improve once Jev (item 5) is available.
+
+A new, narrower live-model question this pass surfaces (see
+`tools/run_smoke_tests.py` case 18): without item 1's old blanket
+"mid-exploration messages skip the router" behavior, a topic-free but
+genuinely contextual follow-up ("the first one") now reaches layer 2's
+on-topic classifier for the first time. Not yet verified live whether the
+router reliably classifies this as on-topic -- flagged for qa-engineer.
 
 ## What triggered this
 

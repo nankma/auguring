@@ -7,7 +7,6 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 import agent
-import guardrails
 import news_cache
 import news_classify
 import news_embed
@@ -116,12 +115,12 @@ def test_compose_prompt_defaults_to_news_query_when_context_is_none():
 
 
 def test_compose_prompt_always_uses_news_query_instructions():
-    # Route B (start_push/stop_push) is dispatched directly by
-    # agent.dispatch_settings; everything else (news_query, and now
-    # set_interest/remove_interest/set_language/find_interests) runs
-    # through the agent loop, so this prompt only ever needs the
-    # news_query instructions. The `category` context key no longer
-    # selects anything here; this just confirms that stays true
+    # Every category runs through the interest_finder conversational
+    # agent now except news_query itself, which is the only one that
+    # still reaches agent.py's own dynamic-prompt middleware directly
+    # (docs/plans/front-door-agent-plan.md) -- so this prompt only ever
+    # needs the news_query instructions. The `category` context key no
+    # longer selects anything here; this just confirms that stays true
     # regardless of what's passed.
     for category in (None, "news_query", "set_interest", "start_push"):
         prompt = agent._compose_prompt(_fake_request({"category": category}))
@@ -166,43 +165,31 @@ def test_compose_prompt_language_applies_regardless_of_category(isolated_subscri
         assert "French" in prompt
 
 
-def _classification(category, **kwargs):
-    return guardrails.MessageClassification(on_topic=True, categories=[category], **kwargs)
-
-
-def test_dispatch_settings_start_push_enables_and_sets_interval(isolated_subscribers_db):
-    result = agent.dispatch_settings("start_push", 205, _classification("start_push", push_interval_hours=6))
+def test_enable_push_sets_interval(isolated_subscribers_db):
+    result = agent.enable_push(205, 6)
     assert "every 6 hour(s)" in result
     assert subscriber_ops.get_push_enabled(205) is True
     assert subscriber_ops.get_push_interval_hours(205) == 6
 
 
-def test_dispatch_settings_start_push_no_interval_leaves_existing(isolated_subscribers_db):
+def test_enable_push_no_interval_leaves_existing(isolated_subscribers_db):
     subscriber_ops.set_push_interval_hours(206, 12)
-    result = agent.dispatch_settings("start_push", 206, _classification("start_push"))
+    result = agent.enable_push(206)
     assert "every 12 hour(s)" in result
     assert subscriber_ops.get_push_interval_hours(206) == 12
 
 
-def test_dispatch_settings_start_push_invalid_interval_reports_error(isolated_subscribers_db):
-    result = agent.dispatch_settings("start_push", 207, _classification("start_push", push_interval_hours=0))
+def test_enable_push_invalid_interval_reports_error(isolated_subscribers_db):
+    result = agent.enable_push(207, 0)
     assert "couldn't set that interval" in result
     assert subscriber_ops.get_push_enabled(207) is True  # the enable itself still succeeded
 
 
-def test_dispatch_settings_stop_push_disables(isolated_subscribers_db):
+def test_disable_push_disables(isolated_subscribers_db):
     subscriber_ops.set_push_enabled(208, True)
-    result = agent.dispatch_settings("stop_push", 208, _classification("stop_push"))
+    result = agent.disable_push(208)
     assert "Turned off" in result
     assert subscriber_ops.get_push_enabled(208) is False
-
-
-def test_dispatch_settings_rejects_non_route_b_category():
-    try:
-        agent.dispatch_settings("news_query", 1, _classification("news_query"))
-        assert False, "expected ValueError"
-    except ValueError:
-        pass
 
 
 # agent.search_news is a plain function now (chat_id, query, history,

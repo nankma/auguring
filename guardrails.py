@@ -13,19 +13,14 @@ answers.
 Layer 2 was originally a plain on-topic/off-topic boolean
 (`is_input_on_topic`). Per docs/plans/context-management-plan.md's router
 design, it's now `classify_message()`, returning a structured
-`MessageClassification` -- the same classification call now also decides
-*what kind* of on-topic request this is (a news question vs. a natural-
-language request to manage interests/push subscriptions), and, since that
-doc's settings-dispatch refactor, extracts each request's arguments
-directly (`topic`/`push_interval_hours`/`language`) so bot.py's
-agent.dispatch_settings can act on a settings category without an agent
-loop at all -- only news_query still reaches agent.py's dynamic-prompt
-middleware. `categories` is a list, not a single value, so one message can
-carry more than one distinct intent (see that doc's multi-category routing
-section) -- an ordinary single-intent message is just a one-element list.
-One router call doing all of this instead of stacking a separate
-intent-classification/argument-extraction call on top of a separate
-on-topic check.
+`MessageClassification`. Every on-topic message now reaches the same
+always-on conversational agent (docs/plans/front-door-agent-plan.md) --
+`categories`/`topics`/`push_interval_hours`/`language` are still extracted
+for logging/telemetry, but nothing in bot.py branches on them to pick a
+dispatch path any more; the agent resolves what to do itself via its own
+tools. `categories` stays a list, not a single value, since one message
+can still carry more than one distinct intent -- an ordinary
+single-intent message is just a one-element list.
 
 Layers 2 and 4 reuse whatever chat model is passed in (bot.py's
 guard_model, independently configurable from the main agent's model via
@@ -84,14 +79,14 @@ class MessageClassification(BaseModel):
     # empty list the same way it guards against a None result, in case
     # the model ever returns one.
     categories: list[Category]
-    # Extracted directly by the router so Route B (docs/plans/context-management-plan.md's
-    # settings-dispatch refactor -- agent.dispatch_settings) never needs the
-    # agent's own tool-call reasoning to get its arguments. All optional --
-    # empty/None unless the matching category above was chosen. The
-    # normalization rules here (short topic label, corrected/disambiguated
-    # language name) used to live in agent.py's per-category prompt
-    # fragments; moved into _ROUTER_PROMPT below since the agent no longer
-    # sees these categories at all once Route B intercepts them.
+    # Extracted directly by the router -- originally so Route B's
+    # deterministic settings dispatch never needed the agent's own
+    # tool-call reasoning to get its arguments. Route B is retired
+    # (docs/plans/front-door-agent-plan.md: every on-topic category now
+    # runs through the same conversational agent), but these fields are
+    # kept as informational/telemetry labels rather than removed --
+    # bot.py no longer branches on them. All optional -- empty/None
+    # unless the matching category above was chosen.
     #
     # `topics` is a LIST, not a single string -- same reason `categories`
     # above is a list rather than one Category. A single string field
@@ -337,24 +332,7 @@ _OUTPUT_SCOPE_PROMPT = (
     "their interests or refining a definition."
 )
 
-# Categories where layer 2 (the router) already confirmed intent and layer
-# 3 (agent.py's per-category system prompt) already tightly constrains what
-# the agent can say -- for these, only self-disclosure is worth checking,
-# not the broader "is this appropriate content" judgment. See
-# docs/plans/guardrails-plan.md's 2026-08-08 finding for why: news_query replies
-# are free-form (the model decides what to write about), so both checks
-# matter there, but a push confirmation's shape is already pinned down by
-# the fixed template that generated it.
-#
-# set_interest/remove_interest/set_language deliberately are NOT here
-# (moved out 2026-09-10): they now open the same interest_finder agent as
-# find_interests, whose replies are free-form model prose (examples,
-# definitions, questions) exactly like a news_query report -- the full
-# check applies to all of them for the same reason, not just news_query.
-_NARROW_CHECK_CATEGORIES = {"start_push", "stop_push"}
-
-
-def is_output_on_topic(model, response_text: str, category: str | None = None) -> bool:
+def is_output_on_topic(model, response_text: str) -> bool:
     """Layer 4. Fails open (returns True) on a classification error, same
     reasoning as classify_message.
 
@@ -383,9 +361,12 @@ def is_output_on_topic(model, response_text: str, category: str | None = None) -
     before shipping" discipline as the two prior layer-4 prompt changes.
     See docs/plans/guardrails-plan.md for the full before/after table.
 
-    `category` (the router's classification when known) narrows the check
-    per _NARROW_CHECK_CATEGORIES above; unspecified/None and news_query
-    get both checks.
+    Every reply gets both checks now -- the narrower self-disclosure-only
+    check this used to run for start_push/stop_push's fixed-template
+    confirmations no longer applies now that those go through the same
+    free-form conversational agent as everything else
+    (docs/plans/front-door-agent-plan.md); there is no fixed-shape output
+    left to special-case.
 
     Also fails open when invoke() returns None instead of raising -- see
     classify_message's docstring for the live incident that surfaced this
@@ -413,6 +394,4 @@ def is_output_on_topic(model, response_text: str, category: str | None = None) -
         return True
     if result.discusses_own_configuration:
         return False
-    if category in _NARROW_CHECK_CATEGORIES:
-        return True
     return result.appropriate_bot_content

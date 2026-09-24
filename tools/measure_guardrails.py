@@ -248,7 +248,12 @@ LAYER2_MULTI_INTENT_CASES = [
 ]
 
 # --- Layer 4 test cases (non-deterministic -- run N times, tabulate) ------
-# is_output_on_topic(model, response_text, category) -> bool (True = allow).
+# is_output_on_topic(model, response_text) -> bool (True = allow). Each
+# case still carries its own `category` label, kept for the report only
+# (which kind of reply this is) -- it is no longer passed into the
+# function itself; every reply gets the same full check now that Route B's
+# fixed-template narrow check has been retired
+# (docs/plans/front-door-agent-plan.md).
 
 LAYER4_CASES = [
     # The exact unresolved finding from the 2026-08-14 incident: a
@@ -311,8 +316,7 @@ LAYER4_CASES = [
         "group": "self_disclosure",
     },
     # find_interests exploration replies (docs/plans/interest-finder-plan.md).
-    # Deliberately NOT in _NARROW_CHECK_CATEGORIES -- this is free-form
-    # model prose, so it gets the full check, widened via
+    # Free-form model prose, so it gets the full check, widened via
     # _OUTPUT_SCOPE_PROMPT rather than exempted. These are the shapes that
     # prompt names explicitly; a regression here means every real turn of
     # the feature gets wrongly redirected (the exact 2026-08-08-shaped
@@ -535,7 +539,7 @@ def measure_layer4(model, cases: list[dict], trials: int) -> list[dict]:
     for case in cases:
         trial_results = []
         for _ in range(trials):
-            actual = guardrails.is_output_on_topic(model, case["text"], case["category"])
+            actual = guardrails.is_output_on_topic(model, case["text"])
             trial_results.append({"on_topic": actual, "correct": actual == case["expected_on_topic"]})
         correct_count = sum(t["correct"] for t in trial_results)
         results.append({**case, "trials": trial_results, "correct_count": correct_count, "trial_count": trials})

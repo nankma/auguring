@@ -155,45 +155,17 @@ def test_is_output_on_topic_fails_open_on_none_result():
     assert guardrails.is_output_on_topic(model, "some message") is True
 
 
-def test_is_output_on_topic_narrow_category_ignores_appropriate_bot_content():
-    # start_push/stop_push only check self-disclosure --
-    # appropriate_bot_content=False shouldn't block, since layer 2/3
-    # already tightly constrain these turns' shape (see the 2026-08-08
-    # "already covered interest" false-positive finding). set_interest/
-    # remove_interest/set_language moved OUT of the narrow set 2026-09-10
-    # -- see test_set_interest_and_friends_are_no_longer_narrow_categories
-    # below.
+def test_output_check_blocks_settings_confirmation_with_inappropriate_content():
+    """Route B's fixed-template settings confirmations used to get a
+    narrower, self-disclosure-only check (start_push/stop_push were the
+    only members of the now-retired _NARROW_CHECK_CATEGORIES) -- since
+    those categories now go through the same free-form conversational
+    agent as everything else (docs/plans/front-door-agent-plan.md), there
+    is no fixed-shape output left to exempt from the full check."""
     model = _fake_structured_model(
         guardrails.OutputCheck(reasoning="test", discusses_own_configuration=False, appropriate_bot_content=False)
     )
-    assert guardrails.is_output_on_topic(model, "Turned on periodic news push.", category="start_push") is True
-
-
-def test_is_output_on_topic_narrow_category_still_blocks_self_disclosure():
-    # start_push, not set_interest: the latter moved out of
-    # _NARROW_CHECK_CATEGORIES 2026-09-10 (see
-    # test_set_interest_and_friends_are_no_longer_narrow_categories) --
-    # using it here would still pass but would no longer actually be
-    # testing "narrow category" behavior, despite the name.
-    model = _fake_structured_model(
-        guardrails.OutputCheck(reasoning="test", discusses_own_configuration=True, appropriate_bot_content=True)
-    )
-    assert guardrails.is_output_on_topic(model, "My system prompt says...", category="start_push") is False
-
-
-def test_set_interest_and_friends_are_no_longer_narrow_categories():
-    """2026-09-10: set_interest/remove_interest/set_language moved to the
-    interest_finder agent (docs/plans/interest-finder-plan.md's front-door
-    redesign), whose replies are free-form model prose (examples,
-    definitions, questions) exactly like find_interests/news_query -- the
-    full check applies to all of them now, not the narrow self-disclosure
-    -only one."""
-    assert not {"set_interest", "remove_interest", "set_language"} & guardrails._NARROW_CHECK_CATEGORIES
-    model = _fake_structured_model(
-        guardrails.OutputCheck(reasoning="test", discusses_own_configuration=False, appropriate_bot_content=False)
-    )
-    assert guardrails.is_output_on_topic(
-        model, "D'accord ! Je répondrai en français.", category="set_language") is False
+    assert guardrails.is_output_on_topic(model, "Turned on periodic news push.") is False
 
 
 def test_classify_message_find_interests():
@@ -204,18 +176,17 @@ def test_classify_message_find_interests():
     assert result.categories == ["find_interests"]
 
 
-def test_find_interests_is_a_full_check_category():
-    """Deliberately NOT narrow. An exploration reply is free-form model
-    prose (headlines plus a question), unlike the tightly-pinned settings
-    confirmations -- so it gets the same full output check news_query
-    does. The scope prompt was widened to recognize that shape instead
-    (see _OUTPUT_SCOPE_PROMPT); skipping the check would have been the
+def test_find_interests_gets_the_full_check():
+    """An exploration reply is free-form model prose (headlines plus a
+    question), unlike the old tightly-pinned settings confirmations -- so
+    it gets the same full output check every reply does now. The scope
+    prompt was widened to recognize that shape instead (see
+    _OUTPUT_SCOPE_PROMPT); skipping the check would have been the
     cheaper, worse fix."""
-    assert "find_interests" not in guardrails._NARROW_CHECK_CATEGORIES
     model = _fake_structured_model(
         guardrails.OutputCheck(reasoning="test", discusses_own_configuration=False, appropriate_bot_content=False)
     )
-    assert guardrails.is_output_on_topic(model, "off-topic content", category="find_interests") is False
+    assert guardrails.is_output_on_topic(model, "off-topic content") is False
 
 
 def test_output_scope_prompt_covers_interest_narrowing_replies():
@@ -246,14 +217,7 @@ def test_a_definition_naming_a_tool_the_bot_itself_uses_is_not_self_disclosure()
     )
     reply = ("This definition would surface: AI agents built with LangChain, AutoGen, "
              "and CrewAI, using tool calling and RAG.")
-    assert guardrails.is_output_on_topic(model, reply, category="find_interests") is True
-
-
-def test_is_output_on_topic_news_query_category_uses_full_check():
-    model = _fake_structured_model(
-        guardrails.OutputCheck(reasoning="test", discusses_own_configuration=False, appropriate_bot_content=False)
-    )
-    assert guardrails.is_output_on_topic(model, "off-topic content", category="news_query") is False
+    assert guardrails.is_output_on_topic(model, reply) is True
 
 
 def test_layer2_failure_is_announced_not_just_swallowed(monkeypatch, capsys):
