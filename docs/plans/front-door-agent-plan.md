@@ -263,6 +263,67 @@ dispatch since Step B anyway (they were telemetry-only), so nothing of
 value was lost. `MessageClassification` shrank to `on_topic`/`categories`
 accordingly.
 
+### Writing questions for an independent yes/no is not the same job
+
+The first cut of those questions measured **badly** -- layer 2 at 71%
+overall, `find_interests` at 22% on a 60-trial re-check -- and the two
+root causes are worth recording, because both came from carrying
+single-select habits into an independent-question format, and neither
+was visible without printing raw `noul` scores per category:
+
+1. **A relative tiebreaker becomes an over-firing bug.** The first cut
+   reused the old `_ROUTER_PROMPT`'s "treat brevity charitably: a vague
+   question is almost always a news_query" line. In a single-select
+   prompt that is a sensible where-to-put-the-doubt rule. As an
+   independent yes/no it made `is_news_query` fire at **0.87-0.94** on
+   "help me figure out what to follow" and "我想追蹤機器人科技的新聞" --
+   messages not asking to be told news at all. The diagnosis only
+   appeared on raw scores: `find_interests` was being recognised
+   perfectly (0.88-0.98) the whole time; the 22% was almost entirely
+   `news_query` firing *alongside* it and breaking the exact-match
+   expectation. The fix is that each question states its own negative
+   boundary, naming the neighbouring requests it must not claim --
+   while still answering "is this request present" rather than "is this
+   the best label", so a genuine two-intent message still trips both.
+2. **`criteria` is not optional decoration.** Questions written with
+   bare `instructions` and no `criteria` clustered in the 0.46-0.57
+   band, where a 0.5 threshold is a coin flip. That is exactly what the
+   layer-4 dip was: a reply-language confirmation scored 0.47/0.49/0.52
+   on `appropriate_bot_content` across three trials, because the
+   enumerated subscription actions listed adding/removing an interest
+   and turning push on/off but never *setting the reply language* -- the
+   same content gap as the 2026-08-14 incident, surfacing differently
+   because Jev has no reasoning field to lean on. Naming the case fixed
+   it outright.
+
+A third finding was the most user-visible of the three and did not come
+from the pass/fail numbers at all: `on_topic` scored **0.46 and 0.32**
+for "我對加密貨幣很感興趣" and "我對比特幣很感興趣" -- below threshold, so those
+subscribers would get the "I only help with tech industry news" redirect.
+The *category* was correct in both (`set_interest` alone). "我對區塊鏈很感
+興趣" scored 0.60 on the identical sentence structure, which isolates the
+variable to the topic word: crypto and bitcoin read as finance rather
+than technology. This bot's own dataset has always treated them as in
+scope, so `on_topic`'s criteria now say so explicitly, naming the
+adjacent coverage (crypto/blockchain, semiconductors, hardware, cloud,
+tech earnings) rather than leaving "technology industry" to be read
+narrowly.
+
+**Measured after the rewrite** (`tools/measure_guardrails.py --trials 10`,
+490 trials, same dataset both times):
+
+| | first cut | after |
+|---|---|---|
+| Layer 2, single-category | 71% (62/87) | **99% (288/290)** |
+| — `find_interests` shapes | 22% (13/60) | **97% (58/60)** |
+| — `chinese_crypto` | 83% | **100% (40/40)** |
+| Layer 2, multi-intent | 83% | **98% (59/60)** |
+| Layer 4 | 93% | **100% (140/140)** |
+
+The two residual layer-2 misses are in `find_interests_shapes`, and the
+one multi-intent miss is `mixed_language_control` -- the case this
+dataset's own comment already documents as having no single true answer.
+
 `guard_model` (the pinned LangChain model) is untouched and still backs
 everything Jev can't do: `classify_confirmation`,
 `reads_as_bare_confirmation`, `_translate_confirmation`, interest

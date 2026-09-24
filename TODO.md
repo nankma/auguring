@@ -203,11 +203,13 @@ pass first, per that rule.
   migration" section for the design (independent yes/no questions per
   category, since Jev's `choice` type is single-select-only) and what it
   can't do (free-text extraction, so `topics`/`push_interval_hours`/
-  `language` are gone). `tools/measure_guardrails.py` was updated to call
-  the new signatures but NOT yet re-run for a real before/after accuracy
-  comparison against the old DeepSeek-based baseline -- worth doing
-  before trusting Jev's classification quality as strongly as the
-  now-retired baseline was measured.
+  `language` are gone). `tools/measure_guardrails.py` was updated to the
+  new signatures and re-run live at 10 trials/case (490 trials): layer 2
+  99% (288/290), multi-intent 98% (59/60), layer 4 100% (140/140) -- at
+  or above the retired DeepSeek baseline. Getting there took one prompt
+  rewrite; see the plan doc's "Writing questions for an independent
+  yes/no is not the same job" section for what the first cut got wrong
+  and why raw `noul` scores, not pass/fail rates, were what diagnosed it.
 
 - [ ] **Resolve whether OCI's "Always Free" Email Delivery service is
   actually usable on this tenancy before building

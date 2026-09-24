@@ -37,7 +37,7 @@ def _jev_router_answers(on_topic: float, **categories: float) -> dict:
     always asks about every category in one call, so a test mock must
     answer all of them, not just the ones it cares about."""
     answers = {"on_topic": {"noul": on_topic}}
-    for category in guardrails._CATEGORY_INSTRUCTIONS:
+    for category in guardrails._CATEGORY_QUESTIONS:
         answers[f"is_{category}"] = {"noul": categories.get(category, 0.0)}
     return answers
 
@@ -133,7 +133,7 @@ def test_classify_message_sends_the_user_message_as_state(monkeypatch):
     assert state == {"message": "What's new with Anthropic?"}
     assert api_key == "fake-jev-key"
     assert "on_topic" in questions
-    assert set(questions) == {"on_topic"} | {f"is_{c}" for c in guardrails._CATEGORY_INSTRUCTIONS}
+    assert set(questions) == {"on_topic"} | {f"is_{c}" for c in guardrails._CATEGORY_QUESTIONS}
 
 
 def _jev_layer4_answers(discusses=0.0, appropriate=1.0, all_addressed=None) -> dict:
@@ -195,14 +195,27 @@ def test_appropriate_bot_content_instructions_cover_interest_narrowing_replies()
     reply is neither a news report nor a settings confirmation, so before
     the instructions named that shape, layer 4 would have blocked every
     turn of this feature."""
-    assert "narrowing down" in guardrails._APPROPRIATE_BOT_CONTENT_INSTRUCTIONS
+    assert "narrowing down" in guardrails._APPROPRIATE_BOT_CONTENT_QUESTION["criteria"]["true"]
 
 
 def test_appropriate_bot_content_instructions_cover_definition_refinement_replies():
     """docs/plans/interest-definition-plan.md: showing/proposing a
     retrieval definition is a new reply shape this feature introduces,
     and it needed the same treatment as narrowing-down replies."""
-    assert "retrieval definition" in guardrails._APPROPRIATE_BOT_CONTENT_INSTRUCTIONS
+    assert "retrieval definition" in guardrails._APPROPRIATE_BOT_CONTENT_QUESTION["criteria"]["true"]
+
+
+def test_appropriate_bot_content_criteria_cover_reply_language_confirmations():
+    """The gap that made a reply-language confirmation score 0.47-0.52 --
+    right on the 0.5 threshold, so it passed or failed at random (measured
+    live 2026-09-24, 3/6). The enumerated subscription-feature actions
+    listed adding/removing an interest and turning push on/off but never
+    setting the reply language, so the classifier had nothing to match a
+    "Done -- I'll reply in Traditional Chinese from now on" against. Same
+    content gap the 2026-08-14 incident hit from the other direction; this
+    pins it so a future rewrite of these criteria can't drop it again."""
+    true_criteria = guardrails._APPROPRIATE_BOT_CONTENT_QUESTION["criteria"]["true"].lower()
+    assert "reply language" in true_criteria
 
 
 def test_a_definition_naming_a_tool_the_bot_itself_uses_is_not_self_disclosure(monkeypatch):
