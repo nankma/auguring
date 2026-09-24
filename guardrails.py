@@ -370,8 +370,17 @@ def classify_message(user_message: str, jev_api_key: str) -> MessageClassificati
             if answers[f"is_{category}"]["noul"] > _NOUL_TRUE_THRESHOLD
         ]
         if not categories:
-            print("[guardrails] layer 2 returned no categories -- "
-                  "defaulting to news_query")
+            # Through _events.log, not a bare print, for the same reason
+            # every other anomaly in this module goes that way: a
+            # should-never-happen condition is exactly what needs to be
+            # queryable in production rather than buried in container
+            # logs. WARN, not ERROR -- unlike a router outage this is
+            # self-correcting (the message still gets handled as a news
+            # query), so it's a rate to watch, not a page.
+            _events.log("router_no_categories",
+                         {"message": "layer 2 returned no categories -- defaulting to news_query",
+                          "user_message": user_message},
+                         level=Level.WARN)
             categories = ["news_query"]
         return MessageClassification(on_topic=True, categories=categories)
     except Exception as exc:
@@ -518,11 +527,26 @@ def is_output_on_topic(response_text: str, jev_api_key: str, user_text: str | No
         _events.log("output_check_failed", "layer 4 FAILED, allowing output",
                      level=Level.ERROR, exc=exc)
         return True
-    if "all_asks_addressed" in questions and not answers["all_asks_addressed"]["noul"] > _NOUL_TRUE_THRESHOLD:
-        _events.log("incomplete_reply",
-                     {"message": "reply did not address everything the user asked for",
-                      "user_text": user_text, "bot_reply": response_text},
-                     level=Level.WARN)
+    if "all_asks_addressed" in questions:
+        # Guarded separately from the verdict above, and deliberately NOT
+        # inside the same try: this question is observability-only, so a
+        # missing or malformed answer to it must neither change the
+        # verdict the caller depends on nor fail the whole check. Reading
+        # it in the main try would fail the check open on a partial
+        # response whose two real answers came back fine; reading it
+        # unguarded (the first version of this) let a KeyError escape
+        # is_output_on_topic entirely, past layer 4's whole reason for
+        # existing -- a partial response is a real possibility against an
+        # alpha endpoint, not a hypothetical.
+        try:
+            addressed = answers["all_asks_addressed"]["noul"] > _NOUL_TRUE_THRESHOLD
+        except (KeyError, TypeError):
+            addressed = True  # no signal is not the same as a bad signal
+        if not addressed:
+            _events.log("incomplete_reply",
+                         {"message": "reply did not address everything the user asked for",
+                          "user_text": user_text, "bot_reply": response_text},
+                         level=Level.WARN)
     if discusses_own_configuration:
         return False
     return appropriate_bot_content

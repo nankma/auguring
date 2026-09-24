@@ -687,7 +687,15 @@ def test_confirmation_classifier_receives_the_assistants_last_reply(monkeypatch,
     monkeypatch.setattr(bot.interest_finder, "run_turn", MagicMock(return_value="ok"))
     _pending(7, "AI", "redefine", "x")
     bot.conversations[7]["messages"] = [AIMessage(content="I won't save that -- it wouldn't change anything.")]
-    bot.conversations[7]["timestamps"] = [datetime.now(timezone.utc)]
+    # The offer's OWN set_at, not a fresh now(): _persist_turn stamps the
+    # offer and the message that made it from one clock read, so they are
+    # always equal in real usage. Taking a second now() here made the
+    # message look newer than the offer, which _get_conversation correctly
+    # reads as "the offer's own turn was count-trimmed away" and drops it.
+    # Passed on Windows (~15ms timer granularity returned the same value
+    # twice) and failed on CI's microsecond clock -- a real CI-only break,
+    # caught on PR #106.
+    bot.conversations[7]["timestamps"] = [bot.conversations[7]["pending_offer"]["set_at"]]
 
     asyncio.run(bot.process_message(7, "yes", "m", "g", "j"))
 

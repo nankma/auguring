@@ -118,12 +118,19 @@ def test_classify_message_fails_open_on_malformed_response(monkeypatch):
 def test_classify_message_on_topic_with_no_matching_category_defaults_to_news_query(monkeypatch, capsys):
     """Shouldn't happen per the instructions (every on-topic message
     should trip at least one category question), but bot.py indexes
-    categories[0] unconditionally, so this must not come back empty."""
+    categories[0] unconditionally, so this must not come back empty.
+    Announced through _events.log rather than a bare print (code-review
+    finding) -- a should-never-happen condition is exactly what needs to
+    be queryable in production, not buried in container logs."""
     _mock_jev(monkeypatch, return_value=_jev_router_answers(0.9))  # on_topic but no category above threshold
+    span = _patch_events_span(monkeypatch)
+
     result = guardrails.classify_message("some message", "fake-jev-key")
+
     assert result.on_topic is True
     assert result.categories == ["news_query"]
     assert "no categories" in capsys.readouterr().out
+    assert span.attrs["logfire.level_num"] == Level.WARN
 
 
 def test_classify_message_sends_the_user_message_as_state(monkeypatch):
@@ -265,6 +272,32 @@ def test_incomplete_reply_is_logged_but_not_blocked(monkeypatch, capsys):
     assert result is True  # not blocked
     assert span.attrs["message"] == "reply did not address everything the user asked for"
     assert span.attrs["logfire.level_num"] == Level.WARN
+
+
+def test_a_partial_jev_response_missing_the_completeness_answer_still_returns_a_verdict(monkeypatch):
+    """Code-review finding: the completeness answer was read OUTSIDE the
+    fail-open try, so a response carrying the two real answers but not
+    the third -- a plausible shape against an alpha endpoint -- raised a
+    KeyError that escaped is_output_on_topic entirely, straight past
+    layer 4's whole reason for existing. The two real answers are
+    present here and must still decide the verdict."""
+    _mock_jev(monkeypatch, return_value=_jev_layer4_answers(discusses=0.1, appropriate=0.9))
+
+    result = guardrails.is_output_on_topic("a reply", "fake-jev-key", user_text="two asks")
+
+    assert result is True
+
+
+def test_a_partial_response_missing_the_completeness_answer_does_not_fail_the_verdict_open(monkeypatch):
+    """The other half of the same finding: reading it inside the main try
+    instead would have failed the check OPEN on a partial response whose
+    real answers said to block. A missing observability signal must not
+    rescue content the real checks rejected."""
+    _mock_jev(monkeypatch, return_value=_jev_layer4_answers(discusses=0.9, appropriate=0.9))
+
+    result = guardrails.is_output_on_topic("self-disclosure", "fake-jev-key", user_text="two asks")
+
+    assert result is False
 
 
 def test_complete_reply_does_not_log_anything(monkeypatch, capsys):
