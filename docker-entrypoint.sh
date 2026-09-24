@@ -57,5 +57,12 @@ fi
 if [ -n "$NEWSAPI_API_KEY_SECRET_OCID" ]; then
     export NEWSAPI_API_KEY="$(fetch_secret "$NEWSAPI_API_KEY_SECRET_OCID")"
 fi
+# Backs guardrails.py's layers 2 and 4 via Jev/OpenRouter
+# (docs/plans/front-door-agent-plan.md item 5) -- required=True in
+# settings.oracle.yml's jev.api-key, so the container will not start
+# without this resolving to a real value.
+if [ -n "$OPENROUTER_API_KEY_SECRET_OCID" ]; then
+    export OPENROUTER_API_KEY="$(fetch_secret "$OPENROUTER_API_KEY_SECRET_OCID")"
+fi
 
 exec "$@"
