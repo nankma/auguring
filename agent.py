@@ -654,27 +654,43 @@ def dispatch_settings(category: str, chat_id: int, classification) -> str:
     nothing left in this function makes an LLM call -- that was only ever
     set_interest's own normalization step."""
     if category == "start_push":
-        subscriber_ops.set_push_enabled(chat_id, True)
-        if classification.push_interval_hours is not None:
-            try:
-                subscriber_ops.set_push_interval_hours(chat_id, classification.push_interval_hours)
-            except ValueError as exc:
-                return f"Turned on periodic news push, but couldn't set that interval: {exc}"
-        hours = subscriber_ops.get_push_interval_hours(chat_id)
-        return f"Turned on periodic news push, every {hours} hour(s)."
+        return enable_push(chat_id, classification.push_interval_hours)
 
     if category == "stop_push":
-        subscriber_ops.set_push_enabled(chat_id, False)
-        # A user's own stop is a deliberate reset, unlike the automatic
-        # 3-strikes disable (news_push._strike_unreachable_subscriber),
-        # which deliberately does NOT reset -- see that function's
-        # docstring. Re-enabling later starts with a clean slate instead
-        # of carrying forward a failure count from whenever they last
-        # tried, possibly months stale.
-        subscriber_ops.reset_push_consecutive_failures(chat_id)
-        return "Turned off periodic news push."
+        return disable_push(chat_id)
 
     raise ValueError(f"dispatch_settings called with a non-Route-B category: {category!r}")
+
+
+def enable_push(chat_id: int, interval_hours: int | None = None) -> str:
+    """Turns the periodic digest on, optionally setting its interval, and
+    returns the English confirmation. Extracted from dispatch_settings so
+    the conversational agent's own start_push tool and the router's Route
+    B dispatch share ONE implementation -- two copies of "what turning
+    push on means" would drift, and the interval-validation branch below
+    is exactly the kind of detail that drifts first."""
+    subscriber_ops.set_push_enabled(chat_id, True)
+    if interval_hours is not None:
+        try:
+            subscriber_ops.set_push_interval_hours(chat_id, interval_hours)
+        except ValueError as exc:
+            return f"Turned on periodic news push, but couldn't set that interval: {exc}"
+    hours = subscriber_ops.get_push_interval_hours(chat_id)
+    return f"Turned on periodic news push, every {hours} hour(s)."
+
+
+def disable_push(chat_id: int) -> str:
+    """The stop half of enable_push above -- same shared-implementation
+    reasoning."""
+    subscriber_ops.set_push_enabled(chat_id, False)
+    # A user's own stop is a deliberate reset, unlike the automatic
+    # 3-strikes disable (news_push._strike_unreachable_subscriber),
+    # which deliberately does NOT reset -- see that function's
+    # docstring. Re-enabling later starts with a clean slate instead
+    # of carrying forward a failure count from whenever they last
+    # tried, possibly months stale.
+    subscriber_ops.reset_push_consecutive_failures(chat_id)
+    return "Turned off periodic news push."
 
 
 # --- Agent construction & invocation ------------------------------------
