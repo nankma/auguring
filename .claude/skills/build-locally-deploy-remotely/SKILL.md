@@ -128,6 +128,26 @@ the same incidents inline.
    been added yet; flag it to the caller rather than assuming it's safe
    to add mid-deploy.
 
+   **On a Windows dev machine using Git Bash, `docker run -e VAR=/data/...`
+   in a sanity-check command can get its value silently rewritten before
+   it ever reaches Docker.** Real incident, 2026-09-24 (INT deploy of PR
+   #109): `docker run --rm -e MESSAGE_ARCHIVE_DIR=/data/message_archive
+   ... python -c "import combined_bot"` failed with `SettingsError:
+   required setting 'storage.message_archive_dir.path' is not present`
+   even though `settings.int.yml` correctly names that exact env var --
+   the actual value the container saw was
+   `C:/Program Files/Git/data/message_archive`, because MSYS's automatic
+   POSIX-to-Windows path conversion (the same mechanism that mangles a
+   bare `/c/...` argument) rewrote the leading `/data/...` before `docker
+   run` ever launched. This looked exactly like a real settings/env bug
+   until printing `os.environ` inside the container showed the mangled
+   value. Fix: export `MSYS_NO_PATHCONV=1` before any `docker run -e
+   ...=/data/...`-shaped sanity check on this machine (the real `docker
+   run` invocation on the remote VM via `plink`/`ssh` is unaffected --
+   this is specifically a local Git-Bash-invoking-docker-directly
+   problem). Affects any future local import/entrypoint sanity check
+   that sets a `/data`-rooted env var, not just this one.
+
    **Don't trust `docker images`' SIZE column for this image on this
    Windows/Docker Desktop machine — it overstates real size by ~5x.**
    Real finding, 2026-08-25 (`myfirstagent-bot` after the model2vec/

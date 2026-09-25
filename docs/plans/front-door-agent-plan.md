@@ -73,6 +73,30 @@ after Step B first shipped:**
    whether/how to act on it can be made from accumulated data rather
    than a 25-trial sample.
 
+3. **`tools/run_smoke_tests.py` cases 2/3 looked like a save failure --
+   traced live, it's a smoke-test assumption, not an application bug.**
+   On the INT re-deploy that confirmed the case-12 fix, cases 2/3 (add a
+   new interest, English and Chinese) came back with the interest never
+   actually saved. Reproduced directly against INT: both cases hit a
+   REAL ambiguity, not a code defect. "Add quantum sensing to my
+   interests" had zero real coverage in INT's cache, so the agent
+   correctly refused to add it ungrounded and offered two alternative
+   directions instead (per `interest_finder.py`'s own AAOI-avoidance
+   rule, unrelated to anything in this plan); "我對機器人科技很感興趣" had
+   real coverage, but across two distinct directions (industry/policy vs.
+   technical implementation), so the agent correctly showed both and
+   asked which one landed. Either way, the scripted second message
+   ("yes, that's right, go ahead" / "對，就是這個") doesn't specify
+   which of two-or-more offered directions is meant, and the agent
+   correctly asks for clarification rather than guessing and saving the
+   wrong thing -- exactly the behavior `interest_finder.py`'s own
+   docstring calls out as the point of this design, not a regression.
+   Fixed by loosening cases 2/3's own pass/fail check to `blocked_at is
+   None` (did the conversation stay on-topic and not error) rather than
+   asserting a specific category or an actual save, which was really
+   asserting against live cache contents this suite doesn't control, not
+   against the code.
+
 ## What triggered this
 
 A subscriber reported sporadic "No related news found" on INT and
