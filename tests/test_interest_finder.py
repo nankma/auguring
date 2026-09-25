@@ -794,20 +794,20 @@ def test_a_pending_offer_skips_the_router_entirely(monkeypatch, isolated_subscri
     assert result["category"] == "find_interests"
 
 
-def test_layer_2_is_skipped_for_any_ongoing_conversation_not_just_a_pending_offer(
-    monkeypatch, isolated_subscribers_db
-):
-    """Measured live by qa-engineer, 2026-09-24: a topic-free but
-    genuinely contextual reply ("sure", "the first one") answering an
-    ordinary agent question -- NOT a propose_interest confirmation, so no
-    pending offer exists yet -- got misclassified as off-topic by layer 2
-    up to 100% of the time in one sample once the skip condition was
-    narrowed to "only when a pending offer exists". Layer 2 must skip for
-    ANY ongoing conversation (any non-empty history), matching the old
-    design's blanket mid-exploration bypass, not just the pending-offer
-    case."""
+def test_layer_2_runs_with_the_last_assistant_reply_as_context(monkeypatch, isolated_subscribers_db):
+    """Two narrower designs were tried and measured to regress before
+    this one (see bot.py's own comment at the call site): skipping layer
+    2 only when a pending offer exists misclassified a contextual reply
+    ("the first one") as off-topic up to 100% of the time; skipping it
+    for any ongoing conversation instead let a genuine off-topic pivot
+    mid-conversation through uncaught (qa-engineer, 2026-09-24, case 12).
+    This version always runs layer 2 once there's no pending offer, and
+    passes the last assistant message as context so Jev can tell the two
+    apart -- verified live before shipping (24/24 across both failure
+    shapes)."""
     run_turn = _stub_agent_turn(monkeypatch)
-    classify = MagicMock()
+    classify = MagicMock(return_value=guardrails.MessageClassification(
+        on_topic=True, categories=["find_interests"]))
     monkeypatch.setattr(bot.guardrails, "classify_message", classify)
     bot.conversations[7] = {
         "messages": [AIMessage(content="Here are a few examples, which land?")],
@@ -817,9 +817,31 @@ def test_layer_2_is_skipped_for_any_ongoing_conversation_not_just_a_pending_offe
 
     result = asyncio.run(bot.process_message(7, "the first one", "m", "g", "j"))
 
-    classify.assert_not_called()
+    classify.assert_called_once_with("the first one", "j", "Here are a few examples, which land?")
     run_turn.assert_called_once()
     assert result["blocked_at"] is None
+
+
+def test_layer_2_still_catches_an_off_topic_pivot_mid_conversation(monkeypatch, isolated_subscribers_db):
+    """The case 12 regression itself, as a guard: a genuinely off-topic
+    message mid-conversation must still be blocked, not waved through
+    just because history exists."""
+    run_turn = MagicMock()
+    monkeypatch.setattr(bot.interest_finder, "run_turn", run_turn)
+    monkeypatch.setattr(bot.guardrails, "fails_local_prefilter", MagicMock(return_value=False))
+    monkeypatch.setattr(bot.guardrails, "classify_message", MagicMock(
+        return_value=guardrails.MessageClassification(on_topic=False, categories=["off_topic"])))
+    bot.conversations[7] = {
+        "messages": [AIMessage(content="Here's what's new with OpenAI: ...")],
+        "timestamps": [datetime.now(timezone.utc)],
+        "pending_offer": None,
+    }
+
+    result = asyncio.run(bot.process_message(7, "Write me a poem about cats", "m", "g", "j"))
+
+    run_turn.assert_not_called()
+    assert result["blocked_at"] == "layer2_router"
+    assert result["reply"] == guardrails.REDIRECT_MESSAGE
 
 
 def test_a_bare_confirmation_with_nothing_pending_gets_an_honest_reply(monkeypatch, isolated_subscribers_db):

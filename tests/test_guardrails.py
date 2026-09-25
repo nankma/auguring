@@ -143,6 +143,27 @@ def test_classify_message_sends_the_user_message_as_state(monkeypatch):
     assert set(questions) == {"on_topic"} | {f"is_{c}" for c in guardrails._CATEGORY_QUESTIONS}
 
 
+def test_classify_message_omits_previous_bot_message_when_not_given(monkeypatch):
+    mock = _mock_jev(monkeypatch, return_value=_jev_router_answers(0.9, news_query=0.9))
+    guardrails.classify_message("What's new with Anthropic?", "fake-jev-key")
+    state, _questions, _api_key = mock.call_args[0]
+    assert "previous_bot_message" not in state
+
+
+def test_classify_message_includes_previous_bot_message_when_given(monkeypatch):
+    """Case 12, docs/plans/front-door-agent-plan.md: layer 2 needs the
+    last assistant reply as context to tell a contextual continuation
+    ("sure") apart from a genuine off-topic pivot, without exempting
+    either shape from the check entirely (both prior designs -- skip only
+    with a pending offer, skip for any ongoing conversation -- were
+    measured live to regress)."""
+    mock = _mock_jev(monkeypatch, return_value=_jev_router_answers(0.9, news_query=0.9))
+    guardrails.classify_message(
+        "sure", "fake-jev-key", last_assistant_reply="Here are a few examples, which land?")
+    state, _questions, _api_key = mock.call_args[0]
+    assert state == {"message": "sure", "previous_bot_message": "Here are a few examples, which land?"}
+
+
 def _jev_layer4_answers(discusses=0.0, appropriate=1.0, all_addressed=None) -> dict:
     answers = {
         "discusses_own_configuration": {"noul": discusses},
