@@ -207,6 +207,24 @@ the same incidents inline.
    this deploy change it" — those are different claims, and the report
    should say which one it's actually making.
 
+   **Resuming after Claude Code's own background memory-pressure
+   protection kills the session mid-deploy: re-check the VM's actual
+   state before trusting the last thing you observed.** Real case,
+   2026-09-24 (PR #112): a session was killed apparently mid-Transfer,
+   with the last confirmed observation being "old container still
+   running untouched, old image". On resuming, `docker inspect
+   myfirstagent-bot --format '{{.Created}}'` and the image's `commit`
+   label showed the new container had actually already been created and
+   was running the new image — the backgrounded `docker save | ssh ...
+   docker load` and the restart are plain shell/SSH processes not tied
+   to the interactive session's lifetime, so they kept running and
+   finished after the session was torn down; only the verification
+   steps hadn't happened yet. Don't assume the last-observed step is
+   still where things stand — run `docker inspect ... .Created` and
+   check the image's `commit` label against the target commit FIRST,
+   before deciding whether to redo Transfer/Restart or skip straight to
+   verification.
+
 ## After every deploy: check `docker logs` actually has output
 
 **Step 3.5, before the smoke test below:** run

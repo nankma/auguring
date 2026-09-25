@@ -910,7 +910,7 @@ async def _push_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     # the two don't read as the same function at a glance.
     await news_push.run_push_cycle(
         model, send, embedder=context.bot_data.get("embedder"),
-        notify_admin=notify_admin_of_push_limit)
+        notify_admin=notify_admin_of_push_limit, jev_api_key=context.bot_data["jev_api_key"])
 
 
 def register_push_job(app: Application) -> None:
