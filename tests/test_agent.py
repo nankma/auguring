@@ -10,6 +10,7 @@ import agent
 import news_cache
 import news_classify
 import news_embed
+import news_jev_filter
 import interest_cache_ops
 import subscriber_ops
 from tests.fakes import FakeEmbedder, FakeToolCallingModel, RecordingCallbackHandler
@@ -341,6 +342,47 @@ def test_search_news_enforces_daily_quota(monkeypatch, isolated_subscribers_db):
     assert first == agent._no_results_message("AI")  # cap not yet reached, just an empty cache
     assert "today's searches" in second
     model.invoke.assert_not_called()
+
+
+def test_search_news_applies_jev_filter_when_key_given(monkeypatch, isolated_subscribers_db):
+    """When jev_api_key is provided, search_news's candidate pool runs
+    through news_jev_filter.score_and_rank before the report-writing
+    model ever sees it -- not just called, but its OUTPUT is what
+    reaches the model (a re-ranked/filtered list), not the embedding
+    filter's own raw order."""
+    embedder = FakeEmbedder()
+    reordered = _cached_article(
+        "https://example.com/reordered", "Jev-preferred headline",
+        embedding=news_embed.embed_one(embedder, "AI coding"),
+    )
+    other = _cached_article(
+        "https://example.com/other", "Embedding-preferred headline",
+        embedding=news_embed.embed_one(embedder, "AI coding"),
+    )
+    monkeypatch.setattr(news_cache, "read_all", lambda: [other, reordered])
+    mock_score = MagicMock(return_value=[reordered, other])
+    monkeypatch.setattr(news_jev_filter, "score_and_rank", mock_score)
+    model = _RecordingModel(responses=[AIMessage(content="<b>Report</b>")])
+
+    agent.search_news(1, "AI coding", [], model, None, embedder, jev_api_key="fake-key")
+
+    mock_score.assert_called_once()
+    call_args = mock_score.call_args.args
+    assert call_args[1] == "AI coding"  # topic
+    assert call_args[2] == "fake-key"
+    listing = model.captured[1]["content"]
+    assert listing.index("Jev-preferred headline") < listing.index("Embedding-preferred headline")
+
+
+def test_search_news_skips_jev_filter_when_no_key_given(monkeypatch, isolated_subscribers_db):
+    monkeypatch.setattr(news_cache, "read_all", lambda: [])
+    mock_score = MagicMock()
+    monkeypatch.setattr(news_jev_filter, "score_and_rank", mock_score)
+    model = MagicMock()
+
+    agent.search_news(1, "AI", [], model, None, None)
+
+    mock_score.assert_not_called()
 
 
 def test_search_news_generates_and_caches_a_query_definition_when_uncached(monkeypatch, isolated_subscribers_db):

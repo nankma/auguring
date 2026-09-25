@@ -79,7 +79,7 @@ def _fake_structured_model(return_value) -> MagicMock:
     return model
 
 
-def _runtime(chat_id=1, session=None, embedder=None, model=None, guard_model=None):
+def _runtime(chat_id=1, session=None, embedder=None, model=None, guard_model=None, jev_api_key=None):
     """Stand-in for LangChain's ToolRuntime -- the tools only ever read
     `.context`, so a namespace with that one attribute is the whole
     surface they need."""
@@ -89,6 +89,7 @@ def _runtime(chat_id=1, session=None, embedder=None, model=None, guard_model=Non
         "model": model,
         "guard_model": guard_model,
         "embedder": embedder,
+        "jev_api_key": jev_api_key,
     })
 
 
@@ -333,9 +334,11 @@ def test_search_news_tool_delegates_with_no_conversation_history(monkeypatch):
     fake_model, fake_guard, fake_embedder = object(), object(), object()
 
     result = interest_finder.search_news.func(
-        "OpenAI news", _runtime(chat_id=7, model=fake_model, guard_model=fake_guard, embedder=fake_embedder))
+        "OpenAI news",
+        _runtime(chat_id=7, model=fake_model, guard_model=fake_guard, embedder=fake_embedder,
+                 jev_api_key="fake-jev-key"))
 
-    search.assert_called_once_with(7, "OpenAI news", [], fake_model, fake_guard, fake_embedder)
+    search.assert_called_once_with(7, "OpenAI news", [], fake_model, fake_guard, fake_embedder, "fake-jev-key")
     assert result == "a real trend report"
 
 
@@ -493,7 +496,7 @@ def test_run_turn_threads_the_turn_model_into_context_for_search_news(monkeypatc
     reply = interest_finder.run_turn(7, "what's new with OpenAI?", [], {}, model)
 
     assert reply == "Here's what's new."
-    search.assert_called_once_with(7, "OpenAI news", [], model, None, None)
+    search.assert_called_once_with(7, "OpenAI news", [], model, None, None, None)
 
 
 def test_run_turn_saves_via_the_tool_and_returns_the_final_reply(

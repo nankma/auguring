@@ -567,7 +567,8 @@ def test_handle_message_passes_chat_id_and_history_to_the_agent_turn(isolated_su
     asyncio.run(bot.handle_message(update, context))
 
     run_turn_mock.assert_called_once_with(
-        999, "What's new with robotics?", [], {"pending_proposal": None}, "fake-model", "fake-guard-model", None)
+        999, "What's new with robotics?", [], {"pending_proposal": None}, "fake-model", "fake-guard-model", None,
+        "fake-jev-key")
 
 
 def test_translate_confirmation_sends_text_and_language_returns_content():

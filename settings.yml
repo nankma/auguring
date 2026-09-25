@@ -263,7 +263,15 @@ push:
 # clamp on the same news_embed.filter_by_relevance pass push uses, with
 # its own values since search's pool (the whole cache, no category
 # pre-filter) differs from push's per-topic one. daily_limit: max
-# search_news calls per subscriber per UTC day.
+# search_news calls per subscriber per UTC day. jev_max_articles: cap on
+# how many of relevance_keep's survivors get sent into ONE Jev call
+# (news_jev_filter.score_and_rank) for the relatedness/interestingness
+# re-rank -- deliberately independent of relevance_keep.max, not derived
+# from it: raising the embedding filter's own keep window shouldn't
+# silently raise what's sent to Jev past what's actually been verified
+# for per-item accuracy (see news_jev_filter.py's module docstring --
+# clean up to 200, unverified above that even though latency alone holds
+# to ~500).
 search:
   max_results: 5
   daily_limit: 10
@@ -271,6 +279,7 @@ search:
     fraction: 0.10
     min: 20
     max: 50
+  jev_max_articles: 50
 
 # The "help me find my interests" conversation (interest_finder.py).
 # max_examples: how many real headlines one example-showing step puts in
