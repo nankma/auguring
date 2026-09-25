@@ -229,14 +229,24 @@ def run_cases(chat_id: int, timeout: int) -> list[dict]:
     # set_language is a direct-effect tool inside the interest_finder
     # agent (no confirmation needed, unlike add/remove -- see
     # docs/plans/interest-finder-plan.md), so this stays a one-shot
-    # message even after the front-door redesign; only the category
-    # changed, from "set_language" to "find_interests". Own chat_id, same
+    # message even after the front-door redesign. Own chat_id, same
     # isolation reasoning as case 2 -- also keeps this Spanish preference
     # from leaking into any other case's assertions the way it used to
     # warn about for case 14 below.
+    #
+    # `lang_ok` checks blocked_at only, same "blocked_at is what's
+    # actually guaranteed" reasoning as cases 2/3's own fix -- found live
+    # 2026-09-24 (PROD deploy of #106-#110) still asserting the PRE-Step-B
+    # behavior, where every INTEREST_AGENT_CATEGORIES-routed message was
+    # hardcoded to category="find_interests" regardless of what the
+    # router actually classified it as. Step B removed that hardcoding
+    # (docs/plans/front-door-agent-plan.md); `category` is now the
+    # router's real classification, "set_language" for this message,
+    # every time (verified 6/6 live) -- a correct, distinct category
+    # guardrails.py still asks about, not a wrong answer.
     language_chat_id = chat_id + 13
     r = send(language_chat_id, "Always reply to me in Spanish from now on", timeout)
-    lang_ok = r["blocked_at"] is None and r["category"] == "find_interests"
+    lang_ok = r["blocked_at"] is None
     r = send(language_chat_id, "What is new with OpenAI?", timeout)
     followup_ok = r["blocked_at"] is None and ("ñ" in r["reply"] or "ó" in r["reply"] or "de" in r["reply"].lower())
     results.append(

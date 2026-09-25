@@ -28,7 +28,7 @@ along with `end_exploration`/`MAX_TURNS`; **the Jev migration** (same day,
 once OpenRouter access came through) moved layers 2 and 4 off the pinned
 LangChain guard_model onto Jev's typed-decision API.
 
-**Two things qa-engineer measured live against the real model, 2026-09-24,
+**Four things measured live against the real model/endpoint, 2026-09-24,
 after Step B first shipped:**
 
 1. **Layer 2's skip condition -- three designs tried, two of them real
@@ -96,6 +96,16 @@ after Step B first shipped:**
    asserting a specific category or an actual save, which was really
    asserting against live cache contents this suite doesn't control, not
    against the code.
+
+4. **Case 9 (set language) had the same class of stale assertion, found
+   on the actual PROD deploy.** `lang_ok` required `category ==
+   "find_interests"` -- correct PRE-Step-B, when every
+   `INTEREST_AGENT_CATEGORIES`-routed message was hardcoded to that
+   label regardless of what the router actually classified it as. Step B
+   removed that hardcoding, so `category` is now the router's real
+   classification -- `"set_language"` for this message, every time
+   (verified live, 6/6 across fresh chat_ids, feature working correctly
+   in all six). Same fix as cases 2/3: loosened to `blocked_at is None`.
 
 ## What triggered this
 
