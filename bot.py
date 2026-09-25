@@ -580,11 +580,12 @@ async def _process_agent_turn(
     propose_definition) takes priority over everything below, INCLUDING
     layer 2 -- a bare "yes" carries no topical signal for the router to
     classify, so letting layer 2 see it first would route it somewhere
-    unrelated. More generally, layer 2 only ever runs on the FIRST
-    message of a fresh (empty-history) conversation -- see the comment at
-    its call site below for why a narrower "only skip it when there's a
-    pending offer" gate was tried first and measured to be a real
-    regression.
+    unrelated; classify_confirmation handles it instead. Otherwise, layer
+    2 runs on every message, but with the last assistant reply passed as
+    context so it can tell a contextual continuation ("sure") apart from
+    a genuine off-topic pivot regardless of how much history exists --
+    see the comment at its call site below for the two narrower designs
+    that were tried and measured to regress first.
 
     When there is neither a pending offer NOR any conversation history at
     all, a message that only makes sense as answering something gets the
@@ -635,30 +636,40 @@ async def _process_agent_turn(
         return {"blocked_at": None, "category": "context_lost", "reply": reply}
 
     category = "find_interests"
-    if not history:
+    if pending_offer is None:
         # Guardrail layer 2 -- the router, on Jev since
         # docs/plans/front-door-agent-plan.md item 5: one Jev call answers
-        # "is this on-topic" and "what
-        # kind of request(s) is this". Only its on_topic gate drives
-        # anything now; `categories` is kept purely as a label for the
-        # return value/telemetry below, not to pick a dispatch path.
+        # "is this on-topic" and "what kind of request(s) is this". Only
+        # its on_topic gate drives anything now; `categories` is kept
+        # purely as a label for the return value/telemetry below, not to
+        # pick a dispatch path.
         #
-        # Runs ONLY on the first message of a fresh (empty-history)
-        # conversation -- ANY ongoing conversation skips it, not just one
-        # with a live pending offer. Measured live (qa-engineer,
-        # 2026-09-24): a topic-free but genuinely contextual reply
-        # ("sure", "the first one") is misclassified as off-topic by this
-        # same router a third to all of the time -- the old design's
-        # blanket "any message in an open exploration skips layer 2"
-        # protected against exactly this, and narrowing that to
-        # "only when a pending offer exists" (this module's first attempt
-        # at this) was a real regression, not a simplification. Layer 1
-        # (local prefilter) and layer 4 (output check) still run
-        # regardless, same as they always did for a mid-exploration
-        # message under the old design -- layer 2 was never the sole
-        # defense against a mid-conversation off-topic pivot.
+        # Runs on every message that isn't answering a live pending offer
+        # (that's classify_confirmation's job instead -- see above). Two
+        # designs were tried and measured live before this one, both real
+        # regressions found by qa-engineer, not assumed:
+        #   1. Skip layer 2 only when a pending offer exists (first cut):
+        #      a topic-free but genuinely contextual reply ("sure", "the
+        #      first one") got misclassified as off-topic up to 100% of
+        #      the time, since Jev saw the message with no conversation
+        #      context at all.
+        #   2. Skip layer 2 for ANY ongoing conversation, not just a
+        #      pending offer (the fix for #1): this closed that gap but
+        #      opened a new one -- a genuinely off-topic pivot mid-
+        #      conversation ("write me a poem about cats" right after a
+        #      news reply) was never checked by any layer at all, since
+        #      the agent's own polite decline reads as acceptable bot
+        #      content to layer 4.
+        # This version always runs layer 2, but passes the last assistant
+        # message as context (`last_assistant_reply`) so Jev can tell a
+        # contextual continuation apart from a genuine pivot instead of
+        # bot.py trying to guess from history shape alone -- verified live
+        # against both directions (24/24 across the cases each prior
+        # design got wrong) before shipping.
+        last_assistant_reply = history[-1].content if history else None
         _t0 = time.monotonic()
-        classification = await asyncio.to_thread(guardrails.classify_message, user_text, jev_api_key)
+        classification = await asyncio.to_thread(
+            guardrails.classify_message, user_text, jev_api_key, last_assistant_reply)
         _events.log("latency_layer2_classify", {"message": "router classified the message",
                      "duration_seconds": round(time.monotonic() - _t0, 3)})
         if not classification.on_topic:

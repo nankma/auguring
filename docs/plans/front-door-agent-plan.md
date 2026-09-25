@@ -31,20 +31,27 @@ LangChain guard_model onto Jev's typed-decision API.
 **Two things qa-engineer measured live against the real model, 2026-09-24,
 after Step B first shipped:**
 
-1. **Layer 2 misclassifying a contextual mid-conversation follow-up as
-   off-topic -- real, fixed.** Step B's first cut narrowed the router's
-   skip condition to "only when a pending offer exists" (item 4's own
-   scope). Measured: a topic-free but genuinely contextual reply ("sure",
-   "the first one") answering an ordinary agent question -- not a
-   propose_interest confirmation, so no pending offer exists yet --
-   got misclassified as off-topic 1/3 to 3/3 of the time across a small
-   sample (67% overall on-topic across 6 phrasings × 3 trials). Fixed by
-   widening the skip condition back to "any ongoing conversation" (any
-   non-empty history), matching the OLD design's blanket bypass -- layer
-   1 (local prefilter) and layer 4 (output check) were never dependent on
-   layer 2 catching this, so nothing is lost by widening it back. Layer 2
-   now runs only on the first message of a fresh (empty-history)
-   conversation.
+1. **Layer 2's skip condition -- three designs tried, two of them real
+   regressions, before landing on one that works both ways.** First cut
+   skipped it "only when a pending offer exists" (item 4's own scope):
+   measured, a topic-free but genuinely contextual reply ("sure", "the
+   first one") got misclassified as off-topic 1/3 to 3/3 of the time
+   (67% overall on-topic across 6 phrasings × 3 trials), since Jev saw
+   the message with zero conversation context. Widened to "skip for any
+   ongoing conversation" (any non-empty history) to fix that -- which
+   fixed it, but opened the mirror-image gap: **case 12** of
+   `tools/run_smoke_tests.py`, found on the INT deploy of this plan
+   (2026-09-24), showed a genuinely off-topic pivot mid-conversation
+   ("write me a poem about cats" right after a news reply) went
+   completely uncaught by any layer -- the agent's own polite decline
+   read as acceptable content to layer 4, and layer 2 never ran at all.
+   Resolved by keeping layer 2 running on every message (skipped only for
+   a live pending offer, back to the first design) but passing the last
+   assistant reply to Jev as `previous_bot_message` context --
+   `_ON_TOPIC_QUESTION`'s criteria explicitly cover both directions (a
+   continuation of an on-topic conversation is true; an unrelated pivot
+   is false even with context present). Verified live, 24/24 across the
+   cases each of the first two designs got wrong, before shipping.
 
 2. **Multi-intent reliability -- real, NOT fixed, made observable
    instead.** Step A's own accepted-risk framing ("~7% for
@@ -331,6 +338,19 @@ normalization -- none of those fit a typed-decision shape.
 
 ## Open
 
+- **`search_news`'s report gets rewritten by the front-door agent, not
+  passed through verbatim -- accepted, not fixed.** Found on the INT
+  deploy of this plan (2026-09-24, smoke case 1): the agent narrates its
+  own reply around the tool's report instead of returning it as-is,
+  which breaks the "reply starts with 📰" contract (case 1's own check)
+  and means `agent.search_news`'s `mark_links_shown` call (based on what
+  its OWN generated report cites) can mark a link shown that the agent's
+  rewrite then drops from what the subscriber actually sees. Decided:
+  this is fine as-is -- a dropped article surfacing again on a later
+  search or the regular push is an acceptable outcome, not worth
+  engineering around. Not resolved: whether the 📰-first check itself
+  should be relaxed to match the new conversational-rewrite behavior
+  (it's currently a smoke-test false positive, not a real bug).
 - **Whether/how to act on `incomplete_reply` once real data accumulates.**
   The Jev migration above made the 12% multi-intent finding observable
   (an `incomplete_reply` WARN event) rather than fixing it. Revisit once
