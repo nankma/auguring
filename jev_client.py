@@ -2,11 +2,16 @@
 Thin adapter for TypeSafe AI's Jev "System One" typed-decision model,
 reached via OpenRouter's alpha decisions endpoint -- not OpenAI-wire-
 compatible, so agent.build_model_from_config's ChatOpenAI path can't
-reach it (see TODO.md). Used only for guardrails.py's two fixed, bounded,
+reach it (see TODO.md). Used by guardrails.py's two fixed, bounded,
 typed-decision layers (layer 2's on-topic/category gate, layer 4's output
-check) -- never for the conversational agent itself, which needs real
+check) and by news_jev_filter.py's per-article relatedness/interestingness
+scoring (called from inside agent.search_news) -- never for the
+conversational agent's own tool-calling loop itself, which needs real
 tool-calling and free-text generation Jev doesn't do (see
-docs/plans/front-door-agent-plan.md item 5).
+docs/plans/front-door-agent-plan.md item 5). search_news is reachable AS
+A TOOL from that same conversational agent, but the Jev call inside it
+is still one fixed, bounded, typed-decision step, not the agent loop
+itself making the call.
 
 Verified live against the real endpoint 2026-09-24 before this shipped:
 response shape matches docs.typesafe.ai/api.md's documented schema

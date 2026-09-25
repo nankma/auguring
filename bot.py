@@ -681,7 +681,8 @@ async def _process_agent_turn(
     try:
         _t0 = time.monotonic()
         reply = await asyncio.to_thread(
-            interest_finder.run_turn, chat_id, user_text, history, session, model, guard_model, embedder
+            interest_finder.run_turn, chat_id, user_text, history, session, model, guard_model, embedder,
+            jev_api_key
         )
         _events.log("latency_agent_turn", {"message": "front-door agent turn returned",
                      "duration_seconds": round(time.monotonic() - _t0, 3)})

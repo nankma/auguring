@@ -43,7 +43,7 @@ WORKDIR /app
 # supposed to when SETTINGS_FILE isn't explicitly configured for
 # production (see docs/standaloneplan/01-settings-migration.md). Don't
 # add it back without re-reading that reasoning first.
-COPY --chown=$MAMBA_USER:$MAMBA_USER agent.py app_settings.py news_sources.py news_cache.py news_classify.py news_embed.py news_keyness.py news_ingest.py news_push.py bot.py admin_bot.py combined_bot.py telemetry.py ptb_error_handler.py guardrails.py jev_client.py interest_finder.py subscriber_ops.py category_ops.py push_outcome_ops.py api_budget_ops.py interest_cache_ops.py source_state_ops.py test_api.py telegram_html.py message_archive.py settings.oracle.yml settings.int.yml docker-entrypoint.sh ./
+COPY --chown=$MAMBA_USER:$MAMBA_USER agent.py app_settings.py news_sources.py news_cache.py news_classify.py news_embed.py news_keyness.py news_ingest.py news_push.py bot.py admin_bot.py combined_bot.py telemetry.py ptb_error_handler.py guardrails.py jev_client.py news_jev_filter.py interest_finder.py subscriber_ops.py category_ops.py push_outcome_ops.py api_budget_ops.py interest_cache_ops.py source_state_ops.py test_api.py telegram_html.py message_archive.py settings.oracle.yml settings.int.yml docker-entrypoint.sh ./
 # news_sources.py/telemetry.py each import from their own package -- a
 # directory can't sit in the flat file list above (COPY needs its own
 # destination), so each needs its own line. Missed once already

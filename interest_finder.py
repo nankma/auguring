@@ -521,7 +521,8 @@ def search_news(query: str, runtime: ToolRuntime) -> str:
     exactly the mistake that produced a real incident."""
     ctx = runtime.context
     return agent.search_news(
-        ctx["chat_id"], query, [], ctx.get("model"), ctx.get("guard_model"), ctx.get("embedder"))
+        ctx["chat_id"], query, [], ctx.get("model"), ctx.get("guard_model"), ctx.get("embedder"),
+        ctx.get("jev_api_key"))
 
 
 @tool
@@ -772,7 +773,7 @@ def compose_prompt(request):
 
 
 def run_turn(chat_id: int, user_text: str, history: list, session: dict,
-             model, guard_model=None, embedder=None) -> str:
+             model, guard_model=None, embedder=None, jev_api_key=None) -> str:
     """One exchange with the always-on front-door agent. Returns the
     reply text.
 
@@ -788,7 +789,7 @@ def run_turn(chat_id: int, user_text: str, history: list, session: dict,
         result = agent.run_agent(
             built, messages,
             context={"chat_id": chat_id, "session": session, "model": model,
-                     "guard_model": guard_model, "embedder": embedder},
+                     "guard_model": guard_model, "embedder": embedder, "jev_api_key": jev_api_key},
             recursion_limit=MAX_STEPS_PER_TURN,
         )
     except GraphRecursionError:

@@ -38,6 +38,7 @@ from telemetry_providers import Level
 import news_cache
 import news_classify
 import news_embed
+import news_jev_filter
 import interest_cache_ops
 import subscriber_ops
 import telegram_html
@@ -55,6 +56,13 @@ SEARCH_DAILY_LIMIT = get_settings().resolved("search.daily_limit", default=10)
 SEARCH_RELEVANCE_KEEP_FRACTION = get_settings().resolved("search.relevance_keep.fraction", default=0.10)
 SEARCH_RELEVANCE_KEEP_MIN = get_settings().resolved("search.relevance_keep.min", default=20)
 SEARCH_RELEVANCE_KEEP_MAX = get_settings().resolved("search.relevance_keep.max", default=50)
+# Independent of relevance_keep.max above on purpose (see
+# news_jev_filter.py's own module docstring for the verified-safe
+# range): the embedding filter's own tuning and "how many of its
+# survivors get sent into one Jev call" are two different knobs, so
+# raising one doesn't silently raise the other past what's been checked
+# for per-item accuracy.
+SEARCH_JEV_MAX_ARTICLES = get_settings().resolved("search.jev_max_articles", default=50)
 
 
 def build_model_from_config(cfg: dict, default_timeout: float = 60.0):
@@ -404,7 +412,8 @@ _SEARCH_REPORT_BASE_PROMPT = (
 )
 
 
-def search_news(chat_id: int, query: str, history: list, model, guard_model, embedder=None) -> str:
+def search_news(chat_id: int, query: str, history: list, model, guard_model, embedder=None,
+                 jev_api_key: str | None = None) -> str:
     """Search the already-ingested news cache for `query` and return the
     most relevant recent articles as a finished, ready-to-send report --
     a one-off lookup, not a subscription; it does not add or change any
@@ -417,10 +426,12 @@ def search_news(chat_id: int, query: str, history: list, model, guard_model, emb
     `history` is this chat's prior conversation turns, used only by the
     query-rewrite step to resolve a context-dependent follow-up -- this
     function itself has no memory of its own and makes no other use of
-    it. `guard_model`/`embedder` are optional (default None) and this
-    function degrades gracefully without either -- a caller that hasn't
-    built one yet (or a test) can omit them, same convention as the
-    rest of this pipeline."""
+    it. `guard_model`/`embedder`/`jev_api_key` are optional (default
+    None) and this function degrades gracefully without any of them --
+    a caller that hasn't built one yet (or a test) can omit them, same
+    convention as the rest of this pipeline. Without `jev_api_key`, the
+    embedding relevance filter's own top-N-by-similarity order is used
+    as-is (see news_jev_filter.py for what the Jev step adds on top)."""
     today = datetime.now(timezone.utc).date().isoformat()
     if not subscriber_ops.try_consume_search_query(chat_id, today, daily_cap=SEARCH_DAILY_LIMIT):
         return (
@@ -475,6 +486,13 @@ def search_news(chat_id: int, query: str, history: list, model, guard_model, emb
     )
     _events.log("latency_cache_read_relevance_filter", {"message": "news_cache read + relevance filter completed",
                  "duration_seconds": round(time.monotonic() - _t0, 3)})
+
+    if jev_api_key is not None:
+        _t0 = time.monotonic()
+        relevant = news_jev_filter.score_and_rank(relevant, topic, jev_api_key, SEARCH_JEV_MAX_ARTICLES)
+        _events.log("latency_jev_filter", {"message": "Jev relatedness/interestingness filter completed",
+                     "duration_seconds": round(time.monotonic() - _t0, 3)})
+
     results = relevant[:SEARCH_MAX_RESULTS]
 
     if not results:

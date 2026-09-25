@@ -370,6 +370,26 @@ everything Jev can't do: `classify_confirmation`,
 `reads_as_bare_confirmation`, `_translate_confirmation`, interest
 normalization -- none of those fit a typed-decision shape.
 
+**A third Jev caller, 2026-09-24: `news_jev_filter.py`.** Separate from
+layers 2/4 (this one scores search_news's candidate articles for
+relatedness/interestingness, not a guardrail), but it hit the same class
+of problem the layer-2/4 work above already had to solve empirically, so
+it's recorded here rather than only in `telemetry-and-testing-plan.md`.
+Jev's own docs recommend scoring a batch of records with one shared
+`state.articles` list and questions referencing "article #i" -- verified
+live to have a severe, batch-size-independent positional bias: the
+IDENTICAL article scored 0.95 at position 0 and 0.14-0.39 at any later
+position, even in a 10-item batch. Fix: each question embeds that
+article's own title/summary text directly in its own `instructions`
+string; `state` never carries the shared list. Re-verified clean at 200
+articles (on-topic 0.69-0.95, off-topic 0.01, regardless of position,
+~0.3s/~$0.0004 per call) -- latency alone holds flat to ~500 questions,
+but per-item accuracy was only checked to 200, which is why
+`search.jev_max_articles` is its own setting rather than derived from
+`search.relevance_keep.max`. See `news_jev_filter.py`'s own module
+docstring for the full detail. Wired into `agent.search_news` only so
+far -- `news_push.py`'s scheduled digest doesn't use it yet.
+
 ## Open
 
 - **`search_news`'s report gets rewritten by the front-door agent, not

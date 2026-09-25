@@ -210,6 +210,7 @@ search:
     fraction: 0.10
     min: 20
     max: 50
+  jev_max_articles: 50
 
 interest_finder:
   max_examples: 5
