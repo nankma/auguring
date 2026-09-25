@@ -872,6 +872,23 @@ def test_push_job_threads_the_bot_datas_embedder_through(monkeypatch):
     assert run_push_cycle.call_args.kwargs["embedder"] == "fake-embedder"
 
 
+def test_push_job_threads_the_bot_datas_jev_api_key_through(monkeypatch):
+    """Regression test for the 2026-09-25 bug where news_push.py's
+    is_output_on_topic call site never received jev_api_key at all (a
+    stale pre-Jev-migration call site) -- this confirms _push_job at
+    least passes it into run_push_cycle; test_news_push.py's own
+    regression test confirms it then reaches is_output_on_topic
+    correctly from there."""
+    context = _make_context()
+    context.bot = MagicMock()
+    run_push_cycle = AsyncMock()
+    monkeypatch.setattr(bot.news_push, "run_push_cycle", run_push_cycle)
+
+    asyncio.run(bot._push_job(context))
+
+    assert run_push_cycle.call_args.kwargs["jev_api_key"] == "fake-jev-key"
+
+
 def test_push_job_with_no_embedder_in_bot_data_passes_none(monkeypatch):
     """bot_data.get(), not [] -- a deployment where build_embedder() failed
     at startup must not KeyError the push job, it must degrade."""

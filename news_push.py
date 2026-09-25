@@ -1035,7 +1035,7 @@ def is_subscriber_due(last_push_at: datetime | None, interval_hours: int, now: d
 
 
 async def run_push_cycle(model, send: "callable", now: datetime | None = None, embedder=None,
-                         notify_admin: "callable" = None) -> None:
+                         notify_admin: "callable" = None, jev_api_key: str | None = None) -> None:
     """One scheduler tick: for every push-enabled, due subscriber with at
     least one interest, select candidate articles from the shared cache,
     and if there are any, write and send a digest. `send` is
@@ -1071,6 +1071,21 @@ async def run_push_cycle(model, send: "callable", now: datetime | None = None, e
     for a shared cache ("one Perigon call can satisfy every subscriber
     whose interests match it"), and avoids N redundant directory scans
     for N due subscribers in the same tick.
+
+    `jev_api_key=None` (the default): passed straight through to the
+    per-digest guardrails.is_output_on_topic call below. Fixes a real
+    regression found live 2026-09-25 -- this call site still passed the
+    module's OLD pre-Jev signature (`model, digest`) after
+    is_output_on_topic's signature moved to `(response_text, jev_api_key,
+    user_text=None)` for the Jev migration (docs/plans/front-door-agent-plan.md
+    item 5); every other caller was updated, this one wasn't. The digest
+    text ended up in the `jev_api_key` slot, which jev_client.ask then
+    tried to send as the literal `Authorization: Bearer <digest text>`
+    header -- `requests` rejects that client-side (emoji/newlines aren't
+    legal header bytes) before any network call is made, so every push
+    digest's layer-4 check has been silently failing open (0 real Jev
+    tokens spent, 0 digests blocked) since that migration shipped, not
+    just today.
 
     Real incident, 2026-08-09, two parts: (1) a subscriber reported never
     receiving a push despite push_outcome_ops showing a completed cycle -- there
@@ -1263,7 +1278,7 @@ async def run_push_cycle(model, send: "callable", now: datetime | None = None, e
                 # A stored interest is user-supplied, unsanitized text that
                 # ends up embedded in the digest prompt, so the same output
                 # guardrail bot.py runs on chat replies applies here.
-                if not _model_call(guardrails.is_output_on_topic, model, digest):
+                if not _model_call(guardrails.is_output_on_topic, digest, jev_api_key):
                     blocked += 1
                     continue
 

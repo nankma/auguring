@@ -1381,6 +1381,35 @@ def test_run_push_cycle_sends_and_records_when_new_articles_found(monkeypatch, i
     advance_last_push_at.assert_called_once_with(3, now)
 
 
+def test_run_push_cycle_calls_is_output_on_topic_with_the_digest_and_jev_api_key(
+    monkeypatch, isolated_subscribers_db
+):
+    """Regression test for a real bug found live 2026-09-25: this call
+    site still passed the OLD pre-Jev signature (model, digest) after
+    is_output_on_topic moved to (response_text, jev_api_key, user_text=None)
+    for the Jev migration -- every other caller was updated, this one
+    wasn't, so the digest text silently ended up in the jev_api_key slot
+    (see run_push_cycle's own docstring). Asserts the exact positional
+    shape, not just that the call happens, so a future edit can't
+    reintroduce the swap without this test catching it."""
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(subscriber_ops, "list_push_enabled_subscribers", lambda: [_subscriber(3)])
+    monkeypatch.setattr(subscriber_ops, "mark_links_shown", MagicMock())
+    monkeypatch.setattr(subscriber_ops, "advance_last_push_at", MagicMock())
+    new_articles = [{**_article("https://example.com/new"), "topic": "AI"}]
+    _stub_cache_and_categories(monkeypatch)
+    monkeypatch.setattr(news_push, "select_candidate_articles", MagicMock(return_value=new_articles))
+    digest = '<b>Digest</b> 🔗 <a href="https://example.com/new">Source</a>'
+    monkeypatch.setattr(news_push, "write_push_digest", MagicMock(return_value=digest))
+    is_output_on_topic = MagicMock(return_value=True)
+    monkeypatch.setattr(news_push.guardrails, "is_output_on_topic", is_output_on_topic)
+
+    asyncio.run(news_push.run_push_cycle(
+        model="fake-model", send=AsyncMock(), now=now, jev_api_key="fake-jev-key"))
+
+    is_output_on_topic.assert_called_once_with(digest, "fake-jev-key")
+
+
 def test_run_push_cycle_passes_the_subscribers_chat_id_to_select_candidate_articles(
     monkeypatch, isolated_subscribers_db
 ):
@@ -2560,7 +2589,7 @@ def test_a_partial_block_is_visible_in_the_delivered_detail(
             f'<a href="{a["link"]}">s</a>' for a in arts))
     # AI's digest passes the guardrail, Robotics' is blocked.
     monkeypatch.setattr(news_push.guardrails, "is_output_on_topic",
-                        lambda model, digest: "https://e.com/ai" in digest)
+                        lambda digest, jev_api_key: "https://e.com/ai" in digest)
 
     asyncio.run(news_push.run_push_cycle(model="fake-model", send=AsyncMock(), now=now))
 
@@ -2603,7 +2632,7 @@ def test_a_later_interests_model_failure_still_records_delivered(
             '<b>D</b> <a href="https://e.com/ai">s</a>',
             RuntimeError("Request timed out."),
         ]))
-    monkeypatch.setattr(news_push.guardrails, "is_output_on_topic", lambda model, digest: True)
+    monkeypatch.setattr(news_push.guardrails, "is_output_on_topic", lambda digest, jev_api_key: True)
 
     asyncio.run(news_push.run_push_cycle(model="fake-model", send=AsyncMock(), now=now))
 
@@ -2649,7 +2678,7 @@ def test_a_later_interests_model_failure_still_charges_the_trial_allowance(
             '<b>D</b> <a href="https://e.com/ai2">s</a>',
             RuntimeError("Request timed out."),
         ]))
-    monkeypatch.setattr(news_push.guardrails, "is_output_on_topic", lambda model, digest: True)
+    monkeypatch.setattr(news_push.guardrails, "is_output_on_topic", lambda digest, jev_api_key: True)
 
     asyncio.run(news_push.run_push_cycle(model="fake-model", send=AsyncMock(), now=now))
 
