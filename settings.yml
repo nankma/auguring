@@ -238,7 +238,9 @@ news_source:
 # collapse at. max_article_age_hours: ceiling on an article's own
 # publish date. max_html_attempts: retry budget for valid Telegram
 # HTML. unreachable_strikes: consecutive failed digests before push
-# turns off for that subscriber.
+# turns off for that subscriber. jev_max_articles/jev_min_pool_size: see
+# news_jev_filter.py's own module docstring and this file's search.*
+# comment below -- independent of relevance_keep.max on purpose.
 push:
   tick_seconds: 900
   max_articles_per_topic: 5
@@ -255,6 +257,8 @@ push:
     fraction: 0.20
     min: 40
     max: 100
+  jev_max_articles: 50
+  jev_min_pool_size: 4
 
 # search_news (agent.py): an on-demand lookup over the same ingested
 # cache push reads, not a live source fetch. max_results: articles

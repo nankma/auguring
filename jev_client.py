@@ -17,12 +17,25 @@ Verified live against the real endpoint 2026-09-24 before this shipped:
 response shape matches docs.typesafe.ai/api.md's documented schema
 exactly (`{"answers": {qid: {"type": "noul", "noul": 0.0-1.0}}, ...}`),
 ~0.17s round trip for a 3-question call.
+
+Every call's `usage` is logged here, once, centrally -- not by each
+caller -- specifically so a real question like "how many tokens did
+Jev spend today, and on what" has an actual log to answer it from
+instead of needing to be reconstructed by hand against the real
+endpoint after the fact (see docs/plans/front-door-agent-plan.md's
+2026-09-25 cost-investigation note for the reconstruction this
+replaces). `ask()`'s own return contract is unchanged (still just
+`answers`) so this needed no change at any of its three call sites.
 """
 
 import requests
 
+from telemetry import EventLogger, get_event_logger
+
 ENDPOINT = "https://openrouter.ai/api/alpha/decisions"
 MODEL = "~typesafe/jev-latest"
+
+_events: EventLogger = get_event_logger("argus.jev_client")
 
 
 def ask(state, questions: dict, api_key: str, timeout: float = 10.0) -> dict:
@@ -39,7 +52,10 @@ def ask(state, questions: dict, api_key: str, timeout: float = 10.0) -> dict:
     Raises on any failure (network, non-2xx, malformed response) --
     callers are responsible for their own fail-open handling, same as
     guardrails.classify_message/is_output_on_topic already do around
-    their own model calls."""
+    their own model calls. A raised exception means this never reaches
+    the usage-logging line below -- a failed call has no usage to log,
+    and the caller's own fail-open path already logs the failure itself
+    (router_failed/output_check_failed/news_jev_filter_failed)."""
     response = requests.post(
         ENDPOINT,
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
@@ -47,4 +63,24 @@ def ask(state, questions: dict, api_key: str, timeout: float = 10.0) -> dict:
         timeout=timeout,
     )
     response.raise_for_status()
-    return response.json()["answers"]
+    body = response.json()
+    usage = body.get("usage") or {}
+    _events.log("jev_call_usage", {
+        "message": "Jev call usage",
+        # A sample question id, not a caller-supplied label -- this
+        # function has no other way to know which caller it's serving,
+        # and num_questions alone is an unreliable proxy (guardrails.py's
+        # fixed 8/2/3 can collide with news_jev_filter.py's 2*len(articles)
+        # at specific article counts). Every caller's own question-id
+        # keys are already distinct and stable ("on_topic"/"is_*" only
+        # from layer 2, "discusses_own_configuration"/"all_asks_addressed"
+        # only from layer 4, "related_*"/"interesting_*" only from
+        # news_jev_filter) -- one of them, sorted for determinism,
+        # identifies the caller with zero call-site changes.
+        "sample_question_id": min(questions, default=None),
+        "num_questions": len(questions),
+        "input_tokens": usage.get("input_tokens"),
+        "output_tokens": usage.get("output_tokens"),
+        "cost": usage.get("cost"),
+    })
+    return body["answers"]

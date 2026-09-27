@@ -1410,6 +1410,159 @@ def test_run_push_cycle_calls_is_output_on_topic_with_the_digest_and_jev_api_key
     is_output_on_topic.assert_called_once_with(digest, "fake-jev-key")
 
 
+def test_run_push_cycle_applies_the_jev_filter_before_write_push_digest(monkeypatch, isolated_subscribers_db):
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(subscriber_ops, "list_push_enabled_subscribers", lambda: [_subscriber(3)])
+    monkeypatch.setattr(subscriber_ops, "mark_links_shown", MagicMock())
+    monkeypatch.setattr(subscriber_ops, "advance_last_push_at", MagicMock())
+    monkeypatch.setattr(news_push, "PUSH_JEV_MIN_POOL_SIZE", 1)
+    _stub_cache_and_categories(monkeypatch)
+    regular = [{**_article("https://example.com/a"), "topic": "AI"},
+               {**_article("https://example.com/b"), "topic": "AI"}]
+    monkeypatch.setattr(news_push, "select_candidate_articles", MagicMock(return_value=regular))
+    score_and_rank = MagicMock(return_value=[regular[1]])  # Jev keeps only the second one
+    monkeypatch.setattr(news_push.news_jev_filter, "score_and_rank", score_and_rank)
+    monkeypatch.setattr(interest_cache_ops, "resolve_interest_definition", lambda chat_id, topic: "a real definition")
+    write_push_digest = MagicMock(return_value='<b>D</b> <a href="https://example.com/b">s</a>')
+    monkeypatch.setattr(news_push, "write_push_digest", write_push_digest)
+    monkeypatch.setattr(news_push.guardrails, "is_output_on_topic", MagicMock(return_value=True))
+
+    asyncio.run(news_push.run_push_cycle(
+        model="fake-model", send=AsyncMock(), now=now, jev_api_key="fake-jev-key"))
+
+    score_and_rank.assert_called_once_with(
+        regular, "AI", "fake-jev-key", news_push.PUSH_JEV_MAX_ARTICLES, definition="a real definition")
+    # write_push_digest must see what the FILTER kept, not the raw candidate list
+    assert write_push_digest.call_args.args[1] == [regular[1]]
+
+
+def test_run_push_cycle_never_sends_the_novelty_extra_pick_through_the_jev_filter(
+    monkeypatch, isolated_subscribers_db
+):
+    """The novelty-extra article exists specifically to surface something
+    topically ADJACENT, not strictly on-topic -- gating it on Jev's
+    relatedness question would silently defeat that purpose. It must be
+    set aside before the Jev call and always survive regardless of what
+    Jev says about the regular candidates."""
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(subscriber_ops, "list_push_enabled_subscribers", lambda: [_subscriber(3)])
+    monkeypatch.setattr(subscriber_ops, "mark_links_shown", MagicMock())
+    monkeypatch.setattr(subscriber_ops, "advance_last_push_at", MagicMock())
+    monkeypatch.setattr(news_push, "PUSH_JEV_MIN_POOL_SIZE", 1)
+    _stub_cache_and_categories(monkeypatch)
+    regular = {**_article("https://example.com/regular"), "topic": "AI"}
+    extra = {**_article("https://example.com/extra"), "topic": "AI", "is_novelty_extra": True}
+    monkeypatch.setattr(news_push, "select_candidate_articles", MagicMock(return_value=[regular, extra]))
+    # Jev drops every regular candidate it's asked about.
+    score_and_rank = MagicMock(return_value=[])
+    monkeypatch.setattr(news_push.news_jev_filter, "score_and_rank", score_and_rank)
+    write_push_digest = MagicMock(
+        return_value='<b>D</b> <a href="https://example.com/extra">s</a>')
+    monkeypatch.setattr(news_push, "write_push_digest", write_push_digest)
+    monkeypatch.setattr(news_push.guardrails, "is_output_on_topic", MagicMock(return_value=True))
+
+    asyncio.run(news_push.run_push_cycle(
+        model="fake-model", send=AsyncMock(), now=now, jev_api_key="fake-jev-key"))
+
+    score_and_rank.assert_called_once()
+    assert score_and_rank.call_args.args[0] == [regular]  # extra never sent to Jev
+    assert write_push_digest.call_args.args[1] == [extra]  # extra survives regardless
+
+
+def test_run_push_cycle_skips_jev_filter_below_the_min_pool_size(monkeypatch, isolated_subscribers_db):
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(subscriber_ops, "list_push_enabled_subscribers", lambda: [_subscriber(3)])
+    monkeypatch.setattr(subscriber_ops, "mark_links_shown", MagicMock())
+    monkeypatch.setattr(subscriber_ops, "advance_last_push_at", MagicMock())
+    _stub_cache_and_categories(monkeypatch)
+    small_pool = [{**_article("https://example.com/a"), "topic": "AI"}]
+    monkeypatch.setattr(news_push, "select_candidate_articles", MagicMock(return_value=small_pool))
+    monkeypatch.setattr(news_push, "PUSH_JEV_MIN_POOL_SIZE", 4)
+    score_and_rank = MagicMock(return_value=[])
+    monkeypatch.setattr(news_push.news_jev_filter, "score_and_rank", score_and_rank)
+    monkeypatch.setattr(news_push, "write_push_digest",
+                        MagicMock(return_value='<b>D</b> <a href="https://example.com/a">s</a>'))
+    monkeypatch.setattr(news_push.guardrails, "is_output_on_topic", MagicMock(return_value=True))
+
+    asyncio.run(news_push.run_push_cycle(
+        model="fake-model", send=AsyncMock(), now=now, jev_api_key="fake-jev-key"))
+
+    score_and_rank.assert_not_called()
+
+
+def test_run_push_cycle_min_pool_size_gate_checks_regular_count_not_combined(
+    monkeypatch, isolated_subscribers_db
+):
+    """Regression test for a real bug caught in code review, 2026-09-26:
+    the gate was originally checked against the COMBINED pool (regular +
+    novelty-extra) before splitting them, so a topic with 3 regular
+    candidates + 1 novelty-extra would incorrectly clear a size-4 gate
+    and call Jev on only 3 real candidates -- inconsistent, since the
+    novelty-extra article never actually reaches Jev either way. This
+    test constructs exactly that shape (regular count below the
+    threshold, combined count at/above it) so it would have failed
+    against the old, buggy combined-pool gate."""
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(subscriber_ops, "list_push_enabled_subscribers", lambda: [_subscriber(3)])
+    monkeypatch.setattr(subscriber_ops, "mark_links_shown", MagicMock())
+    monkeypatch.setattr(subscriber_ops, "advance_last_push_at", MagicMock())
+    _stub_cache_and_categories(monkeypatch)
+    regular = [{**_article(f"https://example.com/{i}"), "topic": "AI"} for i in range(3)]
+    extra = {**_article("https://example.com/extra"), "topic": "AI", "is_novelty_extra": True}
+    monkeypatch.setattr(news_push, "select_candidate_articles", MagicMock(return_value=regular + [extra]))
+    monkeypatch.setattr(news_push, "PUSH_JEV_MIN_POOL_SIZE", 4)  # regular=3 < 4, combined=4 >= 4
+    score_and_rank = MagicMock(return_value=[])
+    monkeypatch.setattr(news_push.news_jev_filter, "score_and_rank", score_and_rank)
+    monkeypatch.setattr(news_push, "write_push_digest",
+                        MagicMock(return_value='<b>D</b> <a href="https://example.com/extra">s</a>'))
+    monkeypatch.setattr(news_push.guardrails, "is_output_on_topic", MagicMock(return_value=True))
+
+    asyncio.run(news_push.run_push_cycle(
+        model="fake-model", send=AsyncMock(), now=now, jev_api_key="fake-jev-key"))
+
+    score_and_rank.assert_not_called()
+
+
+def test_run_push_cycle_skips_jev_filter_when_no_key_given(monkeypatch, isolated_subscribers_db):
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(subscriber_ops, "list_push_enabled_subscribers", lambda: [_subscriber(3)])
+    monkeypatch.setattr(subscriber_ops, "mark_links_shown", MagicMock())
+    monkeypatch.setattr(subscriber_ops, "advance_last_push_at", MagicMock())
+    _stub_cache_and_categories(monkeypatch)
+    pool = [{**_article(f"https://example.com/{i}"), "topic": "AI"} for i in range(6)]
+    monkeypatch.setattr(news_push, "select_candidate_articles", MagicMock(return_value=pool))
+    score_and_rank = MagicMock(return_value=[])
+    monkeypatch.setattr(news_push.news_jev_filter, "score_and_rank", score_and_rank)
+    monkeypatch.setattr(news_push, "write_push_digest",
+                        MagicMock(return_value='<b>D</b> <a href="https://example.com/0">s</a>'))
+    monkeypatch.setattr(news_push.guardrails, "is_output_on_topic", MagicMock(return_value=True))
+
+    asyncio.run(news_push.run_push_cycle(model="fake-model", send=AsyncMock(), now=now))
+
+    score_and_rank.assert_not_called()
+
+
+def test_run_push_cycle_treats_an_all_rejected_jev_filter_result_like_no_candidates(
+    monkeypatch, isolated_subscribers_db
+):
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(subscriber_ops, "list_push_enabled_subscribers", lambda: [_subscriber(3)])
+    monkeypatch.setattr(subscriber_ops, "mark_links_shown", MagicMock())
+    _stub_cache_and_categories(monkeypatch)
+    pool = [{**_article(f"https://example.com/{i}"), "topic": "AI"} for i in range(6)]
+    monkeypatch.setattr(news_push, "select_candidate_articles", MagicMock(return_value=pool))
+    monkeypatch.setattr(news_push.news_jev_filter, "score_and_rank", MagicMock(return_value=[]))
+    write_push_digest = MagicMock()
+    monkeypatch.setattr(news_push, "write_push_digest", write_push_digest)
+
+    asyncio.run(news_push.run_push_cycle(
+        model="fake-model", send=AsyncMock(), now=now, jev_api_key="fake-jev-key"))
+
+    # The filter rejected everything -- same outcome as select_candidate_articles
+    # itself returning nothing: no digest is ever written.
+    write_push_digest.assert_not_called()
+
+
 def test_run_push_cycle_passes_the_subscribers_chat_id_to_select_candidate_articles(
     monkeypatch, isolated_subscribers_db
 ):
