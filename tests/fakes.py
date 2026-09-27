@@ -50,7 +50,10 @@ class FakeSpan:
     news_ingest.py, bot.py, news_classify.py, guardrails.py) need the
     identical class -- keeping one copy means EventLogger.log() growing
     a new span method only needs updating here, not in lockstep across
-    all six."""
+    every test file that imports it (grep this file's own name across
+    tests/ for the current list -- deliberately not enumerated here,
+    since a hardcoded count/list just goes stale as new consumers are
+    added, as happened to this docstring's own count more than once)."""
 
     def __init__(self):
         self.attrs = {}

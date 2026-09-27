@@ -202,6 +202,8 @@ push:
     fraction: 0.20
     min: 40
     max: 100
+  jev_max_articles: 50
+  jev_min_pool_size: 4
 
 search:
   max_results: 5

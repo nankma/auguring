@@ -55,6 +55,7 @@ import message_archive
 import news_cache
 import news_classify
 import news_embed
+import news_jev_filter
 import news_keyness
 import news_sources
 import telegram_html
@@ -191,6 +192,19 @@ RELEVANCE_KEEP_MAX = get_settings().resolved("push.relevance_keep.max", default=
 NOVELTY_RELEVANCE_KEEP_FRACTION = get_settings().resolved("push.novelty_relevance_keep.fraction", default=0.20)
 NOVELTY_RELEVANCE_KEEP_MIN = get_settings().resolved("push.novelty_relevance_keep.min", default=40)
 NOVELTY_RELEVANCE_KEEP_MAX = get_settings().resolved("push.novelty_relevance_keep.max", default=100)
+
+# news_jev_filter's fine relatedness/interestingness pass, run on
+# select_candidate_articles's own output before write_push_digest sees
+# it -- see run_push_cycle's per-interest loop. Independent of
+# RELEVANCE_KEEP_MAX/NOVELTY_RELEVANCE_KEEP_MAX on purpose, same
+# reasoning as search.jev_max_articles: the embedding filter's own
+# tuning and "how many of its survivors get sent into one Jev call" are
+# different knobs. jev_min_pool_size skips the Jev call entirely below
+# this many candidates -- a 2-3 article pool gets negligible value from
+# a fine filter relative to its guaranteed cost, and write_push_digest's
+# own judgment already covers a pool this small.
+PUSH_JEV_MAX_ARTICLES = get_settings().resolved("push.jev_max_articles", default=50)
+PUSH_JEV_MIN_POOL_SIZE = get_settings().resolved("push.jev_min_pool_size", default=4)
 
 # The relevance-filtered pool is capped here again before the regular
 # recency cut and novelty-extra search run -- matches RELEVANCE_KEEP_MAX
@@ -1213,6 +1227,30 @@ async def run_push_cycle(model, send: "callable", now: datetime | None = None, e
                     embedder=embedder,
                     chat_id=chat_id,
                 )
+                if not new_articles:
+                    continue
+
+                # Fine filter, same role as agent.search_news's own --
+                # see news_jev_filter's module docstring. The novelty-extra
+                # pick (at most one, see _pick_novelty_extra) is
+                # deliberately NOT sent through the relatedness gate: it
+                # exists specifically to surface something topically
+                # adjacent rather than strictly on-topic, so gating it on
+                # "related to `topic`" would silently defeat its own
+                # purpose. It's set aside before the Jev call and always
+                # added back afterward, never scored or dropped by Jev.
+                # PUSH_JEV_MIN_POOL_SIZE is checked against the REGULAR
+                # count specifically, not the combined pool -- the
+                # novelty-extra pick never reaches Jev, so it shouldn't be
+                # able to tip a too-small regular pool into calling Jev
+                # anyway (code review, 2026-09-26).
+                novelty_extra = [a for a in new_articles if a.get("is_novelty_extra")]
+                regular = [a for a in new_articles if not a.get("is_novelty_extra")]
+                if jev_api_key is not None and len(regular) >= PUSH_JEV_MIN_POOL_SIZE:
+                    regular = news_jev_filter.score_and_rank(
+                        regular, topic, jev_api_key, PUSH_JEV_MAX_ARTICLES,
+                        definition=interest_cache_ops.resolve_interest_definition(chat_id, topic))
+                    new_articles = regular + novelty_extra
                 if not new_articles:
                     continue
 

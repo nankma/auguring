@@ -489,7 +489,8 @@ def search_news(chat_id: int, query: str, history: list, model, guard_model, emb
 
     if jev_api_key is not None:
         _t0 = time.monotonic()
-        relevant = news_jev_filter.score_and_rank(relevant, topic, jev_api_key, SEARCH_JEV_MAX_ARTICLES)
+        relevant = news_jev_filter.score_and_rank(
+            relevant, topic, jev_api_key, SEARCH_JEV_MAX_ARTICLES, definition=definition)
         _events.log("latency_jev_filter", {"message": "Jev relatedness/interestingness filter completed",
                      "duration_seconds": round(time.monotonic() - _t0, 3)})
 
