@@ -266,7 +266,27 @@ SOURCE_SECTIONS: dict[str, list[str]] = {
     # for those -- too few to cluster -- while the subject classes are
     # exactly the right handle. These are papers, not industry news, so
     # they widen the corpus more than they feed digests.
-    "arxiv": ["cs.AI", "cs.LG", "cs.RO", "cs.CR", "quant-ph", "physics.optics"],
+    #
+    # Widened 2026-10-14 from the original 4 CS classes (cs.AI/cs.LG/
+    # cs.RO/cs.CR) to also cover the other CS subfields that actually map
+    # to real subscriber interests/categories: cs.CL (NLP/LLM research),
+    # cs.CV (computer vision), cs.MA (multiagent systems -- "AI Agent"),
+    # cs.NE (neural/evolutionary computing), cs.HC (human-computer
+    # interaction), cs.SE (software engineering), cs.DC (distributed/
+    # cluster computing -- infra and edge), cs.NI (networking), cs.IR
+    # (information retrieval/search), cs.SD (sound -- speech/audio ML).
+    # Left out the remaining ~22 arXiv CS classes (cs.AR, cs.CC, cs.CE,
+    # cs.CG, cs.CY, cs.DB, cs.DL, cs.DM, cs.ET, cs.FL, cs.GL, cs.GR,
+    # cs.GT, cs.IT, cs.LO, cs.MM, cs.MS, cs.NA, cs.OH, cs.OS, cs.PF,
+    # cs.PL, cs.SC, cs.SI, cs.SY) as pure-theory/niche-systems subfields
+    # with little tech-industry-news signal for this bot's subscribers --
+    # add one if a real interest needs it, same as quant-ph/physics.optics
+    # above.
+    "arxiv": [
+        "cs.AI", "cs.LG", "cs.RO", "cs.CR",
+        "cs.CL", "cs.CV", "cs.MA", "cs.NE", "cs.HC", "cs.SE", "cs.DC", "cs.NI", "cs.IR", "cs.SD",
+        "quant-ph", "physics.optics",
+    ],
     # Algolia's front_page tag is HN's own ranking, which is a better
     # relevance signal than anything a query could express here.
     "hackernews": ["front_page"],

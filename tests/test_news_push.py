@@ -1255,6 +1255,15 @@ def test_write_push_digest_marks_the_novelty_extra_in_the_listing(monkeypatch):
     assert captured["listing"].count("[EXTRA]") == 1
 
 
+def test_push_digest_prompt_caps_article_count_to_max_articles_per_topic():
+    """Regression test for the 2026-10-14 sequencing fix: Jev no longer
+    pre-cuts the pool to MAX_ARTICLES_PER_TOPIC before scoring it, so
+    write_push_digest can now be handed more than that many genuinely-
+    related candidates -- the prompt itself must be the thing enforcing
+    the final count, since nothing upstream does anymore."""
+    assert f"the {news_push.MAX_ARTICLES_PER_TOPIC} most significant" in news_push._PUSH_DIGEST_PROMPT
+
+
 def test_write_push_digest_adds_extra_instruction_only_when_present(monkeypatch):
     captured = {}
 
@@ -1584,6 +1593,53 @@ def test_run_push_cycle_passes_the_subscribers_chat_id_to_select_candidate_artic
     assert select.call_args.kwargs["chat_id"] == 3
 
 
+def test_run_push_cycle_widens_the_candidate_pool_for_jev_when_a_key_is_given(
+    monkeypatch, isolated_subscribers_db
+):
+    """Regression test for a real bug found via a live user report,
+    2026-10-14: digests had shrunk to 2-3 articles after the Jev filter
+    shipped, because select_candidate_articles was always cut to
+    MAX_ARTICLES_PER_TOPIC (5) by pure recency BEFORE Jev ever ran, so
+    Jev's own related>=3 threshold was being applied to an already-
+    final-sized list with no bigger pool to backfill from. When a
+    jev_api_key is configured, the call site must ask for the FULL
+    CANDIDATE_POOL_SIZE pool instead, so Jev (and then write_push_digest's
+    own final pick) has something real to narrow down."""
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(subscriber_ops, "list_push_enabled_subscribers", lambda: [_subscriber(3)])
+    monkeypatch.setattr(subscriber_ops, "mark_links_shown", MagicMock())
+    monkeypatch.setattr(subscriber_ops, "advance_last_push_at", MagicMock())
+    _stub_cache_and_categories(monkeypatch)
+    select = MagicMock(return_value=[])
+    monkeypatch.setattr(news_push, "select_candidate_articles", select)
+    send = AsyncMock()
+
+    asyncio.run(news_push.run_push_cycle(model="fake-model", send=send, now=now, jev_api_key="fake-jev-key"))
+
+    assert select.call_args.kwargs["max_per_topic"] == news_push.CANDIDATE_POOL_SIZE
+
+
+def test_run_push_cycle_keeps_the_narrow_cap_when_no_jev_key_is_given(
+    monkeypatch, isolated_subscribers_db
+):
+    """Without a jev_api_key, nothing downstream narrows the pool, so the
+    old MAX_ARTICLES_PER_TOPIC cut stays in effect -- widening it here
+    too would hand write_push_digest up to CANDIDATE_POOL_SIZE candidates
+    with no fine filter between it and the coarse embedding one."""
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(subscriber_ops, "list_push_enabled_subscribers", lambda: [_subscriber(3)])
+    monkeypatch.setattr(subscriber_ops, "mark_links_shown", MagicMock())
+    monkeypatch.setattr(subscriber_ops, "advance_last_push_at", MagicMock())
+    _stub_cache_and_categories(monkeypatch)
+    select = MagicMock(return_value=[])
+    monkeypatch.setattr(news_push, "select_candidate_articles", select)
+    send = AsyncMock()
+
+    asyncio.run(news_push.run_push_cycle(model="fake-model", send=send, now=now))
+
+    assert select.call_args.kwargs["max_per_topic"] == news_push.MAX_ARTICLES_PER_TOPIC
+
+
 def test_run_push_cycle_backfills_missing_definitions_before_selecting(monkeypatch, isolated_subscribers_db):
     now = datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
     monkeypatch.setattr(subscriber_ops, "list_push_enabled_subscribers", lambda: [_subscriber(3)])
@@ -1909,7 +1965,7 @@ def test_run_push_cycle_isolates_one_subscribers_failure(monkeypatch, isolated_s
     call_count = {"n": 0}
 
     def select_side_effect(cached_articles, topics, topic_categories, since, pushed_links,
-                           include_restricted=False, now=None, embedder=None, chat_id=None):
+                           include_restricted=False, max_per_topic=None, now=None, embedder=None, chat_id=None):
         call_count["n"] += 1
         if call_count["n"] == 1:
             raise RuntimeError("boom")
