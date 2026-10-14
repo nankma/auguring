@@ -17,16 +17,22 @@ earthquake and a Japan-society piece into a push digest -- nothing tech-
 related about either, and nothing in the old pipeline could have caught
 it, since no relevance check existed before the digest-writing prompt).
 
-Two-stage filtering, per docs/plans/local-news-cache-plan.md:
-  Stage 1 (category filter, in code) -- select_candidate_articles narrows
-  the shared cache to articles whose classifier-assigned categories
-  overlap with a subscriber's own classified interests, before the model
-  ever sees anything.
-  Stage 2 (content filter) -- folded into the existing single
-  write_push_digest call rather than a separate LLM call: the prompt now
-  explicitly tells the model to still exercise judgment and omit
-  candidates that survived the category filter but aren't genuinely
-  about the topic, instead of forcing everything given into the report.
+Three-stage filtering, per docs/plans/local-news-cache-plan.md:
+  Stage 1 (category + embedding filter, in code) -- select_candidate_
+  articles narrows the shared cache to articles whose classifier-assigned
+  categories overlap with a subscriber's own classified interests, then
+  to CANDIDATE_POOL_SIZE's worth of the most embedding-relevant ones,
+  before the model ever sees anything.
+  Stage 1.5 (Jev relatedness filter, when a jev_api_key is configured) --
+  news_jev_filter.score_and_rank, run on the FULL stage-1 pool (not a
+  pre-cut top-N -- see run_push_cycle's own comment on this, fixed
+  2026-10-14 after it was found to be the cause of digests shrinking to
+  2-3 articles).
+  Stage 2 (content filter + final pick) -- folded into the existing
+  single write_push_digest call rather than a separate LLM call: the
+  prompt tells the model to exercise its own relatedness judgment AND to
+  pick at most MAX_ARTICLES_PER_TOPIC of the best candidates for the
+  report, since stages 1/1.5 may now hand it more than that many.
 
 Deliberately still does NOT go through agent.py's tool-calling agent
 (build_agent/run_agent): a single plain model.invoke (no tool loop) is
@@ -257,10 +263,16 @@ _PUSH_DIGEST_PROMPT = (
     "genuinely relevant, silently omitting any that aren't -- do not "
     "force an irrelevant candidate into the report just because it was "
     "in the list, and do not invent or reference anything not in the "
-    "list either. If NONE of the candidates are genuinely relevant, "
-    "write nothing (an empty reply) rather than reporting on off-topic "
-    "content. Do not mention that this is an automated or periodic "
-    "message, and do not mention the filtering process itself.\n\n"
+    "list either. The list may contain more candidates than belong in one "
+    f"digest: if more than {MAX_ARTICLES_PER_TOPIC} are genuinely relevant, "
+    f"pick only the {MAX_ARTICLES_PER_TOPIC} most significant or "
+    "noteworthy ones to report on rather than covering all of them -- "
+    "being relevant does not by itself guarantee inclusion once there are "
+    "more relevant candidates than that. If NONE of the candidates are "
+    "genuinely relevant, write nothing (an empty reply) rather than "
+    "reporting on off-topic content. Do not mention that this is an "
+    "automated or periodic message, and do not mention the filtering "
+    "process itself.\n\n"
     + agent.HTML_FORMATTING_RULES
     + "\n\n"
     + agent.TREND_REPORT_STRUCTURE
@@ -1223,6 +1235,28 @@ async def run_push_cycle(model, send: "callable", now: datetime | None = None, e
                     # pushed_links cannot know about it yet.
                     set(subscriber["pushed_links"]) | set(delivered or []),
                     include_restricted=subscriber["restricted_sources_enabled"],
+                    # Sequencing fix, 2026-10-14: a real bug found via a
+                    # live user report of digests shrinking to 2-3 articles
+                    # after the Jev filter shipped. The ORIGINAL wiring
+                    # pre-cut "regular" to MAX_ARTICLES_PER_TOPIC (5) by
+                    # pure recency *before* Jev ever ran, then had Jev
+                    # apply its own, stricter related>=3 threshold on TOP
+                    # of that already-final-sized list -- any article Jev
+                    # rejected was just gone, with no bigger pool to
+                    # backfill from. Correct order (per user direction):
+                    # rough embedding filter to CANDIDATE_POOL_SIZE (50) ->
+                    # Jev ranks/filters by relatedness over the FULL 50 ->
+                    # write_push_digest's own LLM call does the final
+                    # relatedness judgment AND picks the best
+                    # MAX_ARTICLES_PER_TOPIC out of whatever Jev kept (see
+                    # _PUSH_DIGEST_PROMPT's cap instruction) -- one LLM
+                    # step doing both, not a separate code-side cut. Only
+                    # widen the pool when Jev is actually configured to
+                    # narrow it back down again; without a key, keep the
+                    # old narrow cut so write_push_digest isn't handed up
+                    # to 50 un-fine-filtered candidates with nothing
+                    # between it and the embedding filter.
+                    max_per_topic=CANDIDATE_POOL_SIZE if jev_api_key is not None else MAX_ARTICLES_PER_TOPIC,
                     now=now,
                     embedder=embedder,
                     chat_id=chat_id,
@@ -1231,26 +1265,35 @@ async def run_push_cycle(model, send: "callable", now: datetime | None = None, e
                     continue
 
                 # Fine filter, same role as agent.search_news's own --
-                # see news_jev_filter's module docstring. The novelty-extra
-                # pick (at most one, see _pick_novelty_extra) is
-                # deliberately NOT sent through the relatedness gate: it
-                # exists specifically to surface something topically
-                # adjacent rather than strictly on-topic, so gating it on
-                # "related to `topic`" would silently defeat its own
-                # purpose. It's set aside before the Jev call and always
-                # added back afterward, never scored or dropped by Jev.
-                # PUSH_JEV_MIN_POOL_SIZE is checked against the REGULAR
-                # count specifically, not the combined pool -- the
-                # novelty-extra pick never reaches Jev, so it shouldn't be
-                # able to tip a too-small regular pool into calling Jev
-                # anyway (code review, 2026-09-26).
+                # see news_jev_filter's module docstring. Runs on the FULL
+                # widened pool (up to CANDIDATE_POOL_SIZE, see the
+                # max_per_topic= comment above), not a pre-cut top-5 --
+                # Jev's own (related desc, interesting desc) ranking is
+                # what narrows it, not recency. The novelty-extra pick (at
+                # most one, see _pick_novelty_extra) is deliberately NOT
+                # sent through the relatedness gate: it exists specifically
+                # to surface something topically adjacent rather than
+                # strictly on-topic, so gating it on "related to `topic`"
+                # would silently defeat its own purpose. It's set aside
+                # before the Jev call and always added back afterward,
+                # never scored or dropped by Jev. PUSH_JEV_MIN_POOL_SIZE is
+                # checked against the REGULAR count specifically, not the
+                # combined pool -- the novelty-extra pick never reaches
+                # Jev, so it shouldn't be able to tip a too-small regular
+                # pool into calling Jev anyway (code review, 2026-09-26).
                 novelty_extra = [a for a in new_articles if a.get("is_novelty_extra")]
                 regular = [a for a in new_articles if not a.get("is_novelty_extra")]
+                regular_before_jev = len(regular)
                 if jev_api_key is not None and len(regular) >= PUSH_JEV_MIN_POOL_SIZE:
                     regular = news_jev_filter.score_and_rank(
                         regular, topic, jev_api_key, PUSH_JEV_MAX_ARTICLES,
                         definition=interest_cache_ops.resolve_interest_definition(chat_id, topic))
                     new_articles = regular + novelty_extra
+                # Per-stage pool sizes, so a digest that shrinks again is
+                # visible in docker logs instead of only via a user report.
+                print(f"[news_push] chat_id={chat_id} topic={topic!r}: candidates "
+                      f"before_jev={regular_before_jev} after_jev={len(regular)} "
+                      f"novelty_extra={len(novelty_extra)}")
                 if not new_articles:
                     continue
 
