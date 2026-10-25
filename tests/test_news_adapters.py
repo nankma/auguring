@@ -1,6 +1,7 @@
+import pytest
 from datetime import datetime, timezone
 
-from news_adapters._util import _parse_iso_published
+from news_adapters._util import FeedBlockedError, _parse_iso_published
 from news_adapters.arxiv import ArxivAdapter
 from news_adapters.gnews import GNewsAdapter
 from news_adapters.hackernews import HackerNewsAdapter
@@ -108,6 +109,25 @@ def test_arxiv_pull(requests_mock):
     assert "fake abstract" in articles[0]["summary"]
     assert "\n" not in articles[0]["title"]
     assert articles[0]["published_dt"] == datetime(2026, 8, 4, 0, 0, 0, tzinfo=timezone.utc)
+
+
+def test_arxiv_raises_when_a_200_response_is_an_html_challenge_page(requests_mock):
+    requests_mock.get("http://export.arxiv.org/api/query", text="<html><body>Just a moment</body></html>")
+    adapter = ArxivAdapter()
+    adapter.initialize({})
+
+    with pytest.raises(FeedBlockedError):
+        adapter.pull("cat:cs.AI", 5)
+
+
+def test_arxiv_returns_empty_for_a_valid_feed_with_no_entries(requests_mock):
+    requests_mock.get(
+        "http://export.arxiv.org/api/query",
+        text='<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><title>q</title></feed>')
+    adapter = ArxivAdapter()
+    adapter.initialize({})
+
+    assert adapter.pull("cat:cs.AI", 5) == []
 
 
 def test_arxiv_omits_date_range_when_since_not_given(requests_mock):

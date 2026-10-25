@@ -7,7 +7,7 @@ from datetime import datetime
 import feedparser
 import requests
 
-from news_adapters._util import _REQUEST_HEADERS, _parse_rss_published
+from news_adapters._util import _REQUEST_HEADERS, _parse_rss_published, _raise_if_html
 
 
 class ArxivAdapter:
@@ -45,6 +45,7 @@ class ArxivAdapter:
             headers=_REQUEST_HEADERS,
         )
         resp.raise_for_status()
+        _raise_if_html(resp, resp.url)
         feed = feedparser.parse(resp.text)
         return [
             {

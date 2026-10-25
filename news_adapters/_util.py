@@ -52,6 +52,28 @@ def _raise_for_status(resp: requests.Response) -> None:
         raise requests.HTTPError(_redact(exc)) from None
 
 
+class FeedBlockedError(Exception):
+    """A feed URL answered 2xx with an HTML document instead of a feed."""
+
+
+def _raise_if_html(resp: requests.Response, url: str) -> None:
+    """Raises FeedBlockedError when a 2xx response body is an HTML document.
+
+    An HTML page is never a valid RSS/Atom feed, but feedparser quietly
+    parses one into zero entries, so an anti-bot challenge page (HTTP 200,
+    e.g. The Register's proof-of-work page served to datacenter IPs) used
+    to look like a feed with nothing new: "fetched 0 article(s)", no
+    failure anywhere. Sniffs the body rather than Content-Type, since some
+    servers label a perfectly valid feed text/html. A feed that is valid
+    but empty is not HTML and still parses to [].
+    """
+    head = resp.content[:512].lstrip().lower()
+    if head.startswith((b"<!doctype html", b"<html")):
+        raise FeedBlockedError(
+            f"{_redact(url)} returned HTML ({resp.status_code}, {len(resp.content)} bytes) "
+            "instead of a feed -- likely an anti-bot challenge page")
+
+
 def _parse_iso_published(raw: str | None) -> datetime | None:
     """For sources that give an ISO-8601-ish string (HN's created_at,
     NewsAPI/GNews/Perigon's publishedAt/pubDate).
