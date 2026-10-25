@@ -235,7 +235,7 @@ posture, recurring cost) than anything on this page.
 
 | Source | Class | Endpoint | Notes |
 |---|---|---|---|
-| **The Register** | rss | `https://www.theregister.com/headlines.atom` | Atom, not RSS2.0 — feedparser handles both transparently. 302 redirect, followed automatically. |
+| **The Register** | rss | `https://www.theregister.com/headlines.atom` | Atom, not RSS2.0 — feedparser handles both transparently. 302 redirect, followed automatically. **Blocked from the Oracle VM's datacenter IP** (anti-bot challenge page, HTTP 200 HTML): listed in `news_source.disabled` in `settings.oracle.yml`; still on in `settings.yml`. |
 | **Computerworld** | rss | `https://www.computerworld.com/index.rss` | 301 redirect, followed automatically. |
 
 ### Consumer/gadget tech press (added 2026-08-13)
@@ -482,6 +482,14 @@ rejected on a docs page's word alone.
 | **Nikkei Asia's plain feed URL grepped for `<item>`** | Not a rejection of the source (it's enabled — see above), but a methodology trap worth recording: naively grepping for `<item>` on this feed finds zero, because it's RDF/RSS1.0. Always verify via `feedparser`, matching how the code actually parses it, not a raw string search. |
 | **Google News RSS search** (`news.google.com/rss/search?q=...`) | Works, and covers almost anything (validated: real AAOI coverage, and 100 results for a generic "NVIDIA chip" query from CNBC/Bloomberg/Financial Times/Benzinga). **Rejected anyway**: its `<link>` doesn't resolve to the actual article via a normal HTTP fetch — `curl -L` lands on a Google interstitial page that needs client-side JavaScript to redirect further to the real publisher URL. That breaks this project's requirement that `search_news` return real, citable URLs (see `CLAUDE.md`'s note on why `link` was added to `search_news`'s output in the first place). A source that regresses that isn't worth adding even though its coverage is excellent. |
 | **Reddit** (e.g. r/MachineLearning, r/LocalLLaMA) | Reddit deprecated unauthenticated `.json` endpoint access around 2026-05-28 — a request with a proper custom `User-Agent` still returns `403 Forbidden`. Getting Reddit data now requires registering an OAuth app (`reddit.com/prefs/apps`) and using the official API — more setup than a simple API key, not done yet. |
+
+## Disabling a source per deployment (`news_source.disabled`)
+
+Optional list of source keys to drop from `SOURCE_REGISTRY` (default none;
+`news_sources._without_disabled`). An unknown key only logs a warning. A
+feed that answers 200 with an HTML page (anti-bot challenge) now raises
+`FeedBlockedError` (`news_adapters/_util._raise_if_html`) instead of parsing
+to zero entries, so ingest logs and counts it as a failed pull.
 
 ## How to add a new source
 

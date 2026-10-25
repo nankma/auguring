@@ -94,6 +94,12 @@ news_source:
   default_interval_hours: 4
   request_delay_seconds: 1.1
 
+  # Sources to skip on this deployment. the_register serves an anti-bot
+  # challenge page (HTTP 200, HTML) to this VM's datacenter IP, so every
+  # pull returned nothing; settings.yml leaves it on for self-hosters.
+  disabled:
+    - the_register
+
   api:
     - key: newsapi
       type: newsapi

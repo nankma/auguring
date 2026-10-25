@@ -3,6 +3,7 @@ from trailsign import Settings, SettingsError
 
 import news_sources
 from news_adapters import discover_adapter_types, validate_configured_types
+from news_adapters._util import FeedBlockedError
 from tests.fixtures import HACKERNEWS_RESPONSE, RSS_RESPONSE
 
 
@@ -428,3 +429,55 @@ def test_traced_fetch_records_the_section_rather_than_a_placeholder_query():
         news_sources.traced_fetch("arxiv", lambda q, n: [], "user question", 5)
     assert captured.get("query") == "user question"
     assert "section" not in captured
+
+
+CHALLENGE_PAGE = "<!DOCTYPE html>\n<html><head><script>async function solved(d){}</script></head></html>"
+
+
+def test_fetch_rss_raises_when_a_200_response_is_an_html_challenge_page(requests_mock):
+    """Regression: The Register answered this VM's datacenter IP with an
+    HTTP 200 anti-bot page, which feedparser turned into zero entries --
+    "fetched 0 article(s)" with no failure logged anywhere."""
+    requests_mock.get("https://example.com/feed.xml", text=CHALLENGE_PAGE)
+
+    with pytest.raises(FeedBlockedError, match="https://example.com/feed.xml.*anti-bot"):
+        news_sources._fetch_rss("https://example.com/feed.xml", "Fake A")
+
+
+def test_fetch_rss_returns_empty_for_a_valid_feed_with_no_entries(requests_mock):
+    requests_mock.get(
+        "https://example.com/feed.xml",
+        text='<?xml version="1.0"?><rss version="2.0"><channel><title>t</title></channel></rss>')
+
+    assert news_sources._fetch_rss("https://example.com/feed.xml", "Fake A") == []
+
+
+def test_fetch_rss_accepts_a_valid_feed_mislabelled_as_text_html(requests_mock):
+    requests_mock.get(
+        "https://example.com/feed.xml", text=RSS_RESPONSE, headers={"Content-Type": "text/html"})
+
+    assert news_sources._fetch_rss("https://example.com/feed.xml", "Fake A")
+
+
+def test_without_disabled_drops_the_listed_sources(monkeypatch):
+    monkeypatch.setattr(
+        news_sources, "get_settings", lambda: Settings({"news_source": {"disabled": ["b"]}}))
+    registry = [("a", None, None, "rss"), ("b", None, None, "rss")]
+
+    assert news_sources._without_disabled(registry) == [("a", None, None, "rss")]
+
+
+def test_without_disabled_keeps_everything_by_default(monkeypatch):
+    monkeypatch.setattr(news_sources, "get_settings", lambda: Settings({}))
+    registry = [("a", None, None, "rss"), ("b", None, None, "rss")]
+
+    assert news_sources._without_disabled(registry) == registry
+
+
+def test_without_disabled_warns_about_an_unknown_key_without_raising(monkeypatch, capsys):
+    monkeypatch.setattr(
+        news_sources, "get_settings", lambda: Settings({"news_source": {"disabled": ["typo"]}}))
+    registry = [("a", None, None, "rss")]
+
+    assert news_sources._without_disabled(registry) == registry
+    assert "typo" in capsys.readouterr().out

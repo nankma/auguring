@@ -39,7 +39,7 @@ import requests
 
 from app_settings import get_settings
 from news_adapters import discover_adapter_types, validate_configured_types
-from news_adapters._util import _redact, _REQUEST_HEADERS, _parse_rss_published
+from news_adapters._util import _redact, _raise_if_html, _REQUEST_HEADERS, _parse_rss_published
 from news_adapters.arxiv import ArxivAdapter
 from news_adapters.hackernews import HackerNewsAdapter
 
@@ -68,6 +68,7 @@ def _clean_summary(raw: str | None, max_len: int = 300) -> str | None:
 def _fetch_rss(url: str, source_name: str, max_results: int = 5) -> list[dict]:
     resp = requests.get(url, timeout=10, headers=_REQUEST_HEADERS)
     resp.raise_for_status()
+    _raise_if_html(resp, url)
     feed = feedparser.parse(resp.content)
     return [
         {
@@ -320,7 +321,23 @@ SOURCE_SECTIONS: dict[str, list[str]] = {
 # for tuple-shape stability (RESTRICTED_SOURCES filtering, tests, and
 # news_ingest._SOURCE_CLASS all unpack 4-tuples) even though nothing
 # reads it anymore.
-SOURCE_REGISTRY = _always_on_sources() + _api_sources_from_settings() + _rss_sources_from_settings()
+def _without_disabled(registry: list[tuple]) -> list[tuple]:
+    """Drops sources named in news_source.disabled (optional, default []).
+
+    A per-deployment switch that needs no code change: settings.oracle.yml
+    lists the feeds its datacenter IP can't reach (e.g. the_register is
+    behind an anti-bot challenge there), while settings.yml leaves them on
+    for self-hosters whose IP isn't blocked. A key that matches no source
+    only prints a warning -- a typo here shouldn't take the bot down."""
+    disabled = set(get_settings().resolved("news_source.disabled", default=[]) or [])
+    unknown = disabled - {row[0] for row in registry}
+    if unknown:
+        print(f"[news_sources] news_source.disabled names unknown source(s): {sorted(unknown)}")
+    return [row for row in registry if row[0] not in disabled]
+
+
+SOURCE_REGISTRY = _without_disabled(
+    _always_on_sources() + _api_sources_from_settings() + _rss_sources_from_settings())
 
 
 # Sources gated behind per-user access, on top of the credential gate
