@@ -118,8 +118,32 @@ through the requester's own platform.
   shape; measure the container's memory with the Discord client running
   before shipping.
 
+## Step 0: validate the unknowns with a throwaway spike
+
+Several claims above come from secondary sources and decide whether the
+plan works at all. Before any of the build steps, run a minimal bot (a
+standalone script, not wired into `combined_bot.py`) that echoes a DM, and
+test it with a real young user's account (e.g. the owner's kids):
+
+1. Join flow: invite link -> join -> find the bot -> DM it. Count the
+   steps and where the user hesitates.
+2. Push: the bot sends the first message to a user who has joined the
+   home server but never messaged it. Does it arrive, or do the user's
+   privacy settings block it?
+3. Leaving: after the user leaves the home server, can the bot still DM
+   them and can they still reply? (Decides whether push works long term.)
+4. A welcome-channel button that makes the bot DM the user first, as a
+   way to skip the "find the bot in the member list" step.
+5. Confirm the 2000-character message cap and the minimum-age rule
+   against Discord's official docs.
+
+If push does not reach users after they leave the server, or is blocked
+by default privacy settings, the plan's core value (scheduled digests)
+is at risk and the design must change before anything else is built.
+
 ## Suggested build order
 
+0. The spike above.
 1. Platform-aware identity, Telegram-only behavior (own PR).
 2. Channel-aware formatting + Discord splitter/validator (pure code,
    testable without Discord).
