@@ -59,6 +59,7 @@ Status table.
 | `local-news-cache-plan.md` | Periodic ingestion + local cache, two-stage filtering |
 | `model-portability-plan.md` | Swapping/routing LLM models, the guardrail-measurement harness |
 | `multi-channel-plan.md` | Adding LINE — on hold |
+| `discord-plan.md` | Adding Discord (growth channel) — proposed, not built |
 | `security-plan.md` | The numbered security findings and their status |
 | `taxonomy-and-admin-plan.md` | DB-backed category taxonomy, admin-in-the-loop growth, the admin console |
 | `telemetry-and-testing-plan.md` | Test infrastructure, CI, Phoenix, what's covered vs. not |
