@@ -279,8 +279,7 @@ _PUSH_DIGEST_PROMPT = (
 
 
 def backfill_missing_interest_definitions(model, interests: list[str]) -> None:
-    """Stage-1 setup, for the
-    definition cache rather than the category one. Fixes a real gap
+    """Stage-1 setup for the interest-definition cache. Fixes a real gap
     (docs/plans/interest-definition-plan.md "Defect 2"): add_one_interest
     generates a definition only ONCE, at add time -- an interest added
     before expand_interest_for_retrieval existed, or one whose one-shot
@@ -292,11 +291,9 @@ def backfill_missing_interest_definitions(model, interests: list[str]) -> None:
     two-character string, which is a near-meaningless query
     (docs/analysis/retrieval-quality-measurements.md finding 4).
 
-    Cache-check-then-generate shape,
-    same cache (interest_cache_ops's SHARED/global tier -- the same one
-    add_one_interest already writes to, so this is a retroactive fill of
-    that cache, not a new one). No return value: unlike categories, which
-    select_candidate_articles needs threaded through as a dict, nothing
+    Cache-check-then-generate shape, same cache (interest_cache_ops's
+    SHARED/global tier -- the same one add_one_interest already writes to, so this is a retroactive fill of
+    that cache, not a new one). No return value: nothing
     downstream needs the definitions handed back -- _resolve_query_text
     reads the cache itself, per topic, right after this runs."""
     missing = [i for i in interests if interest_cache_ops.get_interest_query_expansion(i) is None]

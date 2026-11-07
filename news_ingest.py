@@ -1,8 +1,8 @@
 """
 Periodic news ingestion for the local cache -- see
 docs/plans/local-news-cache-plan.md. Pulls from every enabled source on its own
-schedule, classifies each cycle's newly-fetched articles in one batched
-call, writes them to news_cache.py, and sweeps expired entries -- folded
+schedule, embeds each cycle's newly-fetched articles (no LLM call),
+writes them to news_cache.py, and sweeps expired entries -- folded
 into the same cycle rather than a separate job, per the plan doc's
 resolved "cleanup mechanism" question.
 
@@ -29,15 +29,14 @@ items; 200 comfortably exceeds what any of these feeds actually carry
 not a real limit.
 
 Deduplication against what's already cached (`_existing_cache_links`,
-loaded once per cycle from news_cache.read_all()) skips re-classifying a
+loaded once per cycle from news_cache.read_all()) skips re-embedding a
 link this cycle already has a live cache entry for -- necessary once the
 RSS cap stopped being small: at 200/feed, most of a cycle's fetch is
 usually the *same* items as last cycle (feeds don't turn over that fast),
-and without this check every one of them would get re-sent through a real
-paid DeepSeek classification call every 4 hours for no reason --
+and without this check every one of them would get re-embedded and
+re-written every cycle for no reason --
 news_cache.write_article's own overwrite-by-link-hash already makes a
-redundant write harmless, but a redundant *classification call* isn't
-free the way an overwrite is.
+redundant write harmless, but re-embedding is wasted work.
 
 Two complementary mechanisms, not one, per source-specific findings from
 live-testing this 2026-08-16 (see each source's own NewsSourceAdapter
@@ -82,18 +81,13 @@ import news_cache
 import news_embed
 import news_sources
 import api_budget_ops
-import category_ops
-import interest_cache_ops
 import source_state_ops
 from opentelemetry import trace
-from telemetry import EventLogger, get_event_logger
-from telemetry_providers import Level
 
 # A no-op when no tracer provider is configured -- which is every test and
 # CI run -- because OpenTelemetry's default is a no-op tracer. Same
 # reasoning as news_push._tracer.
 _tracer = trace.get_tracer("argus.news_ingest")
-_events: EventLogger = get_event_logger("argus.news_ingest")
 
 # Raised from 5 to 200 on 2026-08-16 -- see module docstring. Still a real
 # cap, not "unlimited": RSS feeds are the publisher's own choice of how
@@ -328,29 +322,6 @@ def _sections_for_source(source_key: str, now: datetime) -> list[str | None]:
     return list(sections)
 
 
-def _report_category_proposals(now: datetime) -> None:
-    """Prints what the classifier has been asking for that the taxonomy
-    doesn't have.
-
-    Deliberately only a log line for now. The threshold that decides when
-    this becomes an admin prompt (docs/plans/taxonomy-and-admin-plan.md A4)
-    is currently a placeholder of 5-in-30-days picked from a single
-    observation of "Education", and choosing it properly needs the real
-    distribution first. Accumulating visibly and deciding later beats
-    guessing a threshold now and then tuning it against alerts nobody
-    trusts."""
-    proposals = category_ops.count_recent_sightings(now)
-    if not proposals:
-        return
-    ranked = sorted(proposals.items(), key=lambda kv: -kv[1])
-    # Truncated because this prints every cycle and the tail is noise: a
-    # label seen once is a model slip, and the decision this feeds is about
-    # what keeps recurring. The full list is in the table.
-    summary = ", ".join(f"{name} x{count}" for name, count in ranked[:8])
-    print(f"[news_ingest] taxonomy gaps proposed by the classifier "
-          f"(last {category_ops.CATEGORY_SIGHTING_RETENTION_DAYS}d): {summary}")
-
-
 def _emit_heartbeat() -> None:
     """One span per cycle, whether or not anything new was found -- same
     shape as news_push._emit_heartbeat. Answers "is this job ticking at
@@ -534,7 +505,9 @@ def run_ingestion_cycle(now: datetime | None = None, embedder=None) -> None:
     """One scheduler tick. Makes NO LLM call: articles are cached with their
     embedding only and are matched to interests by embedding similarity at
     push time (the ingest-time category classification and its push-time
-    category gate were removed; see docs/analysis/cluster-measurements.md). Every outcome is printed -- same reasoning as
+    category gate were removed; see docs/analysis/cluster-measurements.md).
+
+    Every outcome is printed -- same reasoning as
     news_push.py's run_push_cycle: a silent per-source/per-cycle failure
     was a real incident there (docs/reference/observability-and-debugging.md),
     worth not repeating here.
@@ -549,24 +522,15 @@ def run_ingestion_cycle(now: datetime | None = None, embedder=None) -> None:
 
     deleted = news_cache.cleanup_expired(now)
     print(f"[news_ingest] tick at {now.isoformat()}: cleaned up {deleted} expired cache entr{'y' if deleted == 1 else 'ies'}")
-    # Sightings age out on the same tick as the cache, so the threshold
-    # question stays "how often recently" rather than "how often ever" --
-    # see category_ops.CATEGORY_SIGHTING_RETENTION_DAYS.
-    category_ops.prune_category_sightings(now)
-    # Reported here, next to the prune, rather than after classification:
-    # both are about accumulated evidence and neither depends on whether
-    # this cycle fetched anything. Placing it after the `if not fetched`
-    # return meant a quiet cycle pruned the evidence but never showed it.
-    _report_category_proposals(now)
 
     fetched: list[tuple[str, dict]] = []
     # Loaded once per cycle (after cleanup_expired, so already-expired
-    # links are gone and eligible to be re-added) -- skips re-classifying
+    # links are gone and eligible to be re-added) -- skips re-embedding
     # a link this cycle already has a live cache entry for. Matters most
     # for RSS-class sources now that their cap is 200, not 5 (see module
     # docstring): most of a 200-item RSS pull is typically unchanged from
     # last cycle, and without this check every one of them would cost a
-    # real, paid DeepSeek classification call every cycle for no reason.
+    # real embedding pass every cycle for no reason.
     existing_links = {a["link"] for a in news_cache.read_all() if a.get("link")}
     total_duplicates_skipped = 0
     non_latin_skipped = 0
@@ -600,7 +564,7 @@ def run_ingestion_cycle(now: datetime | None = None, embedder=None) -> None:
     # this falls back to title alone for those rather than embedding "None".
     # One batch call for the whole cycle (never per-article -- see
     # news_embed.embed_texts's own docstring on why), aligned back to
-    # `fetched` by plain list index: unlike classify_articles, embed_texts
+    # `fetched` by plain list index: embed_texts
     # never drops an item, so there's no _by_index dict to look up, just
     # a same-length list.
     embeddings = news_embed.embed_texts(
@@ -617,6 +581,3 @@ def run_ingestion_cycle(now: datetime | None = None, embedder=None) -> None:
         f"[news_ingest] tick at {now.isoformat()}: cached {len(fetched)} new article(s), "
         f"{total_duplicates_skipped} already-cached article(s) skipped"
     )
-
-
-
