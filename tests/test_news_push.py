@@ -87,7 +87,7 @@ def test_select_candidate_articles_ignores_dates_when_deciding_already_seen(isol
     older_but_unsent = _article("https://example.com/b", published_dt=NOW - timedelta(hours=40), categories=["AI"])
 
     result = news_push.select_candidate_articles(
-        [old_but_unsent, older_but_unsent], ["AI"], {"AI": ["AI"]}, since, set(), now=NOW
+        [old_but_unsent, older_but_unsent], ["AI"], since, set(), now=NOW
     )
 
     assert [a["link"] for a in result] == ["https://example.com/a", "https://example.com/b"]
@@ -104,13 +104,13 @@ def test_select_candidate_articles_keeps_offering_an_unsent_article(isolated_sub
     ]
 
     first = news_push.select_candidate_articles(
-        articles, ["AI"], {"AI": ["AI"]}, None, set(), max_per_topic=2, now=NOW
+        articles, ["AI"], None, set(), max_per_topic=2, now=NOW
     )
     assert [a["link"] for a in first] == ["https://example.com/1", "https://example.com/2"]
 
     # next cycle: only what was actually sent is excluded
     second = news_push.select_candidate_articles(
-        articles, ["AI"], {"AI": ["AI"]}, None, {a["link"] for a in first}, max_per_topic=2, now=NOW
+        articles, ["AI"], None, {a["link"] for a in first}, max_per_topic=2, now=NOW
     )
     assert [a["link"] for a in second] == ["https://example.com/3", "https://example.com/4"]
 
@@ -130,7 +130,7 @@ def test_select_candidate_articles_drops_articles_older_than_the_age_guard(isola
     )
 
     result = news_push.select_candidate_articles(
-        [ancient, recent], ["AI"], {"AI": ["AI"]}, None, set(), now=NOW
+        [ancient, recent], ["AI"], None, set(), now=NOW
     )
 
     assert [a["link"] for a in result] == ["https://example.com/recent"]
@@ -142,7 +142,7 @@ def test_select_candidate_articles_keeps_articles_with_unparseable_published_dt(
     undated = _article("https://example.com/undated", published_dt=None, fetched_at=NOW, categories=["AI"])
 
     result = news_push.select_candidate_articles(
-        [undated], ["AI"], {"AI": ["AI"]}, None, set(), now=NOW
+        [undated], ["AI"], None, set(), now=NOW
     )
 
     assert [a["link"] for a in result] == ["https://example.com/undated"]
@@ -156,7 +156,7 @@ def test_select_candidate_articles_never_resends_a_pushed_link(isolated_subscrib
     )
 
     result = news_push.select_candidate_articles(
-        [already_sent], ["AI"], {"AI": ["AI"]}, None, {"https://example.com/sent"}, now=NOW
+        [already_sent], ["AI"], None, {"https://example.com/sent"}, now=NOW
     )
 
     assert result == []
@@ -167,7 +167,7 @@ def test_select_candidate_articles_falls_back_to_pushed_links_for_unparsed_dates
     unseen = _article("https://example.com/unseen", published_dt=None, categories=["AI"])
 
     result = news_push.select_candidate_articles(
-        [seen, unseen], ["AI"], {"AI": ["AI"]}, None, {"https://example.com/seen"}
+        [seen, unseen], ["AI"], None, {"https://example.com/seen"}
     )
 
     assert [a["link"] for a in result] == ["https://example.com/unseen"]
@@ -177,75 +177,20 @@ def test_select_candidate_articles_dedupes_across_topics(isolated_subscribers_db
     article = _article("https://example.com/shared", published_dt=NOW - timedelta(hours=1), categories=["AI"])
 
     result = news_push.select_candidate_articles(
-        [article], ["AI", "robotics"], {"AI": ["AI"], "robotics": ["AI"]}, None, set(), now=NOW
+        [article], ["AI", "robotics"], None, set(), now=NOW
     )
 
     assert len(result) == 1
 
 
-def test_select_candidate_articles_topic_with_no_category_mapping_gets_nothing(isolated_subscribers_db):
-    """A topic with no cached category mapping (classifier miss) used to be
-    treated as "unrestricted" -- matching any article regardless of its
-    categories. That fail-open design let a completely off-topic article
-    reach a subscriber (the 2026-08-27 Witcher 3 incident: interest
-    "robotics" classified into zero of 28 taxonomy categories, and the
-    resulting "unrestricted" match let a gaming article through). A topic
-    that can't be matched against anything real is now skipped entirely --
-    same shape as "nothing new since last time": no candidates, no
-    message, no slot consumed."""
-    article = _article("https://example.com/a", categories=["Policy"])
-
-    result = news_push.select_candidate_articles([article], ["AAOI"], {}, None, set())
-
-    assert result == []
 
 
-def test_select_candidate_articles_explicit_empty_mapping_also_gets_nothing(isolated_subscribers_db):
-    """Pins the other way an interest can land with no categories to match
-    against: a topic present in the dict but explicitly mapped to [] --
-    e.g. an interest that once mapped to a category later retired and
-    never re-mapped (see storage/sqlite/category.py's migrate_split_policy
-    docstring and test_category_ops.test_policy_split_does_not_touch_pre_existing_interest_category_mappings
-    -- no code path currently produces this for Policy specifically, but
-    nothing would stop it for a category retired in the future). Both this
-    and the "topic absent from the dict" case above hit the same
-    `if not topic_cats: continue` branch and are therefore
-    indistinguishable to this function -- and both now get zero
-    candidates rather than being silently unrestricted."""
-    article = _article("https://example.com/a", categories=["Government"])
-
-    result = news_push.select_candidate_articles(
-        [article], ["legacy policy watcher"], {"legacy policy watcher": []}, None, set()
-    )
-
-    assert result == []
-
-
-def test_select_candidate_articles_excludes_off_category_article(isolated_subscribers_db):
-    # The Nikkei Asia incident this was built to fix: an uncategorized
-    # (or off-category) article shouldn't reach a subscriber whose topic
-    # DID classify into real categories.
-    earthquake = _article("https://example.com/earthquake", categories=[])
-    ai_topic_categories = {"AI": ["AI", "Research"]}
-
-    result = news_push.select_candidate_articles([earthquake], ["AI"], ai_topic_categories, None, set())
-
-    assert result == []
-
-
-def test_select_candidate_articles_includes_overlapping_category_article(isolated_subscribers_db):
-    article = _article("https://example.com/a", categories=["AI", "Startups"])
-    topic_categories = {"AI": ["AI", "Research"]}
-
-    result = news_push.select_candidate_articles([article], ["AI"], topic_categories, None, set())
-
-    assert len(result) == 1
 
 
 def test_select_candidate_articles_excludes_restricted_sources_by_default(isolated_subscribers_db):
     article = _article("https://example.com/a", source_key="perigon", categories=["AI"])
 
-    result = news_push.select_candidate_articles([article], ["AI"], {"AI": ["AI"]}, None, set())
+    result = news_push.select_candidate_articles([article], ["AI"], None, set())
 
     assert result == []
 
@@ -254,7 +199,7 @@ def test_select_candidate_articles_includes_restricted_sources_when_enabled(isol
     article = _article("https://example.com/a", source_key="perigon", categories=["AI"])
 
     result = news_push.select_candidate_articles(
-        [article], ["AI"], {"AI": ["AI"]}, None, set(), include_restricted=True
+        [article], ["AI"], None, set(), include_restricted=True
     )
 
     assert len(result) == 1
@@ -267,7 +212,7 @@ def test_select_candidate_articles_caps_per_topic(isolated_subscribers_db):
     ]
 
     result = news_push.select_candidate_articles(
-        articles, ["AI"], {"AI": ["AI"]}, None, set(), max_per_topic=3, now=NOW
+        articles, ["AI"], None, set(), max_per_topic=3, now=NOW
     )
 
     assert len(result) == 3
@@ -292,7 +237,7 @@ def test_near_duplicate_articles_collapse_to_the_newer_one(isolated_subscribers_
                  title="Nvidia launches new GPU architecture (wire)", embedding=wire_story, categories=["AI"]),
     ]
 
-    result = news_push.select_candidate_articles(articles, ["AI"], {"AI": ["AI"]}, None, set(), now=NOW)
+    result = news_push.select_candidate_articles(articles, ["AI"], None, set(), now=NOW)
 
     assert [a["link"] for a in result] == ["https://a.com/1"]
 
@@ -305,7 +250,7 @@ def test_articles_below_the_near_duplicate_threshold_both_survive(isolated_subsc
                  title="Bitcoin price surges", embedding=_embed("Bitcoin price surges"), categories=["AI"]),
     ]
 
-    result = news_push.select_candidate_articles(articles, ["AI"], {"AI": ["AI"]}, None, set(), now=NOW)
+    result = news_push.select_candidate_articles(articles, ["AI"], None, set(), now=NOW)
 
     assert {a["link"] for a in result} == {"https://a.com/1", "https://a.com/2"}
 
@@ -323,7 +268,7 @@ def test_an_article_with_no_embedding_is_never_collapsed(isolated_subscribers_db
                  title="Nvidia launches new GPU architecture (wire)", embedding=None, categories=["AI"]),
     ]
 
-    result = news_push.select_candidate_articles(articles, ["AI"], {"AI": ["AI"]}, None, set(), now=NOW)
+    result = news_push.select_candidate_articles(articles, ["AI"], None, set(), now=NOW)
 
     assert {a["link"] for a in result} == {"https://a.com/1", "https://a.com/2"}
 
@@ -343,10 +288,8 @@ def test_a_near_duplicate_within_one_topic_stays_eligible_for_another(isolated_s
     article_x = _article("https://a.com/x", published_dt=NOW - timedelta(hours=2),
                          title="Nvidia launches new GPU architecture (wire)", embedding=wire_story,
                          categories=["Hardware", "Markets"])
-    topic_categories = {"chips": ["Hardware"], "stocks": ["Markets"]}
-
     result = news_push.select_candidate_articles(
-        [article_1, article_x], ["chips", "stocks"], topic_categories, None, set(), now=NOW)
+        [article_1, article_x], ["chips", "stocks"], None, set(), now=NOW)
 
     by_topic = {(a["link"], a["topic"]) for a in result}
     assert ("https://a.com/1", "chips") in by_topic
@@ -640,7 +583,7 @@ def test_novelty_extra_appended_beyond_the_regular_max_per_topic_count(isolated_
     ]
 
     result = news_push.select_candidate_articles(
-        articles, ["AI"], {"AI": ["AI"]}, None, set(),
+        articles, ["AI"], None, set(),
         max_per_topic=3, now=NOW,
     )
 
@@ -655,34 +598,6 @@ def test_novelty_extra_appended_beyond_the_regular_max_per_topic_count(isolated_
     assert "is_novelty_extra" not in result[0]
 
 
-def test_novelty_extra_picks_lowest_keyness_when_no_keyword_hits(isolated_subscribers_db, fake_nltk):
-    """With no keyword hit anywhere in the remainder, the novelty extra
-    goes to the article whose own vocabulary is most "foreign" to the AI
-    category per the precomputed keyness table (as news_ingest.py would
-    have written via interest_cache_ops.set_category_keyness) -- and only because
-    it clears NOVELTY_KEYNESS_THRESHOLD; "robot" (keyness +50, strongly
-    topic-typical) must NOT be picked just for being the next-best thing
-    in a 2-item remainder."""
-    interest_cache_ops.set_category_keyness("AI", {"openai": 300.0, "robot": 50.0, "quantum": -40.0})
-    recency = ["ai daily roundup", "ai weekly digest", "openai announces new update"]
-    remainder = [
-        "ai robot demo at conference",                # keyness +50, does not qualify
-        "ai research touches on quantum computing",   # keyness -40, clears the threshold
-    ]
-    titles_newest_first = recency + remainder
-    articles = [
-        _article(f"https://a.com/{i}", published_dt=NOW - timedelta(hours=i), title=t, categories=["AI"])
-        for i, t in enumerate(titles_newest_first)
-    ]
-
-    result = news_push.select_candidate_articles(
-        articles, ["AI"], {"AI": ["AI"]}, None, set(),
-        max_per_topic=3, now=NOW,
-    )
-
-    assert len(result) == 4
-    assert result[-1]["title"] == "ai research touches on quantum computing"
-    assert result[-1]["is_novelty_extra"] is True
 
 
 def test_novelty_extra_keyword_hit_outranks_keyness_score(isolated_subscribers_db, fake_nltk):
@@ -702,7 +617,7 @@ def test_novelty_extra_keyword_hit_outranks_keyness_score(isolated_subscribers_d
     ]
 
     result = news_push.select_candidate_articles(
-        articles, ["AI"], {"AI": ["AI"]}, None, set(),
+        articles, ["AI"], None, set(),
         max_per_topic=3, now=NOW,
     )
 
@@ -725,7 +640,7 @@ def test_novelty_extra_below_threshold_does_not_qualify(isolated_subscribers_db,
     ]
 
     result = news_push.select_candidate_articles(
-        articles, ["AI"], {"AI": ["AI"]}, None, set(),
+        articles, ["AI"], None, set(),
         max_per_topic=3, now=NOW,
     )
 
@@ -745,7 +660,7 @@ def test_novelty_extra_disabled_sends_no_extra_even_with_a_qualifying_candidate(
     ]
 
     result = news_push.select_candidate_articles(
-        articles, ["AI"], {"AI": ["AI"]}, None, set(),
+        articles, ["AI"], None, set(),
         max_per_topic=3, now=NOW, include_novelty_extra=False,
     )
 
@@ -764,7 +679,7 @@ def test_novelty_extra_none_when_no_signal_at_all(isolated_subscribers_db, fake_
     ]
 
     result = news_push.select_candidate_articles(
-        articles, ["AI"], {"AI": ["AI"]}, None, set(),
+        articles, ["AI"], None, set(),
         max_per_topic=3, now=NOW,
     )
 
@@ -781,7 +696,7 @@ def test_novelty_extra_none_when_remainder_is_empty(isolated_subscribers_db, fak
     ]
 
     result = news_push.select_candidate_articles(
-        articles, ["AI"], {"AI": ["AI"]}, None, set(),
+        articles, ["AI"], None, set(),
         max_per_topic=3, now=NOW,
     )
 
@@ -815,7 +730,7 @@ def test_novelty_extra_uses_a_wider_relevance_pass_than_the_regular_digest(
     ]
 
     news_push.select_candidate_articles(
-        articles, ["AI"], {"AI": ["AI"]}, None, set(), max_per_topic=3, now=NOW,
+        articles, ["AI"], None, set(), max_per_topic=3, now=NOW,
     )
 
     assert calls[0] == {
@@ -894,7 +809,7 @@ def test_novelty_extra_excluded_when_it_fails_even_the_wider_relevance_bar(
     articles = on_topic + [off_topic_keyword_hit]
 
     result = news_push.select_candidate_articles(
-        articles, ["AI"], {"AI": ["AI"]}, None, set(),
+        articles, ["AI"], None, set(),
         max_per_topic=3, now=NOW, embedder=embedder,
     )
 
@@ -954,7 +869,7 @@ def test_novelty_extra_admits_a_candidate_the_regular_relevance_filter_would_hav
     assert articles[25]["link"] not in {a["link"] for a in regular_pass}
 
     result = news_push.select_candidate_articles(
-        articles, ["AI"], {"AI": ["AI"]}, None, set(),
+        articles, ["AI"], None, set(),
         max_per_topic=3, now=NOW, embedder=embedder,
     )
 
@@ -963,65 +878,12 @@ def test_novelty_extra_admits_a_candidate_the_regular_relevance_filter_would_hav
     assert novelty_pick["link"] == "https://a.com/25"
 
 
-# --- resolve_interest_categories -------------------------------------------
 
 
-def test_resolve_interest_categories_uses_cache_when_available(monkeypatch):
-    monkeypatch.setattr(interest_cache_ops, "get_cached_interest_categories", lambda interests: {"AI": ["AI"]})
-    classify = MagicMock()
-    monkeypatch.setattr(news_push.news_classify, "classify_interests", classify)
-
-    result = news_push.resolve_interest_categories("fake-model", ["AI"])
-
-    assert result == {"AI": ["AI"]}
-    classify.assert_not_called()
 
 
-def test_resolve_interest_categories_classifies_and_caches_misses(monkeypatch, isolated_subscribers_db):
-    monkeypatch.setattr(interest_cache_ops, "get_cached_interest_categories", lambda interests: {})
-    monkeypatch.setattr(news_push.news_classify, "classify_interests", lambda model, interests, taxonomy: {"AAOI": ["Stock"]})
-    set_categories = MagicMock()
-    monkeypatch.setattr(interest_cache_ops, "set_interest_categories", set_categories)
-
-    result = news_push.resolve_interest_categories("fake-model", ["AAOI"])
-
-    assert result == {"AAOI": ["Stock"]}
-    set_categories.assert_called_once_with("AAOI", ["Stock"])
 
 
-def test_resolve_interest_categories_caches_a_genuinely_empty_result(monkeypatch, isolated_subscribers_db):
-    """The model answered "no category applies". That is a real answer and
-    belongs in the cache -- re-classifying it every cycle would just re-pay
-    for the same conclusion."""
-    monkeypatch.setattr(interest_cache_ops, "get_cached_interest_categories", lambda interests: {})
-    monkeypatch.setattr(news_push.news_classify, "classify_interests",
-                        lambda model, interests, taxonomy: {"Some obscure ticker": []})
-    set_categories = MagicMock()
-    monkeypatch.setattr(interest_cache_ops, "set_interest_categories", set_categories)
-
-    result = news_push.resolve_interest_categories("fake-model", ["Some obscure ticker"])
-
-    assert result == {"Some obscure ticker": []}
-    set_categories.assert_called_once_with("Some obscure ticker", [])
-
-
-def test_resolve_interest_categories_does_not_cache_a_failure(monkeypatch, isolated_subscribers_db):
-    """Regression test for a live bug. classify_interests omits an interest
-    it failed on; caching that as [] made the failure permanent, and an
-    empty mapping matches every article, so affected subscribers were sent
-    entirely unfiltered news. On the live DB this had poisoned "AI",
-    "Bitcoin" and "機器人科技" among others -- "AI" cached as [] despite AI
-    being one of the 13 categories."""
-    monkeypatch.setattr(interest_cache_ops, "get_cached_interest_categories", lambda interests: {})
-    monkeypatch.setattr(news_push.news_classify, "classify_interests",
-                        lambda model, interests, taxonomy: {})
-    set_categories = MagicMock()
-    monkeypatch.setattr(interest_cache_ops, "set_interest_categories", set_categories)
-
-    result = news_push.resolve_interest_categories("fake-model", ["AI"])
-
-    set_categories.assert_not_called()
-    assert result == {}, "unresolved, so the next cycle retries it"
 
 
 # --- backfill_missing_interest_definitions ----------------------------------
@@ -1067,7 +929,7 @@ def test_backfill_writes_to_the_shared_tier_not_a_subscriber_tier(monkeypatch, i
 
 
 def test_backfill_does_not_cache_a_failed_generation(monkeypatch, isolated_subscribers_db):
-    """Same non-poisoning discipline as resolve_interest_categories: a
+    """Non-poisoning discipline: a
     generation failure (None) must not be cached as a permanent answer,
     so the next cycle retries it instead of being stuck with the bare
     topic string forever."""
@@ -1319,13 +1181,9 @@ def _subscriber(
     }
 
 
-def _stub_cache_and_categories(monkeypatch, cached_articles=(), topic_categories=None):
+def _stub_cache_and_categories(monkeypatch, cached_articles=()):
     monkeypatch.setattr(news_cache, "read_all", lambda: list(cached_articles))
-    monkeypatch.setattr(
-        news_push, "resolve_interest_categories", lambda model, interests: topic_categories or {}
-    )
-    # Same reasoning as the resolve_interest_categories stub above: this
-    # also calls `model` (see backfill_missing_interest_definitions's own
+    # This calls `model` (see backfill_missing_interest_definitions's own
     # docstring), and a test using a FakeToolCallingModel with a specific
     # scripted response sequence for write_push_digest must not have one
     # silently consumed by this unrelated call.
@@ -1646,7 +1504,6 @@ def test_run_push_cycle_backfills_missing_definitions_before_selecting(monkeypat
     monkeypatch.setattr(subscriber_ops, "mark_links_shown", MagicMock())
     monkeypatch.setattr(subscriber_ops, "advance_last_push_at", MagicMock())
     monkeypatch.setattr(news_cache, "read_all", lambda: [])
-    monkeypatch.setattr(news_push, "resolve_interest_categories", lambda model, interests: {})
     backfill = MagicMock()
     monkeypatch.setattr(news_push, "backfill_missing_interest_definitions", backfill)
     send = AsyncMock()
@@ -1875,7 +1732,6 @@ def test_run_push_cycle_reads_cache_once_and_reuses_across_subscribers(monkeypat
     monkeypatch.setattr(subscriber_ops, "advance_last_push_at", MagicMock())
     read_all = MagicMock(return_value=[])
     monkeypatch.setattr(news_cache, "read_all", read_all)
-    monkeypatch.setattr(news_push, "resolve_interest_categories", lambda model, interests: {})
     monkeypatch.setattr(news_push, "select_candidate_articles", MagicMock(return_value=[]))
 
     asyncio.run(news_push.run_push_cycle(model="fake-model", send=AsyncMock(), now=now))
@@ -1964,7 +1820,7 @@ def test_run_push_cycle_isolates_one_subscribers_failure(monkeypatch, isolated_s
 
     call_count = {"n": 0}
 
-    def select_side_effect(cached_articles, topics, topic_categories, since, pushed_links,
+    def select_side_effect(cached_articles, topics, since, pushed_links,
                            include_restricted=False, max_per_topic=None, now=None, embedder=None, chat_id=None):
         call_count["n"] += 1
         if call_count["n"] == 1:
@@ -2326,7 +2182,7 @@ def test_model_error_before_generation_does_not_advance_last_push_at(monkeypatch
     monkeypatch.setattr(subscriber_ops, "mark_links_shown", mark_links_shown)
     monkeypatch.setattr(subscriber_ops, "advance_last_push_at", advance_last_push_at)
     monkeypatch.setattr(news_cache, "read_all", lambda: [])
-    monkeypatch.setattr(news_push, "resolve_interest_categories",
+    monkeypatch.setattr(news_push, "backfill_missing_interest_definitions",
                         MagicMock(side_effect=RuntimeError("402 Insufficient Balance")))
     asyncio.run(news_push.run_push_cycle(model="fake-model", send=AsyncMock(),
                                          now=datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)))
@@ -2626,7 +2482,7 @@ def _per_topic_cycle(monkeypatch, chat_id, articles_by_topic, subscriber=None,
     monkeypatch.setattr(subscriber_ops, "advance_last_push_at", MagicMock())
     _stub_cache_and_categories(monkeypatch)
 
-    def fake_select(cached, topics, cats, since, already_pushed, **kwargs):
+    def fake_select(cached, topics, since, already_pushed, **kwargs):
         topic = topics[0]
         return [{**_article(link), "topic": topic}
                 for link in articles_by_topic.get(topic, [])
@@ -2786,7 +2642,7 @@ def test_a_partial_block_is_visible_in_the_delivered_detail(
 
     by_topic = {"AI": ["https://e.com/ai"], "Robotics": ["https://e.com/robots"]}
 
-    def fake_select(cached, topics, cats, since, already_pushed, **kwargs):
+    def fake_select(cached, topics, since, already_pushed, **kwargs):
         topic = topics[0]
         return [{**_article(link), "topic": topic}
                 for link in by_topic.get(topic, []) if link not in already_pushed]
@@ -2828,7 +2684,7 @@ def test_a_later_interests_model_failure_still_records_delivered(
 
     by_topic = {"AI": ["https://e.com/ai"], "Robotics": ["https://e.com/robots"]}
 
-    def fake_select(cached, topics, cats, since, already_pushed, **kwargs):
+    def fake_select(cached, topics, since, already_pushed, **kwargs):
         topic = topics[0]
         return [{**_article(link), "topic": topic}
                 for link in by_topic.get(topic, []) if link not in already_pushed]
@@ -2875,7 +2731,7 @@ def test_a_later_interests_model_failure_still_charges_the_trial_allowance(
 
     by_topic = {"AI": ["https://e.com/ai2"], "Robotics": ["https://e.com/robots2"]}
 
-    def fake_select(cached, topics, cats, since, already_pushed, **kwargs):
+    def fake_select(cached, topics, since, already_pushed, **kwargs):
         topic = topics[0]
         return [{**_article(link), "topic": topic}
                 for link in by_topic.get(topic, []) if link not in already_pushed]

@@ -79,9 +79,7 @@ from datetime import datetime, timezone
 
 from app_settings import get_settings
 import news_cache
-import news_classify
 import news_embed
-import news_keyness
 import news_sources
 import api_budget_ops
 import category_ops
@@ -532,8 +530,11 @@ def _pull_source(
         return fetched, duplicates_skipped, non_latin_skipped
 
 
-def run_ingestion_cycle(model, now: datetime | None = None, embedder=None) -> None:
-    """One scheduler tick. Every outcome is printed -- same reasoning as
+def run_ingestion_cycle(now: datetime | None = None, embedder=None) -> None:
+    """One scheduler tick. Makes NO LLM call: articles are cached with their
+    embedding only and are matched to interests by embedding similarity at
+    push time (the ingest-time category classification and its push-time
+    category gate were removed; see docs/analysis/cluster-measurements.md). Every outcome is printed -- same reasoning as
     news_push.py's run_push_cycle: a silent per-source/per-cycle failure
     was a real incident there (docs/reference/observability-and-debugging.md),
     worth not repeating here.
@@ -583,21 +584,11 @@ def run_ingestion_cycle(model, now: datetime | None = None, embedder=None) -> No
 
     if not fetched:
         print(
-            f"[news_ingest] tick at {now.isoformat()}: nothing new to classify "
+            f"[news_ingest] tick at {now.isoformat()}: nothing new to cache "
             f"({total_duplicates_skipped} already-cached article(s) skipped)"
         )
         return
 
-    # Loaded once per cycle, not per chunk: the taxonomy must not change
-    # underneath a batch, or the prompt and the validation set would
-    # disagree about what a valid answer is.
-    taxonomy = news_classify.Taxonomy.from_rows(category_ops.get_active_categories())
-    categories_by_index = news_classify.classify_articles(
-        model, [a for _, a in fetched], taxonomy,
-        on_unknown_label=lambda label, article: category_ops.record_category_sighting(
-            label, now, article.get("link"), article.get("title")
-        ),
-    )
     # Title+summary, not title alone -- measured 2026-08-25
     # (docs/analysis/cluster-measurements.md, "Title+summary embedding")
     # to genuinely improve recall for articles whose headline is written
@@ -616,21 +607,8 @@ def run_ingestion_cycle(model, now: datetime | None = None, embedder=None) -> No
         embedder,
         [f"{a.get('title') or ''} {a.get('summary') or ''}".strip() for _, a in fetched],
     )
-    unclassified = 0
     for i, (source_key, article) in enumerate(fetched):
-        # Three distinct outcomes, three distinct records. `.get(i)` is None
-        # when the chunk this article was in failed, which is NOT the same as
-        # the model saying nothing applied -- writing [] for both is what let
-        # a three-day classification outage look like normal operation.
-        categories = categories_by_index.get(i)
-        if categories is not None and not categories:
-            categories = [category_ops.UNCLASSIFIABLE]
-        if categories is None:
-            unclassified += 1
-        news_cache.write_article(source_key, article, categories, now, embedding=embeddings[i])
-    if unclassified:
-        print(f"[news_ingest] {unclassified} of {len(fetched)} article(s) cached "
-              f"WITHOUT being classified -- the classifier failed for them")
+        news_cache.write_article(source_key, article, None, now, embedding=embeddings[i])
 
     # The new/duplicate split here is logged specifically so the RSS cap
     # (MAX_RESULTS_PER_SOURCE_RSS) can be tuned later from real data rather
@@ -640,50 +618,5 @@ def run_ingestion_cycle(model, now: datetime | None = None, embedder=None) -> No
         f"{total_duplicates_skipped} already-cached article(s) skipped"
     )
 
-    _refresh_category_keyness(now)
 
 
-def _refresh_category_keyness(now: datetime) -> None:
-    """Recomputes news_keyness's per-category "how foreign is this word"
-    scores over the WHOLE current cache (not just this cycle's new
-    articles -- keyness needs the full category pool to mean anything)
-    and persists them, once per active category, so news_push.py's read
-    at push time is a cheap local DB lookup rather than ever running
-    NLTK live in the push path. See news_keyness.py's own module
-    docstring for the full design and docs/analysis/cluster-
-    measurements.md's "Offbeat selection, take two" for the measurement
-    behind it.
-
-    Runs every ingestion cycle (every INGEST_TICK_SECONDS, same cadence
-    as embedding computation), deliberately -- not on a separate, slower
-    schedule. A periodic-but-separate job was considered and rejected:
-    the gap between "an article is ingested" and "its category's keyness
-    table reflects it" would otherwise be a real staleness window, and
-    the articles most likely to fall in that window are exactly the
-    newest, most novelty-relevant ones -- the opposite of what this
-    feature is for.
-
-    POS-tagging (build_noun_index) is the one expensive step and is
-    shared across every active category -- computing keyness for 13
-    categories costs one tagging pass, not 13. Measured on the Phoenix
-    VM's own hardware (an OCI VM.Standard.E2.1.Micro, same shape as the
-    bot VM): 12.6s wall time and 84.6 MB peak RSS for 2673 real articles.
-
-    Fails open per category (a tagging exception or an empty pool for one
-    category doesn't block the others) and as a whole (an exception here
-    is a push-quality regression, never something that should take down
-    an otherwise-successful ingestion cycle)."""
-    try:
-        articles = news_cache.read_all()
-        if not articles:
-            return
-        doc_terms, global_df = news_keyness.build_noun_index(articles)
-        categories = [name for name, _description in category_ops.get_active_categories()]
-        for category in categories:
-            scores = news_keyness.category_keyness(articles, doc_terms, global_df, category)
-            interest_cache_ops.set_category_keyness(category, scores)
-        print(f"[news_ingest] tick at {now.isoformat()}: refreshed keyness for {len(categories)} categor{'y' if len(categories) == 1 else 'ies'}")
-    except Exception as exc:
-        _events.log("keyness_refresh_failed",
-                     "category keyness refresh failed, offbeat selection degrades to keyword-only/recency this cycle",
-                     level=Level.WARN, exc=exc)
