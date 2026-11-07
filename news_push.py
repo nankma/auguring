@@ -65,7 +65,6 @@ import news_jev_filter
 import news_keyness
 import news_sources
 import telegram_html
-import category_ops
 import interest_cache_ops
 import push_outcome_ops
 import subscriber_ops
@@ -280,8 +279,7 @@ _PUSH_DIGEST_PROMPT = (
 
 
 def backfill_missing_interest_definitions(model, interests: list[str]) -> None:
-    """Stage-1 setup sibling to resolve_interest_categories, for the
-    definition cache rather than the category one. Fixes a real gap
+    """Stage-1 setup for the interest-definition cache. Fixes a real gap
     (docs/plans/interest-definition-plan.md "Defect 2"): add_one_interest
     generates a definition only ONCE, at add time -- an interest added
     before expand_interest_for_retrieval existed, or one whose one-shot
@@ -293,11 +291,9 @@ def backfill_missing_interest_definitions(model, interests: list[str]) -> None:
     two-character string, which is a near-meaningless query
     (docs/analysis/retrieval-quality-measurements.md finding 4).
 
-    Same cache-check-then-generate shape as resolve_interest_categories,
-    same cache (interest_cache_ops's SHARED/global tier -- the same one
-    add_one_interest already writes to, so this is a retroactive fill of
-    that cache, not a new one). No return value: unlike categories, which
-    select_candidate_articles needs threaded through as a dict, nothing
+    Cache-check-then-generate shape, same cache (interest_cache_ops's
+    SHARED/global tier -- the same one add_one_interest already writes to, so this is a retroactive fill of
+    that cache, not a new one). No return value: nothing
     downstream needs the definitions handed back -- _resolve_query_text
     reads the cache itself, per topic, right after this runs."""
     missing = [i for i in interests if interest_cache_ops.get_interest_query_expansion(i) is None]
@@ -307,49 +303,9 @@ def backfill_missing_interest_definitions(model, interests: list[str]) -> None:
             interest_cache_ops.set_interest_query_expansion(interest, expansion)
 
 
-def resolve_interest_categories(model, interests: list[str]) -> dict[str, list[str]]:
-    """Stage-1 setup: maps each interest to its category tags, using
-    interest_cache_ops's persistent cache and classifying only what's missing --
-    interest text is stable vocabulary (unlike article content), so this
-    should be a cache hit for any interest that's been pushed before.
-
-    An interest the classifier FAILED on is left out of the cache entirely,
-    so the next cycle retries it. Only a real answer gets cached -- including
-    a genuinely empty one, which is a valid classification and should not be
-    re-paid for every cycle.
-
-    Caching failures as [] is what poisoned the live cache during the
-    2026-08-17 classification outage: "AI", "Bitcoin", "機器人科技" and
-    others were all stored as [], permanently, with no retry. At the time,
-    an empty mapping matched every article (see select_candidate_articles),
-    so those subscribers were receiving entirely unfiltered news -- the
-    exact failure the category filter exists to prevent. That
-    "unrestricted" behavior was itself reversed 2026-08-27 (an empty
-    mapping now excludes the topic entirely instead), but caching a
-    genuinely-empty classification permanently is still correct and
-    unrelated to that reversal: it's what makes a confidently-wrong
-    empty answer a standing condition rather than a one-cycle blip, on
-    either side of how select_candidate_articles handles it -- see that
-    function's own docstring."""
-    resolved = interest_cache_ops.get_cached_interest_categories(interests)
-    missing = [i for i in interests if i not in resolved]
-    if missing:
-        taxonomy = news_classify.Taxonomy.from_rows(category_ops.get_active_categories())
-        newly_classified = news_classify.classify_interests(model, missing, taxonomy)
-        failed = [i for i in missing if i not in newly_classified]
-        for interest, categories in newly_classified.items():
-            interest_cache_ops.set_interest_categories(interest, categories)
-            resolved[interest] = categories
-        if failed:
-            print(f"[news_push] could not classify {len(failed)} interest(s), "
-                  f"will retry next cycle: {', '.join(failed)}")
-    return resolved
-
-
 def select_candidate_articles(
     cached_articles: list[dict],
     topics: list[str],
-    topic_categories: dict[str, list[str]],
     since: datetime | None,
     already_pushed_links: set[str],
     include_restricted: bool = False,
@@ -359,65 +315,16 @@ def select_candidate_articles(
     include_novelty_extra: bool = INCLUDE_NOVELTY_EXTRA,
     chat_id: int | None = None,
 ) -> list[dict]:
-    """Stage 1 (category filter): narrows the shared cache to one
-    subscriber's candidate articles, before the digest-writing model
-    (stage 2, in write_push_digest's prompt) ever sees anything.
+    """Stage 1: narrows the shared cache to one subscriber's candidate
+    articles, before the digest-writing model (stage 2, in
+    write_push_digest's prompt) ever sees anything.
 
-    An article is a candidate for `topic` when its own categories (set at
-    ingestion time by news_classify.py) overlap with that topic's mapped
-    categories from `topic_categories`. A topic that mapped to NO
-    categories at all (a classifier miss) gets NO candidates at all --
-    that interest is simply skipped this cycle (same downstream shape as
-    "nothing new since last time": run_push_cycle doesn't send a message
-    or consume a slot for it), rather than the "unrestricted, matches any
-    article" behavior this had until 2026-08-27.
-
-    That earlier behavior was a REPEAT of an already-diagnosed failure,
-    not a new one: this exact docstring already recorded, from the
-    2026-08-17 classification outage, that an empty mapping matching
-    every article was "the exact failure the category filter exists to
-    prevent" -- the outage's own retry logic got fixed, but the
-    consequence of a *confidently-empty* classification (not a retryable
-    failure, a real cached "[]" the classifier itself returned) was left
-    unchanged. It surfaced for real 2026-08-27: an interest literally
-    named "robotics" was classified into zero of the taxonomy's 28
-    categories (including "Robotics" itself -- a genuine classifier
-    misjudgment, not a system bug) and, because that made it
-    "unrestricted," the subscriber's push digest surfaced a Witcher 3
-    game-DLC article with a keyword-hit-triggered novelty note attached,
-    entirely unrelated to robotics. Skipping the topic instead is a
-    real behavior tradeoff, not a strict improvement: a subscriber whose
-    interest was ACTUALLY too novel/niche for the current 28-category
-    taxonomy to recognize now gets nothing at all for it, silently,
-    rather than an imperfectly-filtered digest -- see resolve_
-    interest_categories' own docstring for why a cached "[]" is never
-    retried, which makes this a standing condition, not a one-cycle
-    blip. Accepted as the better failure mode: an occasional legitimate
-    interest going quiet is a worse experience to eventually notice and
-    report than an unrelated-content leak is to receive without warning.
-
-    An article with no categories (the classifier found nothing that
-    plausibly applies, e.g. a general-news piece with no tech angle at
-    all) is excluded whenever the topic itself has real categories to
-    match against -- this is the exact mechanism that would have kept
-    the Nikkei Asia earthquake/society articles out of a digest, since
-    neither classifies into any of the 13 tech-industry categories.
-
-    Since 2026-08-20 the cache distinguishes "the classifier found nothing
-    applicable" (category_ops.UNCLASSIFIABLE) from "never classified" (None).
-    This function deliberately still treats them alike -- neither has a
-    category that can match a topic, so both are excluded the same way --
-    but the distinction now exists in the data for anything that needs it,
-    which is how a silent classification outage becomes detectable.
-    Known, accepted overlap with a separate case this can't distinguish:
-    an article left uncategorized because news_classify.classify_articles
-    failed for its whole ingestion batch (fails open, see that
-    function's docstring) looks identical to a genuine "nothing applies"
-    result here -- both get excluded. Not solved here; a batch
-    classification failure already means that cycle's articles are
-    "harder to find... until the next cycle re-fetches and reclassifies
-    it," per that function's own docstring, so this is consistent with
-    an existing accepted limitation, not a new one.
+    There is no category layer: an article is matched to a topic purely by
+    embedding similarity to the topic's query text (relevance filter below).
+    Measured in docs/analysis/cluster-measurements.md, any category layer
+    between an interest and the articles costs recall, and keeping
+    classification out of ingestion means pulling news makes no LLM call.
+    Articles still carry a legacy `categories` field; nothing here reads it.
 
     **A date is a ranking signal, never a "have they seen it" filter.**
     Restructured 2026-08-19 around that separation:
@@ -502,15 +409,6 @@ def select_candidate_articles(
     seen_links = set()
     candidates = []
     for topic in topics:
-        topic_cats = set(topic_categories.get(topic, []))
-        if not topic_cats:
-            # No categories to match against at all -- skip this topic
-            # entirely rather than treating it as "matches everything"
-            # (removed 2026-08-27; see this function's own docstring for
-            # the incident that motivated the reversal). Same downstream
-            # shape as "nothing new since last time": no candidates, no
-            # message, no slot consumed.
-            continue
         # The embedding query text -- NOT necessarily `topic` itself. See
         # _resolve_query_text: a cached, LLM-generated definition of the
         # topic outperforms the bare topic string as a retrieval query,
@@ -546,11 +444,6 @@ def select_candidate_articles(
             if not link or link in seen_links:
                 continue
             if not include_restricted and article.get("source_key") in news_sources.RESTRICTED_SOURCES:
-                continue
-            article_cats = set(article.get("categories") or [])
-            # topic_cats is always non-empty here -- the loop `continue`d
-            # for this whole topic above otherwise.
-            if not (article_cats & topic_cats):
                 continue
             # The one and only "has this subscriber seen it" test.
             if link in already_pushed_links:
@@ -613,7 +506,7 @@ def select_candidate_articles(
             )
             regular_links = {a["link"] for a in pool[:max_per_topic]}
             novelty_remainder = [a for a in novelty_pool if a["link"] not in regular_links]
-            novelty = _pick_novelty_extra(novelty_remainder, topic_cats)
+            novelty = _pick_novelty_extra(novelty_remainder)
             if novelty is not None:
                 candidates.append({**novelty, "topic": topic, "is_novelty_extra": True})
     return candidates
@@ -657,7 +550,7 @@ def _novelty_sort_key(scored_item: tuple[dict, bool, tuple[float, str] | None]) 
     return (0 if has_keyword else 1, keyness_score)
 
 
-def _pick_novelty_extra(remainder: list[dict], categories: set[str] | list[str]) -> dict | None:
+def _pick_novelty_extra(remainder: list[dict]) -> dict | None:
     """At most one "by the way, we noticed something interesting" pick,
     drawn from `remainder` -- articles that cleared select_candidate_
     articles' own WIDER novelty relevance pass (NOVELTY_RELEVANCE_KEEP_*,
@@ -683,19 +576,13 @@ def _pick_novelty_extra(remainder: list[dict], categories: set[str] | list[str])
     not a weak fallback pick, when nothing in `remainder` clears either
     bar** -- callers must not force a novelty section into every push.
 
-    `categories` is the topic's own category set (from topic_categories
-    in select_candidate_articles), used to look up news_keyness's
-    precomputed per-category table (interest_cache_ops.get_category_keyness) --
-    merged across every category in the set, keeping the lower (more
-    foreign) score for any term scored under more than one."""
+    Keyness needs per-category article pools, which no longer exist, so
+    only the keyword signal is live (the keyness table is empty, which
+    min_term_keyness treats as "no signal")."""
     if not remainder:
         return None
 
     keyness: dict[str, float] = {}
-    for category in categories:
-        for term, score in interest_cache_ops.get_category_keyness(category).items():
-            if term not in keyness or score < keyness[term]:
-                keyness[term] = score
 
     scored = [
         (a, news_keyness.has_novelty_keyword(a.get("title"), a.get("summary")),
@@ -1197,12 +1084,10 @@ async def run_push_cycle(model, send: "callable", now: datetime | None = None, e
         # 0 at this point regardless -- nothing can have sent or been
         # blocked before interests are even resolved -- but they must be
         # bound (not merely 0) so the except clauses can't hit an
-        # UnboundLocalError if resolve_interest_categories itself is what
-        # raises.
+        # UnboundLocalError if an early step raises.
         sent = 0
         blocked = 0
         try:
-            topic_categories = _model_call(resolve_interest_categories, model, interests)
             _model_call(backfill_missing_interest_definitions, model, interests)
             # One message per interest, longest-un-pushed first. Two
             # reasons this replaced a single combined digest:
@@ -1226,7 +1111,6 @@ async def run_push_cycle(model, send: "callable", now: datetime | None = None, e
                 new_articles = select_candidate_articles(
                     cached_articles,
                     [topic],
-                    topic_categories,
                     subscriber["last_push_at"],
                     # What this cycle has already delivered counts as seen
                     # too. Without the union, an article that matches two

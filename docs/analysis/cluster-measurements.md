@@ -1788,3 +1788,18 @@ embedding similarity to the topic, in a pool large enough for the
 percentile cut to actually exclude something, is confirmed excluded)
 and `::test_novelty_extra_uses_a_wider_relevance_pass_than_the_regular_
 digest` (pins the two separate `_filter_by_relevance` calls' params).
+
+## Decision 2026-11-07: no category layer in ingestion or retrieval
+
+Pulling news no longer calls an LLM, and candidate selection no longer gates
+on article categories. `news_ingest.run_ingestion_cycle` caches each article
+with its embedding only (`categories` is stored as NULL); `news_push.
+select_candidate_articles` matches an interest to articles by embedding
+similarity alone, and the push cycle no longer classifies interests.
+Offline check on the live cache (robotics): the old category gate left 20
+candidates (20 Jev-approved); without it, a pool of 50 gave 45 Jev-approved
+(25 more, 0 lost). Edge AI boards stayed at 6-7 either way (few relevant
+articles in the cache, not a gate effect). Costs: the novelty extra now uses
+keywords only (per-category keyness needs category pools), and the
+category-proposal admin flow goes dormant. The `categories` column,
+`news_classify` and the category tables are left in place.

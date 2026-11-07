@@ -930,7 +930,7 @@ async def _ingest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     # enabled source -- offloaded the same way handle_message offloads
     # run_agent, so a slow cycle can't block the bot's event loop.
     await asyncio.to_thread(
-        news_ingest.run_ingestion_cycle, model, embedder=context.bot_data.get("embedder")
+        news_ingest.run_ingestion_cycle, embedder=context.bot_data.get("embedder")
     )
     await review_category_proposals(
         model, context.bot_data["admin_bot_token"], context.bot_data["admin_chat_id"]
