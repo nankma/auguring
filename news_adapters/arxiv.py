@@ -30,7 +30,13 @@ class ArxivAdapter:
         # actually indexes by -- far better than free-text search, which
         # found only 36 quantum and 6 optics articles for subscribers who
         # follow exactly those topics.
-        search_query = f"cat:{section}" if section else query
+        if section:
+            # A section may be several comma-joined classes, ORed into ONE
+            # request (arXiv rate-limits back-to-back requests hard).
+            classes = [f"cat:{c}" for c in section.split(",")]
+            search_query = classes[0] if len(classes) == 1 else "(" + " OR ".join(classes) + ")"
+        else:
+            search_query = query
         if since is not None:
             search_query = f"{search_query} AND submittedDate:[{since.strftime('%Y%m%d%H%M')} TO 99991231235959]"
         resp = requests.get(

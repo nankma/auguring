@@ -111,7 +111,7 @@ def test_sections_for_source_uncapped_takes_every_section():
     now = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
     sections = news_ingest._sections_for_source("arxiv", now)
     assert sections == news_sources.SOURCE_SECTIONS["arxiv"]
-    assert "quant-ph" in sections and "physics.optics" in sections
+    assert any("quant-ph" in g and "physics.optics" in g for g in sections)
 
 
 def test_sections_for_source_capped_takes_exactly_one(monkeypatch):
@@ -327,14 +327,14 @@ def test_pull_source_success_when_only_some_sections_of_a_multi_section_source_f
     monkeypatch, isolated_subscribers_db
 ):
     """Outcome is source-level, not section-level -- a source with several
-    sections (arxiv has 6) that's basically alive shouldn't read as
+    sections (arxiv has several) that's basically alive shouldn't read as
     `failed` over one transient section error."""
     now = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
     span = _patch_pull_span(monkeypatch)
     monkeypatch.setattr(news_ingest.time, "sleep", MagicMock())
 
     def flaky(q, n, section=None):
-        if section == "cs.AI":
+        if section == news_sources.SOURCE_SECTIONS["arxiv"][0]:
             raise RuntimeError("boom")
         return []
 
@@ -392,7 +392,7 @@ def test_run_ingestion_cycle_delays_between_multi_section_calls_to_same_source(
     assert fetch.call_count == n, "one call per section"
     # delay happens BETWEEN calls, not before the first or after the last
     assert sleep.call_count == n - 1
-    sleep.assert_called_with(news_ingest.REQUEST_DELAY_SECONDS)
+    sleep.assert_called_with(max(news_ingest.REQUEST_DELAY_SECONDS, 3.5))  # arxiv's floor
 
 
 def test_ingestion_passes_the_section_not_a_subscriber_interest(
@@ -718,15 +718,17 @@ def test_each_section_keeps_its_own_since_cutoff(
     fast = _article("https://arxiv/fast", published_dt=now - timedelta(hours=1))
     slow = _article("https://arxiv/slow", published_dt=now - timedelta(days=3))
 
+    hot, sci = "cs.AI,cs.LG,cs.CL,cs.CV", "quant-ph,physics.optics"
+
     def fetch(query, n, since=None, section=None):
-        return [fast] if section == "cs.AI" else [slow] if section == "physics.optics" else []
+        return [fast] if section == hot else [slow] if section == sci else []
 
     monkeypatch.setattr(news_sources, "enabled_sources", lambda: [("arxiv", fetch)])
     monkeypatch.setattr(news_ingest.time, "sleep", MagicMock())
     news_ingest.run_ingestion_cycle(now)
 
-    fast_cut = source_state_ops.get_source_last_article_dt("arxiv:cs.AI")
-    slow_cut = source_state_ops.get_source_last_article_dt("arxiv:physics.optics")
+    fast_cut = source_state_ops.get_source_last_article_dt(f"arxiv:{hot}")
+    slow_cut = source_state_ops.get_source_last_article_dt(f"arxiv:{sci}")
     assert fast_cut == fast["published_dt"]
     assert slow_cut == slow["published_dt"]
     assert slow_cut < fast_cut, "the slow section is not dragged forward by the fast one"
@@ -966,3 +968,37 @@ def test_ingestion_makes_no_model_call_and_still_stores_embeddings(
     assert len(cached) == 1
     assert cached[0]["embedding"] is not None
     assert not cached[0]["categories"]
+
+
+def test_arxiv_is_fetched_in_few_grouped_requests_with_a_3_5s_gap_and_200_results(
+    monkeypatch, isolated_subscribers_db, isolated_news_cache
+):
+    now = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
+    fetch = MagicMock(return_value=[])
+    monkeypatch.setattr(news_sources, "enabled_sources", lambda: [("arxiv", fetch)])
+    sleep = MagicMock()
+    monkeypatch.setattr(news_ingest.time, "sleep", sleep)
+
+    news_ingest.run_ingestion_cycle(now)
+
+    assert fetch.call_count == len(news_sources.SOURCE_SECTIONS["arxiv"]) <= 4
+    assert all(c.args[1] == 200 for c in fetch.call_args_list)
+    assert all(c.args[0] == 3.5 for c in sleep.call_args_list) or all(
+        c.args == (3.5,) for c in sleep.call_args_list)
+    assert sleep.call_count == fetch.call_count - 1
+
+
+def test_a_429_stops_the_remaining_sections_of_that_source_for_the_cycle(
+    monkeypatch, isolated_subscribers_db, isolated_news_cache
+):
+    import requests as _requests
+    now = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
+    response = _requests.Response()
+    response.status_code = 429
+    fetch = MagicMock(side_effect=_requests.HTTPError("429 Too Many Requests", response=response))
+    monkeypatch.setattr(news_sources, "enabled_sources", lambda: [("arxiv", fetch)])
+    monkeypatch.setattr(news_ingest.time, "sleep", MagicMock())
+
+    news_ingest.run_ingestion_cycle(now)
+
+    assert fetch.call_count == 1, "later sections must not hammer a rate-limited source"
