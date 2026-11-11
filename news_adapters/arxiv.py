@@ -33,7 +33,7 @@ class ArxivAdapter:
         if section:
             # A section may be several comma-joined classes, ORed into ONE
             # request (arXiv rate-limits back-to-back requests hard).
-            classes = [f"cat:{c}" for c in section.split(",")]
+            classes = [f"cat:{c.strip()}" for c in section.split(",")]
             search_query = classes[0] if len(classes) == 1 else "(" + " OR ".join(classes) + ")"
         else:
             search_query = query

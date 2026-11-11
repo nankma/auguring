@@ -76,13 +76,14 @@ import time
 import unicodedata
 from datetime import datetime, timezone
 
+import requests
+
 from app_settings import get_settings
 import news_cache
 import news_embed
 import news_sources
 import api_budget_ops
 import source_state_ops
-import requests
 from opentelemetry import trace
 
 # A no-op when no tracer provider is configured -- which is every test and
@@ -105,7 +106,7 @@ MAX_RESULTS_PER_SOURCE_RSS = 200
 # 10/request free-tier limit) just clamp silently, no error.
 MAX_RESULTS_PER_SOURCE_SINCE_LAST_PULL = 50
 
-# Per-source overrides. arXiv: each request covers a GROUP of categories
+# Per-source floors (values are applied with max(), never lower than the global). arXiv: each request covers a GROUP of categories
 # (news_sources.SOURCE_SECTIONS), and the busiest group needed ~194 results
 # in 24h, so 50 would truncate it. Its published limit is one request per
 # 3 seconds; 3.5 leaves margin. Both only ever raise the global values.
@@ -261,6 +262,11 @@ def _is_source_due(source_key: str, last_pulled_at: datetime | None, now: dateti
         return True
     elapsed_hours = (now - last_pulled_at).total_seconds() / 3600
     return elapsed_hours >= _interval_hours(source_key)
+
+
+def _is_rate_limited(exc: Exception) -> bool:
+    return (isinstance(exc, requests.HTTPError) and exc.response is not None
+            and exc.response.status_code == 429)
 
 
 def _cutoff_key(source_key: str, section: str | None) -> str:
@@ -450,13 +456,16 @@ def _pull_source(
                       f"failed with {exc!r}")
                 pull_span.record_exception(exc)
                 sections_failed += 1
-                if (isinstance(exc, requests.HTTPError) and exc.response is not None
-                        and exc.response.status_code == 429):
+                if _is_rate_limited(exc):
                     # Rate limited: the remaining sections would only be
                     # refused too, each raising its own alert. Stop for this
                     # cycle; the source is retried at its next interval.
+                    skipped = len(sections) - i - 1
+                    # Counted as failed so a source limited from its first
+                    # request reads `failed`, not a healthy `success`.
+                    sections_failed += skipped
                     print(f"[news_ingest] {source_key}: rate limited (429), "
-                          f"skipping {len(sections) - i - 1} remaining section(s) this cycle")
+                          f"skipping {skipped} remaining section(s) this cycle")
                     break
                 continue
             if time_filterable and last_article_dt is not None:

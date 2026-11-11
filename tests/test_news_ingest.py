@@ -1002,3 +1002,21 @@ def test_a_429_stops_the_remaining_sections_of_that_source_for_the_cycle(
     news_ingest.run_ingestion_cycle(now)
 
     assert fetch.call_count == 1, "later sections must not hammer a rate-limited source"
+
+
+def test_a_source_rate_limited_from_its_first_request_reads_failed_not_success(
+    monkeypatch, isolated_subscribers_db
+):
+    import requests as _requests
+    now = datetime(2026, 8, 14, 12, 0, 0, tzinfo=timezone.utc)
+    span = _patch_pull_span(monkeypatch)
+    monkeypatch.setattr(news_ingest.time, "sleep", MagicMock())
+    response = _requests.Response()
+    response.status_code = 429
+
+    def limited(q, n, section=None):
+        raise _requests.HTTPError("429", response=response)
+
+    news_ingest._pull_source("arxiv", limited, now, set())
+
+    assert span.attrs["pull.outcome"] == "failed"
