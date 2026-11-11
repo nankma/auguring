@@ -283,10 +283,18 @@ SOURCE_SECTIONS: dict[str, list[str]] = {
     # with little tech-industry-news signal for this bot's subscribers --
     # add one if a real interest needs it, same as quant-ph/physics.optics
     # above.
+    # One request per GROUP of categories (comma-joined; the adapter ORs
+    # them), not per category: 16 back-to-back single-category requests
+    # tripped arXiv's rate limit (429 on 14 of 16, 2026-11-10 06:14).
+    # Measured live (24h window): groups fetched at max_results=200 return
+    # every paper the 16 separate requests did (271 vs 238 -- the busy
+    # categories were being truncated at 50 before). Busy categories share
+    # a group so they cannot crowd out the quiet ones.
     "arxiv": [
-        "cs.AI", "cs.LG", "cs.RO", "cs.CR",
-        "cs.CL", "cs.CV", "cs.MA", "cs.NE", "cs.HC", "cs.SE", "cs.DC", "cs.NI", "cs.IR", "cs.SD",
-        "quant-ph", "physics.optics",
+        "cs.AI,cs.LG,cs.CL,cs.CV",
+        "cs.RO,cs.CR,cs.MA,cs.NE,cs.HC,cs.SE",
+        "cs.DC,cs.NI,cs.IR,cs.SD",
+        "quant-ph,physics.optics",
     ],
     # Algolia's front_page tag is HN's own ranking, which is a better
     # relevance signal than anything a query could express here.

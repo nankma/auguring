@@ -373,3 +373,24 @@ def test_parse_iso_published_assumes_utc_when_offset_is_missing():
     result = _parse_iso_published("2026-08-13T22:00:00")
     assert result == datetime(2026, 8, 13, 22, 0, 0, tzinfo=timezone.utc)
     assert result.tzinfo is not None
+
+
+def test_arxiv_section_with_several_classes_is_one_ored_request(requests_mock):
+    requests_mock.get("http://export.arxiv.org/api/query", text=ARXIV_RESPONSE)
+
+    ArxivAdapter().pull(section="cs.AI,cs.LG,quant-ph", max_results=200)
+
+    assert requests_mock.call_count == 1
+    query = requests_mock.last_request.qs["search_query"][0]
+    assert query == "(cat:cs.ai or cat:cs.lg or cat:quant-ph)"
+    assert requests_mock.last_request.qs["max_results"] == ["200"]
+
+
+def test_arxiv_since_filter_applies_to_the_whole_group(requests_mock):
+    requests_mock.get("http://export.arxiv.org/api/query", text=ARXIV_RESPONSE)
+    since = datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc)
+
+    ArxivAdapter().pull(section="cs.AI,cs.LG", since=since)
+
+    query = requests_mock.last_request.qs["search_query"][0]
+    assert query.startswith("(cat:cs.ai or cat:cs.lg) and submitteddate:[202608161200 to")

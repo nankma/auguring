@@ -76,6 +76,8 @@ import time
 import unicodedata
 from datetime import datetime, timezone
 
+import requests
+
 from app_settings import get_settings
 import news_cache
 import news_embed
@@ -103,6 +105,13 @@ MAX_RESULTS_PER_SOURCE_RSS = 200
 # 2026-08-16); sources with their own lower hard cap (e.g. GNews's
 # 10/request free-tier limit) just clamp silently, no error.
 MAX_RESULTS_PER_SOURCE_SINCE_LAST_PULL = 50
+
+# Per-source floors (values are applied with max(), never lower than the global). arXiv: each request covers a GROUP of categories
+# (news_sources.SOURCE_SECTIONS), and the busiest group needed ~194 results
+# in 24h, so 50 would truncate it. Its published limit is one request per
+# 3 seconds; 3.5 leaves margin. Both only ever raise the global values.
+_MAX_RESULTS_OVERRIDE = {"arxiv": 200}
+_MIN_REQUEST_DELAY_SECONDS = {"arxiv": 3.5}
 # The fallback used by _interval_hours() when a source has no
 # news_source.<name>.interval_hours override in Settings.
 DEFAULT_INTERVAL_HOURS = get_settings().resolved("news_source.default_interval_hours", default=4)
@@ -255,6 +264,11 @@ def _is_source_due(source_key: str, last_pulled_at: datetime | None, now: dateti
     return elapsed_hours >= _interval_hours(source_key)
 
 
+def _is_rate_limited(exc: Exception) -> bool:
+    return (isinstance(exc, requests.HTTPError) and exc.response is not None
+            and exc.response.status_code == 429)
+
+
 def _cutoff_key(source_key: str, section: str | None) -> str:
     """The key `last_article_dt` is tracked under.
 
@@ -388,6 +402,8 @@ def _pull_source(
 
         time_filterable = _SOURCE_CLASS.get(source_key) in _TIME_FILTERABLE_CLASSES
         max_results = MAX_RESULTS_PER_SOURCE_SINCE_LAST_PULL if time_filterable else MAX_RESULTS_PER_SOURCE_RSS
+        max_results = max(max_results, _MAX_RESULTS_OVERRIDE.get(source_key, 0))
+        request_delay = max(REQUEST_DELAY_SECONDS, _MIN_REQUEST_DELAY_SECONDS.get(source_key, 0))
         # The newest article's own published_dt actually seen from this
         # source so far -- NOT last_pulled_at (see module docstring for
         # why that was the wrong cutoff: it advances on wall-clock time
@@ -426,7 +442,7 @@ def _pull_source(
                 # 4h+, a few extra seconds is nothing) and avoids needing a
                 # per-source rate table for limits that aren't always
                 # documented up front.
-                time.sleep(REQUEST_DELAY_SECONDS)
+                time.sleep(request_delay)
             try:
                 # The section, not a query: the fetchers keep their query
                 # parameter for agent.py's search_news, and ignore it when
@@ -440,6 +456,17 @@ def _pull_source(
                       f"failed with {exc!r}")
                 pull_span.record_exception(exc)
                 sections_failed += 1
+                if _is_rate_limited(exc):
+                    # Rate limited: the remaining sections would only be
+                    # refused too, each raising its own alert. Stop for this
+                    # cycle; the source is retried at its next interval.
+                    skipped = len(sections) - i - 1
+                    # Counted as failed so a source limited from its first
+                    # request reads `failed`, not a healthy `success`.
+                    sections_failed += skipped
+                    print(f"[news_ingest] {source_key}: rate limited (429), "
+                          f"skipping {skipped} remaining section(s) this cycle")
+                    break
                 continue
             if time_filterable and last_article_dt is not None:
                 # The actually-authoritative "new" check -- applies
